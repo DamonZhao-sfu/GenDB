@@ -133,6 +133,7 @@ function parseArgs(argv) {
     if (argv[i] === "--optimization-target" && argv[i + 1]) args.optimizationTarget = argv[++i];
     if (argv[i] === "--max-concurrent" && argv[i + 1]) args.maxConcurrent = parseInt(argv[++i], 10);
     if (argv[i] === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
+    if (argv[i] === "--base-url" && argv[i + 1]) process.env.VLLM_BASE_URL = argv[++i];
     if (argv[i] === "--no-skills") args.useSkills = false;
     if (argv[i] === "--memory-dir" && argv[i + 1]) args.memoryDir = argv[++i];
     if (argv[i] === "--no-memory") args.memoryDir = null;
