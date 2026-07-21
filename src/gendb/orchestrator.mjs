@@ -54,10 +54,17 @@ let _arrowFlagsCache = null;
 function getArrowCompileFlags() {
   if (_arrowFlagsCache) return _arrowFlagsCache;
   const run = (a) => { try { return execSync(`pkg-config ${a}`, { encoding: "utf-8" }).trim(); } catch { return ""; } };
-  _arrowFlagsCache = {
-    cflags: run("--cflags arrow parquet").split(/\s+/).filter(Boolean),
-    libs: run("--libs arrow parquet").split(/\s+/).filter(Boolean),
-  };
+  const cflags = run("--cflags arrow parquet").split(/\s+/).filter(Boolean);
+  const libs = run("--libs arrow parquet").split(/\s+/).filter(Boolean);
+  // Embed rpath so the compiled binary finds libarrow.so.* at RUNTIME without needing
+  // LD_LIBRARY_PATH (Arrow usually lives in the conda env's lib dir, not a system path).
+  const rpathDirs = new Set();
+  for (const f of libs) if (f.startsWith("-L")) rpathDirs.add(f.slice(2));
+  const libdir = run("--variable=libdir arrow");
+  if (libdir) rpathDirs.add(libdir);
+  if (process.env.CONDA_PREFIX) rpathDirs.add(`${process.env.CONDA_PREFIX}/lib`);
+  const rpaths = [...rpathDirs].map((d) => `-Wl,-rpath,${d}`);
+  _arrowFlagsCache = { cflags, libs: [...libs, ...rpaths] };
   return _arrowFlagsCache;
 }
 /** True if a generated .cpp reads Arrow/Feather storage and must link Arrow C++. */
