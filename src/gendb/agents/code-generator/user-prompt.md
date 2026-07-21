@@ -82,6 +82,9 @@ Binary columnar data: {{gendb_dir}}
 
 ## Validation Loop
 Compile: g++ -O3 -march=native -std=c++17 -Wall -lpthread -fopenmp -DGENDB_PROFILE -I{{utils_path}} -o {{binary_name}} {{cpp_name}}
+(If `storage_design.json` `persistent_storage.format` is `arrow_feather`, the query reads
+Feather via `gendb_arrow_storage.h` — append `$(pkg-config --cflags --libs arrow)` to the
+compile command so Arrow C++ links.)
 Run: timeout {{timeout_sec}}s ./{{binary_name}} {{gendb_dir}} {{results_dir}} {{param_cli_args}}
 {{#if has_ground_truth}}
 Validate: python3 {{compare_tool}} {{ground_truth_dir}} {{results_dir}}

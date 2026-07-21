@@ -14,6 +14,13 @@ Read the workload analysis from: {{workload_analysis_path}}
 ## Data Directory (source data files)
 {{data_dir}}
 
+Detect the source file format by extension (one file per table) and follow the "Source Data
+Format" section of your system prompt. For `.parquet`: run the 5-step Architect → Validate →
+Engineer → QA → Refine workflow and produce **Arrow/Feather** storage
+(`persistent_storage.format = "arrow_feather"`) via `arrow_scaffold.h` + `gendb_arrow_storage.h`.
+For delimited text: parse by the detected delimiter and write the existing `.bin`
+`binary_columnar` storage. Record which one you produced in `storage_design.json`.
+
 ## GenDB Storage Directory (output)
 Write binary columnar data to: {{gendb_dir}}
 

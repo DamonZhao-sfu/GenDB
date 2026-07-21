@@ -10,16 +10,26 @@ Think concisely:
 
 ## Workflow
 1. **Detect hardware**: `nproc`, `lscpu | grep -E "cache|Thread|Core|Flags"`, `lsblk -d -o name,rota`, `free -h`
-2. **Profile data** from data directory:
-   - Detect file format: check extensions and delimiters
-   - Row counts: `wc -l <data_dir>/<table>.<ext>` (mandatory, exact)
-   - Column stats: `head -100` (min/max, distinct counts)
-   - Selectivity: `head -1000` sampling for filter predicates
-   - Join key uniqueness: For each join predicate, check if the key is unique on each side.
-     Use sampling: `awk -F'<delim>' '{print $col}' <file> | sort | uniq -c | sort -rn | head -5`
-     For composite keys, concatenate the columns.
-     Report: `left_unique` (bool), `right_unique` (bool), and `right_max_duplicates` (int) from the non-unique side.
-     This is CRITICAL for downstream index design — a 1:1 index on a non-unique key silently drops rows.
+2. **Profile data** from data directory. First detect the source format by file
+   extension (one file per table): **delimited text** (`.tbl`/`.csv`) or **Apache
+   Parquet** (`.parquet`). Record the detected format so the Storage/Index Designer
+   knows how to read it.
+   - **Delimited text** — profile with shell tools:
+     - Row counts: `wc -l <data_dir>/<table>.<ext>` (mandatory, exact)
+     - Column stats: `head -100` (min/max, distinct counts)
+     - Selectivity: `head -1000` sampling for filter predicates
+     - Join key uniqueness: `awk -F'<delim>' '{print $col}' <file> | sort | uniq -c | sort -rn | head -5`
+   - **Parquet** — columnar/binary; shell text tools (`wc`/`head`/`awk`) do NOT work.
+     Profile with DuckDB (preferred) or pyarrow, referencing columns **BY NAME**:
+     - Row counts (exact): `duckdb -c "SELECT count(*) FROM '<data_dir>/<table>.parquet'"`
+       (or `python3 -c "import pyarrow.parquet as pq; print(pq.ParquetFile('<f>').metadata.num_rows)"`)
+     - Column stats: `duckdb -c "SELECT min(<c>), max(<c>), approx_count_distinct(<c>) FROM '<f>'"`
+     - Selectivity / sampling: `duckdb -c "SELECT ... FROM '<f>' USING SAMPLE 1000 ROWS"`
+     - Join key uniqueness: `duckdb -c "SELECT <col>, count(*) n FROM '<f>' GROUP BY 1 ORDER BY n DESC LIMIT 5"`
+   - Join key uniqueness (BOTH formats): for each join predicate report `left_unique`
+     (bool), `right_unique` (bool), and `right_max_duplicates` (int) from the non-unique
+     side (concatenate columns for composite keys). CRITICAL for downstream index design
+     — a 1:1 index on a non-unique key silently drops rows.
 3. **Analyze**: Table roles, join graph, filter selectivities, aggregation patterns
 4. **Write JSON** using the Write tool to the specified path
 5. **Print brief summary**
@@ -28,6 +38,7 @@ Think concisely:
 ```json
 {
   "hardware": { "cpu_cores": "<N>", "cache_sizes": "<lscpu>", "disk_type": "ssd|hdd", "memory_gb": "<N>" },
+  "data_format": "delimited|parquet",
   "tables": {
     "<table>": {
       "role": "fact|dimension", "exact_row_count": 6001215,

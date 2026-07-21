@@ -136,12 +136,16 @@ Workflow:
 1. Check `<gendb_dir>/column_versions/registry.json` — if the needed version exists, skip
    to step 5 (reference it in the plan)
 2. Write a small C++ build program (~50-100 lines) to `<iteration_dir>/build_ext_<name>.cpp`:
-   - Read the source column files (mmap)
+   - Read the source columns. If `storage_design.json` `persistent_storage.format` is
+     `binary_columnar`, mmap the `.bin` files. If it is `arrow_feather`, read them zero-copy
+     via `gendb_arrow_storage.h` (`gendb::OpenTableMmap(...)->` `GetColumnByName`, iterate ALL
+     chunks) — see the Code Generator's "Storage read model".
    - Produce derived encoding files (codes.bin, dict.offsets, dict.data)
    - Output to `<gendb_dir>/column_versions/<table>.<column>.<type>/`
    - Print row count and unique value count for verification
 3. Compile and run it using the Bash tool:
-   `g++ -O3 -std=c++17 -o build_ext build_ext_<name>.cpp && ./build_ext <gendb_dir>`
+   `g++ -O3 -std=c++17 -I<utils_path> -o build_ext build_ext_<name>.cpp && ./build_ext <gendb_dir>`
+   (For `arrow_feather` storage, also add `$(pkg-config --cflags --libs arrow)` so Arrow links.)
 4. Verify output: check that the files exist and row count matches expectation
 5. Update `<gendb_dir>/column_versions/registry.json` — read the existing registry (or
    create it if missing), append the new version entry, write it back

@@ -31,7 +31,8 @@
 import { spawn, execSync } from "child_process";
 import { readFile, writeFile, mkdir, cp, copyFile } from "fs/promises";
 import { resolve, dirname } from "path";
-import { existsSync, readFileSync, rmSync, readdirSync, realpathSync } from "fs";
+import { existsSync, readFileSync, rmSync, readdirSync, realpathSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import {
   DEFAULT_SCHEMA,
@@ -46,6 +47,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const COMPARE_TOOL_PATH = resolve(__dirname, "tools", "compare_results.py");
 const UTILS_PATH = resolve(__dirname, "utils");
+
+// Arrow C++ compile flags (for query binaries that read Arrow/Feather storage).
+// Resolved once via pkg-config; empty if Arrow isn't installed / pkg-config can't find it.
+let _arrowFlagsCache = null;
+function getArrowCompileFlags() {
+  if (_arrowFlagsCache) return _arrowFlagsCache;
+  const run = (a) => { try { return execSync(`pkg-config ${a}`, { encoding: "utf-8" }).trim(); } catch { return ""; } };
+  const cflags = run("--cflags arrow parquet").split(/\s+/).filter(Boolean);
+  const libs = run("--libs arrow parquet").split(/\s+/).filter(Boolean);
+  // Embed rpath so the compiled binary finds libarrow.so.* at RUNTIME without needing
+  // LD_LIBRARY_PATH (Arrow usually lives in the conda env's lib dir, not a system path).
+  const rpathDirs = new Set();
+  for (const f of libs) if (f.startsWith("-L")) rpathDirs.add(f.slice(2));
+  const libdir = run("--variable=libdir arrow");
+  if (libdir) rpathDirs.add(libdir);
+  if (process.env.CONDA_PREFIX) rpathDirs.add(`${process.env.CONDA_PREFIX}/lib`);
+  const rpaths = [...rpathDirs].map((d) => `-Wl,-rpath,${d}`);
+  _arrowFlagsCache = { cflags, libs: [...libs, ...rpaths] };
+  return _arrowFlagsCache;
+}
+/** True if a generated .cpp reads Arrow/Feather storage and must link Arrow C++. */
+function cppNeedsArrow(cppText) {
+  return /#include\s*[<"](?:arrow\/|parquet\/|gendb_arrow_storage\.h)/.test(cppText || "");
+}
 
 import { defaults, getProviderConfig } from "./gendb.config.mjs";
 import { config as workloadAnalyzerConfig } from "./agents/workload-analyzer/index.mjs";
@@ -118,6 +143,8 @@ function parseArgs(argv) {
     agentProvider: defaults.agentProvider,
     memoryDir: defaults.memoryDir,
     reoptimize: null,  // --reoptimize <queryId> to force re-optimization
+    rebuildStorage: false,  // --rebuild-storage to force Phase 1 re-ingestion
+    forceRegenerate: false, // --force-regenerate/--fresh to force ALL query stages to regenerate (skip nothing)
   };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--schema" && argv[i + 1]) args.schema = resolve(argv[++i]);
@@ -133,10 +160,13 @@ function parseArgs(argv) {
     if (argv[i] === "--optimization-target" && argv[i + 1]) args.optimizationTarget = argv[++i];
     if (argv[i] === "--max-concurrent" && argv[i + 1]) args.maxConcurrent = parseInt(argv[++i], 10);
     if (argv[i] === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
+    if (argv[i] === "--base-url" && argv[i + 1]) process.env.VLLM_BASE_URL = argv[++i];
     if (argv[i] === "--no-skills") args.useSkills = false;
     if (argv[i] === "--memory-dir" && argv[i + 1]) args.memoryDir = argv[++i];
     if (argv[i] === "--no-memory") args.memoryDir = null;
     if (argv[i] === "--reoptimize" && argv[i + 1]) args.reoptimize = argv[++i];
+    if (argv[i] === "--rebuild-storage") args.rebuildStorage = true;
+    if (argv[i] === "--force-regenerate" || argv[i] === "--fresh") args.forceRegenerate = true;
   }
   if (args.useSkills === undefined) args.useSkills = defaults.useSkills;
   // Resolve schema/queries from benchmark dir if not explicitly provided
@@ -733,6 +763,20 @@ async function runOfflineStorageOptimization(args, runDir, schema, queries) {
   await writeFile(resolve(args.gendbDir, "storage_design.json"), JSON.stringify(design, null, 2));
   console.log(`[Orchestrator] Copied storage_design.json to ${args.gendbDir}`);
 
+  // Persist a source-data fingerprint next to the storage so that a later run
+  // with changed data (e.g. .tbl -> .parquet) is detected and re-ingested.
+  try {
+    const fp = computeDataFingerprint(args.dataDir);
+    if (fp) {
+      await writeFile(
+        resolve(args.gendbDir, "data_fingerprint.json"),
+        JSON.stringify({ fingerprint: fp, data_dir: args.dataDir, created_at: new Date().toISOString() }, null, 2)
+      );
+    }
+  } catch (err) {
+    console.warn(`[Orchestrator] Could not write data fingerprint (non-fatal): ${err.message}`);
+  }
+
   console.log("\n[Orchestrator] Storage design + ingestion + index building completed (pass 1).");
   console.log(`[Orchestrator] Tables designed: ${Object.keys(design.tables || {}).length}`);
 
@@ -842,6 +886,30 @@ class PipelineProgressTracker {
  * @returns {{ storageExists: boolean, queries: Object.<string, {action: string}> }}
  *   action: "generate" | "instantiate" | "optimize" | "rebenchmark" | "skip"
  */
+/**
+ * Fingerprint the source data so that a change in the input data (a format
+ * switch like .tbl -> .parquet, a different data dir, or changed file sizes)
+ * invalidates persisted storage and triggers a Phase 1 re-ingest. Hash of
+ * sorted "<name>:<size>" for the files directly in the data dir (one file per
+ * table). Returns null if the directory cannot be read.
+ */
+function computeDataFingerprint(dataDir) {
+  try {
+    const parts = [];
+    for (const e of readdirSync(dataDir, { withFileTypes: true })) {
+      if (!e.isFile()) continue;
+      let size = 0;
+      try { size = statSync(resolve(dataDir, e.name)).size; } catch {}
+      parts.push(`${e.name}:${size}`);
+    }
+    if (parts.length === 0) return null;
+    parts.sort();
+    return createHash("sha1").update(parts.join("|")).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
   const state = {
     storageExists: false,
@@ -918,6 +986,26 @@ async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
       // Broken symlink — re-generate
       state.queries[queryId] = { action: "generate" };
     }
+  }
+
+  // Storage was rebuilt (data changed or --rebuild-storage). The existing query
+  // binaries were generated against the OLD storage (and possibly a different
+  // storage format, e.g. .bin binary_columnar -> Arrow/Feather when switching a
+  // table from .tbl to .parquet), so they may read stale/incompatible files
+  // (e.g. l_returnflag.dict.offsets.bin). Rebenchmarking would just re-run that
+  // broken binary, so force full REGENERATION of every affected query against the
+  // freshly ingested storage.
+  if (opts.invalidateStorage) {
+    for (const s of Object.values(state.queries)) {
+      if (s.action === "skip" || s.action === "rebenchmark") s.action = "generate";
+    }
+  }
+
+  // --force-regenerate/--fresh: regenerate EVERY query from scratch (Query Planner ->
+  // Code Generator -> Query Optimizer), skipping nothing, reusing existing storage.
+  // Combine with --rebuild-storage to also re-run Phase 1 (workload analysis + storage).
+  if (opts.forceRegenerate) {
+    for (const s of Object.values(state.queries)) s.action = "generate";
   }
 
   return state;
@@ -1548,6 +1636,7 @@ async function runQueryFullPipeline(
         ``,
         `Compile after fixing:`,
         `g++ -O3 -march=native -std=c++17 -Wall -lpthread -fopenmp -DGENDB_PROFILE -I${UTILS_PATH} -o ${resolve(optIterDir, queryId.toLowerCase())} ${optIterCppPath}`,
+        `(If the query reads Arrow/Feather storage via gendb_arrow_storage.h, append \`$(pkg-config --cflags --libs arrow)\` to the compile command.)`,
       ].join("\n");
 
       await semaphore.acquire();
@@ -2342,10 +2431,13 @@ async function executeQuery(query, iterDir, cppPath, gendbDir, groundTruthDir, r
   // Step 1: Compile (with -fopenmp)
   console.log(`[Executor] [${query.id}] Compiling...`);
   try {
+    // Query code reading Arrow/Feather storage must link Arrow C++ (gendb_arrow_storage.h).
+    const cppText = await readFile(cppPath, "utf-8").catch(() => "");
+    const arrow = cppNeedsArrow(cppText) ? getArrowCompileFlags() : { cflags: [], libs: [] };
     const compileOutput = await runProcess("g++", [
       "-O3", "-march=native", "-std=c++17", "-Wall", "-lpthread", "-fopenmp",
-      "-DGENDB_PROFILE", `-I${UTILS_PATH}`,
-      "-o", binaryPath, cppPath,
+      "-DGENDB_PROFILE", `-I${UTILS_PATH}`, ...arrow.cflags,
+      "-o", binaryPath, cppPath, ...arrow.libs,
     ], { cwd: iterDir, timeout: 120000 });
     results.compile = { status: "pass", output: compileOutput };
     console.log(`[Executor] [${query.id}] Compilation successful.`);
@@ -2618,19 +2710,20 @@ async function printPerQuerySummary(runDir, parsedQueries, runAuditDir) {
       iters.set(iterNum, {
         timing_ms: exec.timing_ms,
         validation: exec.validation?.status || "-",
+        operation_timings: exec.hot_operation_timings || exec.operation_timings || null,
       });
     }
     // Convert map to sparse array indexed by iteration number
     const maxIterNum = iters.size > 0 ? Math.max(...iters.keys()) + 1 : 0;
     const iterArray = [];
     for (let i = 0; i < maxIterNum; i++) {
-      iterArray.push(iters.get(i) || { timing_ms: null, validation: "-" });
+      iterArray.push(iters.get(i) || { timing_ms: null, validation: "-", operation_timings: null });
     }
     if (maxIterNum > maxIter) maxIter = maxIterNum;
     queryData.push({ id: query.id, iters: iterArray });
   }
 
-  if (queryData.length === 0 || maxIter === 0) return;
+  if (queryData.length === 0 || maxIter === 0) return queryData;
 
   // Build header
   const colW = 14;
@@ -2686,6 +2779,79 @@ async function printPerQuerySummary(runDir, parsedQueries, runAuditDir) {
     console.log(timingRow);
     console.log(validRow);
   }
+
+  return queryData;
+}
+
+/**
+ * Write a unified per-query results CSV: execution time, per-phase runtime
+ * breakdown, and generation cost — each row tagged with dataset / sf / model.
+ * One row per query plus a TOTAL row. Returns the CSV path.
+ */
+async function writeRunResultsCsv(runAuditDir, queryData, telemetry, meta) {
+  const csvEscape = (v) => {
+    const s = v === null || v === undefined ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const columns = [
+    "benchmark", "sf", "model", "provider", "run_id", "query_id", "status",
+    "best_time_ms", "best_iter", "num_iterations", "per_iter_ms",
+    "gen_wall_ms", "gen_cost_usd", "phase_breakdown",
+  ];
+  const rows = [columns.join(",")];
+
+  let sumBest = 0;
+  for (const q of queryData || []) {
+    const iters = q.iters || [];
+    // Best = fastest passing iteration
+    let bestTime = null, bestIter = -1, bestOps = null;
+    const perIter = [];
+    for (let i = 0; i < iters.length; i++) {
+      const it = iters[i];
+      perIter.push(it.timing_ms != null ? Math.round(it.timing_ms) : "");
+      if (it.validation === "pass" && it.timing_ms != null && (bestTime === null || it.timing_ms < bestTime)) {
+        bestTime = it.timing_ms; bestIter = i; bestOps = it.operation_timings || null;
+      }
+    }
+    const numIters = iters.filter((it) => it.timing_ms != null || it.validation !== "-").length;
+    const phaseObj = telemetry.phases?.[`query_${q.id}`];
+    const genWall = phaseObj?.total_ms;
+    const genCost = phaseObj
+      ? Object.values(phaseObj.agents || {}).reduce((s, a) => s + (a.cost_usd || 0), 0)
+      : null;
+    // Runtime [TIMING] breakdown of the best iteration, as key=value pairs.
+    const phaseBreakdown = bestOps
+      ? Object.entries(bestOps).map(([k, v]) => `${k}=${v}`).join(";")
+      : "";
+    const status = bestTime !== null
+      ? "PASS"
+      : (iters.some((it) => it.validation === "fail") ? "FAIL" : "-");
+    if (bestTime !== null) sumBest += bestTime;
+
+    rows.push([
+      meta.benchmark, meta.sf, meta.model, meta.provider, meta.runId, q.id, status,
+      bestTime !== null ? Math.round(bestTime) : "",
+      bestIter >= 0 ? bestIter : "",
+      numIters,
+      perIter.join(";"),
+      genWall != null ? Math.round(genWall) : "",
+      genCost != null ? genCost.toFixed(4) : "",
+      phaseBreakdown,
+    ].map(csvEscape).join(","));
+  }
+
+  // TOTAL row: summed best execution time + run-level wall clock / cost.
+  rows.push([
+    meta.benchmark, meta.sf, meta.model, meta.provider, meta.runId, "TOTAL", "",
+    Math.round(sumBest), "", "", "",
+    Math.round(telemetry.total_wall_clock_ms || 0),
+    (telemetry.total_cost_usd || 0).toFixed(4),
+    "",
+  ].map(csvEscape).join(","));
+
+  const csvPath = resolve(runAuditDir, "results.csv");
+  await writeFile(csvPath, rows.join("\n") + "\n");
+  return csvPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -2821,18 +2987,50 @@ async function main() {
     let skipPhase1 = false;
     const queryClassifications = {};  // queryId → classification result (pre-computed)
 
-    // Check if persistent storage already exists in workload dir
+    // Check if persistent storage already exists in workload dir, and whether the
+    // source data still matches what was ingested (fingerprint) — a data change
+    // (e.g. .tbl -> .parquet) or --rebuild-storage forces a Phase 1 re-ingest.
+    let invalidateStorage = false;
     const persistentStorageDesign = resolve(args.gendbDir, "storage_design.json");
     if (existsSync(persistentStorageDesign)) {
-      console.log("\n[Orchestrator] ========== PHASE 0: PERSISTENT STORAGE FOUND ==========\n");
-      console.log("[Orchestrator] Persistent storage found in workload directory — Phase 1 will be skipped.");
-      skipPhase1 = true;
+      let storedFp = null;
+      try { storedFp = JSON.parse(readFileSync(resolve(args.gendbDir, "data_fingerprint.json"), "utf-8")).fingerprint; } catch {}
+      const currentFp = computeDataFingerprint(args.dataDir);
+      if (args.rebuildStorage) {
+        console.log("\n[Orchestrator] ========== PHASE 0: --rebuild-storage — RE-INGESTING ==========\n");
+        console.log("[Orchestrator] --rebuild-storage set: re-running Phase 1 ingestion.");
+        invalidateStorage = true;
+      } else if (storedFp && currentFp && storedFp !== currentFp) {
+        console.log("\n[Orchestrator] ========== PHASE 0: SOURCE DATA CHANGED — RE-INGESTING ==========\n");
+        console.log(`[Orchestrator] Source-data fingerprint changed since last ingest (${storedFp.slice(0, 8)} -> ${currentFp.slice(0, 8)}) — re-running Phase 1.`);
+        invalidateStorage = true;
+      } else {
+        console.log("\n[Orchestrator] ========== PHASE 0: PERSISTENT STORAGE FOUND ==========\n");
+        console.log("[Orchestrator] Persistent storage found in workload directory — Phase 1 will be skipped.");
+        skipPhase1 = true;
+      }
+    }
+
+    // On a storage rebuild, wipe the old storage directory first so a clean rebuild
+    // starts fresh — this removes stale .bin column files and, importantly, the old
+    // column_versions/registry.json (whose derived .bin extensions the Query Optimizer
+    // would otherwise reuse, pulling queries back onto .bin files that no longer match
+    // the new Arrow/Feather storage).
+    if (invalidateStorage) {
+      try {
+        rmSync(args.gendbDir, { recursive: true, force: true });
+        await mkdir(args.gendbDir, { recursive: true });
+        console.log(`[Orchestrator] Cleared old storage at ${args.gendbDir} for a clean rebuild.`);
+      } catch (err) {
+        console.warn(`[Orchestrator] Could not clear old storage (non-fatal): ${err.message}`);
+      }
     }
 
     // Inspect per-query workload state (which queries already have best results)
     const parsedQueriesForState = parseQueryFile(queries);
     const workloadState = await inspectWorkloadState(
-      workloadDir, parsedQueriesForState, { reoptimize: args.reoptimize, hwFingerprint }
+      workloadDir, parsedQueriesForState,
+      { reoptimize: args.reoptimize, hwFingerprint, invalidateStorage, forceRegenerate: args.forceRegenerate }
     );
     args.workloadState = workloadState;
 
@@ -3176,14 +3374,34 @@ async function main() {
 
   // Always write telemetry (even on failure — cost data is always preserved)
   const parsedQueries = parseQueryFile(queries);
-  await printPerQuerySummary(runDir, parsedQueries, runAuditDir);
+  const queryData = await printPerQuerySummary(runDir, parsedQueries, runAuditDir);
 
   telemetryData.total_wall_clock_ms = Date.now() - runStartTime;
   telemetryData.status = pipelineError ? "failed" : "completed";
   if (pipelineError) telemetryData.error = pipelineError.message;
+  // Record run metadata so telemetry.json is self-describing (used by the CSV
+  // writer and the standalone scripts/results-to-csv.mjs backfill tool).
+  telemetryData.benchmark = args.targetBenchmark;
+  telemetryData.scale_factor = args.scaleFactor;
+  telemetryData.provider = args.agentProvider;
+  telemetryData.model = args.modelOverride || args.model || getProviderConfig(args.agentProvider).model;
   // Write telemetry to run audit dir (per-run), not workload dir
   const telemetryPath = resolve(runAuditDir, "telemetry.json");
   await writeFile(telemetryPath, JSON.stringify(telemetryData, null, 2));
+
+  // Write unified per-query results CSV (dataset, sf, model, timing, phase breakdown, cost)
+  try {
+    const csvPath = await writeRunResultsCsv(runAuditDir, queryData, telemetryData, {
+      benchmark: args.targetBenchmark,
+      sf: args.scaleFactor,
+      model: telemetryData.model,
+      provider: args.agentProvider,
+      runId: runAuditDir.split("/").pop(),
+    });
+    console.log(`[Orchestrator] Results CSV: ${csvPath}`);
+  } catch (err) {
+    console.error(`[Orchestrator] Failed to write results CSV (non-fatal): ${err.message}`);
+  }
 
   // Print cost summary
   console.log(`\n[Orchestrator] === Run Summary ===`);

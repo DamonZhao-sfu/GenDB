@@ -94,6 +94,25 @@ The utils directory also contains `date_utils.h`, `cli_params.h`, `hash_utils.h`
 rely on them blindly — they may not be the most effective approach for every query.
 Write your own implementations when the utils don't fit.
 
+### Storage read model — check `storage_design.json` `persistent_storage.format`
+- **`binary_columnar`** (default, delimited-text source): mmap the per-column `.bin`
+  files as today (`mmap_utils.h`).
+- **`arrow_feather`** (Parquet source): columns live in one **Arrow IPC/Feather** file per
+  table. Read them zero-copy via `gendb_arrow_storage.h`:
+  ```cpp
+  #include "gendb_arrow_storage.h"
+  auto table = gendb::OpenTableMmap("<gendb_dir>/<table>.feather").ValueOrDie();  // mmap, zero-copy
+  auto col   = gendb::Column(table, "l_extendedprice");   // shared_ptr<arrow::ChunkedArray>
+  for (int c = 0; c < col->num_chunks(); ++c) {           // iterate ALL chunks
+      auto a = std::static_pointer_cast<arrow::DoubleArray>(col->chunk(c));
+      for (int64_t i = 0; i < a->length(); ++i) { double v = a->Value(i); /* ... */ }
+  }
+  ```
+  Iterate **every** chunk; use the array's null bitmap (`IsNull(i)`) for nullable columns.
+  The per-query guide's Column Reference tells you each column's Feather column name + type.
+  Compile query binaries reading Feather with Arrow linked:
+  `g++ ... -I{{utils_path}} $(pkg-config --cflags --libs arrow) ...`.
+
 ## Storage Extensions (Column Versions)
 The plan.json may include a `storage_extensions` field listing derived column representations
 built by the Query Optimizer. These are pre-built files stored in `<gendb_dir>/column_versions/`
