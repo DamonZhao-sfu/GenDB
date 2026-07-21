@@ -31,7 +31,8 @@
 import { spawn, execSync } from "child_process";
 import { readFile, writeFile, mkdir, cp, copyFile } from "fs/promises";
 import { resolve, dirname } from "path";
-import { existsSync, readFileSync, rmSync, readdirSync, realpathSync } from "fs";
+import { existsSync, readFileSync, rmSync, readdirSync, realpathSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import {
   DEFAULT_SCHEMA,
@@ -118,6 +119,7 @@ function parseArgs(argv) {
     agentProvider: defaults.agentProvider,
     memoryDir: defaults.memoryDir,
     reoptimize: null,  // --reoptimize <queryId> to force re-optimization
+    rebuildStorage: false,  // --rebuild-storage to force Phase 1 re-ingestion
   };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--schema" && argv[i + 1]) args.schema = resolve(argv[++i]);
@@ -138,6 +140,7 @@ function parseArgs(argv) {
     if (argv[i] === "--memory-dir" && argv[i + 1]) args.memoryDir = argv[++i];
     if (argv[i] === "--no-memory") args.memoryDir = null;
     if (argv[i] === "--reoptimize" && argv[i + 1]) args.reoptimize = argv[++i];
+    if (argv[i] === "--rebuild-storage") args.rebuildStorage = true;
   }
   if (args.useSkills === undefined) args.useSkills = defaults.useSkills;
   // Resolve schema/queries from benchmark dir if not explicitly provided
@@ -734,6 +737,20 @@ async function runOfflineStorageOptimization(args, runDir, schema, queries) {
   await writeFile(resolve(args.gendbDir, "storage_design.json"), JSON.stringify(design, null, 2));
   console.log(`[Orchestrator] Copied storage_design.json to ${args.gendbDir}`);
 
+  // Persist a source-data fingerprint next to the storage so that a later run
+  // with changed data (e.g. .tbl -> .parquet) is detected and re-ingested.
+  try {
+    const fp = computeDataFingerprint(args.dataDir);
+    if (fp) {
+      await writeFile(
+        resolve(args.gendbDir, "data_fingerprint.json"),
+        JSON.stringify({ fingerprint: fp, data_dir: args.dataDir, created_at: new Date().toISOString() }, null, 2)
+      );
+    }
+  } catch (err) {
+    console.warn(`[Orchestrator] Could not write data fingerprint (non-fatal): ${err.message}`);
+  }
+
   console.log("\n[Orchestrator] Storage design + ingestion + index building completed (pass 1).");
   console.log(`[Orchestrator] Tables designed: ${Object.keys(design.tables || {}).length}`);
 
@@ -843,6 +860,30 @@ class PipelineProgressTracker {
  * @returns {{ storageExists: boolean, queries: Object.<string, {action: string}> }}
  *   action: "generate" | "instantiate" | "optimize" | "rebenchmark" | "skip"
  */
+/**
+ * Fingerprint the source data so that a change in the input data (a format
+ * switch like .tbl -> .parquet, a different data dir, or changed file sizes)
+ * invalidates persisted storage and triggers a Phase 1 re-ingest. Hash of
+ * sorted "<name>:<size>" for the files directly in the data dir (one file per
+ * table). Returns null if the directory cannot be read.
+ */
+function computeDataFingerprint(dataDir) {
+  try {
+    const parts = [];
+    for (const e of readdirSync(dataDir, { withFileTypes: true })) {
+      if (!e.isFile()) continue;
+      let size = 0;
+      try { size = statSync(resolve(dataDir, e.name)).size; } catch {}
+      parts.push(`${e.name}:${size}`);
+    }
+    if (parts.length === 0) return null;
+    parts.sort();
+    return createHash("sha1").update(parts.join("|")).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
   const state = {
     storageExists: false,
@@ -918,6 +959,15 @@ async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
     } catch {
       // Broken symlink — re-generate
       state.queries[queryId] = { action: "generate" };
+    }
+  }
+
+  // Storage was rebuilt (data changed or --rebuild-storage): a "skip" query still
+  // needs to be re-run and re-validated against the freshly ingested data, so
+  // downgrade skip -> rebenchmark (keeps the existing cpp, no LLM regeneration).
+  if (opts.invalidateStorage) {
+    for (const s of Object.values(state.queries)) {
+      if (s.action === "skip") s.action = "rebenchmark";
     }
   }
 
@@ -2896,18 +2946,34 @@ async function main() {
     let skipPhase1 = false;
     const queryClassifications = {};  // queryId → classification result (pre-computed)
 
-    // Check if persistent storage already exists in workload dir
+    // Check if persistent storage already exists in workload dir, and whether the
+    // source data still matches what was ingested (fingerprint) — a data change
+    // (e.g. .tbl -> .parquet) or --rebuild-storage forces a Phase 1 re-ingest.
+    let invalidateStorage = false;
     const persistentStorageDesign = resolve(args.gendbDir, "storage_design.json");
     if (existsSync(persistentStorageDesign)) {
-      console.log("\n[Orchestrator] ========== PHASE 0: PERSISTENT STORAGE FOUND ==========\n");
-      console.log("[Orchestrator] Persistent storage found in workload directory — Phase 1 will be skipped.");
-      skipPhase1 = true;
+      let storedFp = null;
+      try { storedFp = JSON.parse(readFileSync(resolve(args.gendbDir, "data_fingerprint.json"), "utf-8")).fingerprint; } catch {}
+      const currentFp = computeDataFingerprint(args.dataDir);
+      if (args.rebuildStorage) {
+        console.log("\n[Orchestrator] ========== PHASE 0: --rebuild-storage — RE-INGESTING ==========\n");
+        console.log("[Orchestrator] --rebuild-storage set: re-running Phase 1 ingestion.");
+        invalidateStorage = true;
+      } else if (storedFp && currentFp && storedFp !== currentFp) {
+        console.log("\n[Orchestrator] ========== PHASE 0: SOURCE DATA CHANGED — RE-INGESTING ==========\n");
+        console.log(`[Orchestrator] Source-data fingerprint changed since last ingest (${storedFp.slice(0, 8)} -> ${currentFp.slice(0, 8)}) — re-running Phase 1.`);
+        invalidateStorage = true;
+      } else {
+        console.log("\n[Orchestrator] ========== PHASE 0: PERSISTENT STORAGE FOUND ==========\n");
+        console.log("[Orchestrator] Persistent storage found in workload directory — Phase 1 will be skipped.");
+        skipPhase1 = true;
+      }
     }
 
     // Inspect per-query workload state (which queries already have best results)
     const parsedQueriesForState = parseQueryFile(queries);
     const workloadState = await inspectWorkloadState(
-      workloadDir, parsedQueriesForState, { reoptimize: args.reoptimize, hwFingerprint }
+      workloadDir, parsedQueriesForState, { reoptimize: args.reoptimize, hwFingerprint, invalidateStorage }
     );
     args.workloadState = workloadState;
 
