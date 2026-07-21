@@ -2,7 +2,11 @@
 
 **Paper:** *Experience Graphs: The Data Foundation for Self-Improving Agents* (arXiv:2606.29823)
 **Nature:** **Independent** feature. It does **not** reuse, extend, or depend on GenDB's existing HAG/skills memory (`src/gendb/memory/`). It is its own self-evolving memory system with its own store, its own capture, and its own retrieval.
-**Backing store:** SQLite via the built-in `node:sqlite` (Node ≥ 22.5; this repo runs v22.22) — **zero new dependencies**. This makes the paper's thesis literal: *search over the experience graph is a database access pattern.*
+**Backing store:** pluggable behind one async interface (`openExperienceStore({ backend })`):
+- **SQLite** (default, embedded, zero setup) via built-in `node:sqlite`; vector search via `sqlite-vec` (exhaustive SIMD KNN).
+- **PostgreSQL** (unified engine) via `pg`; vector search via **pgvector HNSW** — a real ANN index (`EXPLAIN` confirms `Index Scan using idx_nodes_hnsw`). Recommended once the graph outgrows a brute-force scan.
+
+Either way the paper's thesis is literal: *search over the experience graph is a database access pattern* — graph traverse = recursive CTE, relation join = SQL joins, vector search = an in-engine KNN/ANN operator.
 
 ---
 
