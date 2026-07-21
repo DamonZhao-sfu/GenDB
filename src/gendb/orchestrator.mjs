@@ -137,6 +137,7 @@ function parseArgs(argv) {
     memoryDir: defaults.memoryDir,
     reoptimize: null,  // --reoptimize <queryId> to force re-optimization
     rebuildStorage: false,  // --rebuild-storage to force Phase 1 re-ingestion
+    forceRegenerate: false, // --force-regenerate/--fresh to force ALL query stages to regenerate (skip nothing)
   };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--schema" && argv[i + 1]) args.schema = resolve(argv[++i]);
@@ -158,6 +159,7 @@ function parseArgs(argv) {
     if (argv[i] === "--no-memory") args.memoryDir = null;
     if (argv[i] === "--reoptimize" && argv[i + 1]) args.reoptimize = argv[++i];
     if (argv[i] === "--rebuild-storage") args.rebuildStorage = true;
+    if (argv[i] === "--force-regenerate" || argv[i] === "--fresh") args.forceRegenerate = true;
   }
   if (args.useSkills === undefined) args.useSkills = defaults.useSkills;
   // Resolve schema/queries from benchmark dir if not explicitly provided
@@ -990,6 +992,13 @@ async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
     for (const s of Object.values(state.queries)) {
       if (s.action === "skip" || s.action === "rebenchmark") s.action = "generate";
     }
+  }
+
+  // --force-regenerate/--fresh: regenerate EVERY query from scratch (Query Planner ->
+  // Code Generator -> Query Optimizer), skipping nothing, reusing existing storage.
+  // Combine with --rebuild-storage to also re-run Phase 1 (workload analysis + storage).
+  if (opts.forceRegenerate) {
+    for (const s of Object.values(state.queries)) s.action = "generate";
   }
 
   return state;
@@ -3013,7 +3022,8 @@ async function main() {
     // Inspect per-query workload state (which queries already have best results)
     const parsedQueriesForState = parseQueryFile(queries);
     const workloadState = await inspectWorkloadState(
-      workloadDir, parsedQueriesForState, { reoptimize: args.reoptimize, hwFingerprint, invalidateStorage }
+      workloadDir, parsedQueriesForState,
+      { reoptimize: args.reoptimize, hwFingerprint, invalidateStorage, forceRegenerate: args.forceRegenerate }
     );
     args.workloadState = workloadState;
 
