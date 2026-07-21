@@ -141,6 +141,36 @@ export const defaults = {
         effortLevel: "medium",
       },
     },
+    "qwen-code": {
+      // Local open-weight model driven through the Qwen Code CLI over vLLM's
+      // OpenAI /v1/chat/completions API (avoids the Codex Responses-API path).
+      // See providers/qwen-code.mjs.
+      model: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+      baseUrl: "http://localhost:8000/v1",
+      agentModels: {
+        workload_analyzer: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        storage_designer: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        query_planner: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        code_generator: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        query_optimizer: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        memory_manager: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+      },
+      // Qwen Code has no per-request effort knob; kept for interface parity.
+      agentEffortLevels: {
+        workload_analyzer: "low",
+        storage_designer: "medium",
+        query_planner: "medium",
+        code_generator: "medium",
+        query_optimizer: "medium",
+        memory_manager: "medium",
+      },
+      escalationModel: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+      escalationEffortLevel: "high",
+      singleAgent: {
+        model: "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        effortLevel: "medium",
+      },
+    },
   },
 };
 
