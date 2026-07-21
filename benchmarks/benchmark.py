@@ -45,14 +45,14 @@ def _load_workload_module(workload_path):
 def main():
     parser = argparse.ArgumentParser(
         description="Unified Benchmark: GenDB vs PostgreSQL vs DuckDB vs ClickHouse vs Umbra vs MonetDB")
-    parser.add_argument("--benchmark", choices=["tpc-h", "sec-edgar", "all"], required=True,
+    parser.add_argument("--benchmark", choices=["tpc-h", "tpc-ds", "sec-edgar", "all"], required=True,
                         help="Workload to benchmark")
 
-    # TPC-H specific
+    # TPC-H / TPC-DS specific
     parser.add_argument("--sf", type=int, default=None,
-                        help="Scale factor for TPC-H (e.g., 1, 10)")
+                        help="Scale factor for TPC-H / TPC-DS (e.g., 1, 10)")
     parser.add_argument("--data-dir", type=Path, default=None,
-                        help="Path to TPC-H .tbl data files")
+                        help="Path to TPC-H / TPC-DS .tbl data files")
 
     # SEC-EDGAR specific
     parser.add_argument("--years", type=int, default=None,
@@ -136,6 +136,10 @@ def main():
             if args.sf is None:
                 parser.error("--sf is required for TPC-H benchmark")
             mod = _load_workload_module(benchmarks_dir / "tpc-h" / "workload.py")
+        elif args.benchmark == "tpc-ds":
+            if args.sf is None:
+                parser.error("--sf is required for TPC-DS benchmark")
+            mod = _load_workload_module(benchmarks_dir / "tpc-ds" / "workload.py")
         elif args.benchmark == "sec-edgar":
             if args.years is None:
                 parser.error("--years is required for SEC-EDGAR benchmark")

@@ -79,7 +79,8 @@ export function parseQueryFile(queriesText) {
   let queryNum = 1;
   for (const part of parts) {
     const trimmed = part.trim();
-    if (!trimmed || !trimmed.includes("SELECT")) continue;
+    // Case-insensitive SELECT check: TPC-DS reference queries are lowercase.
+    if (!trimmed || !/\bselect\b/i.test(trimmed)) continue;
 
     // Try to extract query ID from comment
     const idMatch = trimmed.match(/--\s*(?:Q|Query)\s*(\d+)/i);
