@@ -48,6 +48,23 @@ const __dirname = dirname(__filename);
 const COMPARE_TOOL_PATH = resolve(__dirname, "tools", "compare_results.py");
 const UTILS_PATH = resolve(__dirname, "utils");
 
+// Arrow C++ compile flags (for query binaries that read Arrow/Feather storage).
+// Resolved once via pkg-config; empty if Arrow isn't installed / pkg-config can't find it.
+let _arrowFlagsCache = null;
+function getArrowCompileFlags() {
+  if (_arrowFlagsCache) return _arrowFlagsCache;
+  const run = (a) => { try { return execSync(`pkg-config ${a}`, { encoding: "utf-8" }).trim(); } catch { return ""; } };
+  _arrowFlagsCache = {
+    cflags: run("--cflags arrow parquet").split(/\s+/).filter(Boolean),
+    libs: run("--libs arrow parquet").split(/\s+/).filter(Boolean),
+  };
+  return _arrowFlagsCache;
+}
+/** True if a generated .cpp reads Arrow/Feather storage and must link Arrow C++. */
+function cppNeedsArrow(cppText) {
+  return /#include\s*[<"](?:arrow\/|parquet\/|gendb_arrow_storage\.h)/.test(cppText || "");
+}
+
 import { defaults, getProviderConfig } from "./gendb.config.mjs";
 import { config as workloadAnalyzerConfig } from "./agents/workload-analyzer/index.mjs";
 import { config as storageDesignerConfig } from "./agents/storage-index-designer/index.mjs";
@@ -1603,6 +1620,7 @@ async function runQueryFullPipeline(
         ``,
         `Compile after fixing:`,
         `g++ -O3 -march=native -std=c++17 -Wall -lpthread -fopenmp -DGENDB_PROFILE -I${UTILS_PATH} -o ${resolve(optIterDir, queryId.toLowerCase())} ${optIterCppPath}`,
+        `(If the query reads Arrow/Feather storage via gendb_arrow_storage.h, append \`$(pkg-config --cflags --libs arrow)\` to the compile command.)`,
       ].join("\n");
 
       await semaphore.acquire();
@@ -2397,10 +2415,13 @@ async function executeQuery(query, iterDir, cppPath, gendbDir, groundTruthDir, r
   // Step 1: Compile (with -fopenmp)
   console.log(`[Executor] [${query.id}] Compiling...`);
   try {
+    // Query code reading Arrow/Feather storage must link Arrow C++ (gendb_arrow_storage.h).
+    const cppText = await readFile(cppPath, "utf-8").catch(() => "");
+    const arrow = cppNeedsArrow(cppText) ? getArrowCompileFlags() : { cflags: [], libs: [] };
     const compileOutput = await runProcess("g++", [
       "-O3", "-march=native", "-std=c++17", "-Wall", "-lpthread", "-fopenmp",
-      "-DGENDB_PROFILE", `-I${UTILS_PATH}`,
-      "-o", binaryPath, cppPath,
+      "-DGENDB_PROFILE", `-I${UTILS_PATH}`, ...arrow.cflags,
+      "-o", binaryPath, cppPath, ...arrow.libs,
     ], { cwd: iterDir, timeout: 120000 });
     results.compile = { status: "pass", output: compileOutput };
     console.log(`[Executor] [${query.id}] Compilation successful.`);
