@@ -52,10 +52,26 @@ const DICT_ENCODINGS = new Set(["PLAIN_DICTIONARY", "RLE_DICTIONARY"]);
 
 const NULL_HANDLING = new Set(["no_nulls", "validity_bitmap", "definition_levels"]);
 
-const GENDB_CPP_TYPES = new Set([
-  "char", "int8_t", "int16_t", "int32_t", "int64_t",
-  "uint32_t", "uint64_t", "float", "double", "string",
+const ARROW_APPEND_FNS = new Set([
+  "ab_append_bool", "ab_append_int8", "ab_append_int16", "ab_append_int32",
+  "ab_append_int64", "ab_append_float32", "ab_append_float64", "ab_append_string",
 ]);
+
+// Map an Arrow C Data Interface format string to the arrow_scaffold.h append fn it must
+// use. Returns null for unknown formats, or { bad: "prefix" } for a forbidden '?' prefix.
+function expectedAppendFn(fmt) {
+  if (typeof fmt !== "string" || fmt.length === 0) return null;
+  if (fmt.startsWith("?")) return { bad: "prefix" };
+  if (fmt === "b") return "ab_append_bool";
+  if (fmt === "c" || fmt === "C") return "ab_append_int8";
+  if (fmt === "s" || fmt === "S") return "ab_append_int16";
+  if (fmt === "i" || fmt === "I" || fmt === "tdD") return "ab_append_int32";
+  if (fmt === "l" || fmt === "L" || fmt.startsWith("ts")) return "ab_append_int64";
+  if (fmt === "f") return "ab_append_float32";
+  if (fmt === "g" || fmt.startsWith("d:")) return "ab_append_float64";
+  if (fmt === "u" || fmt === "U" || fmt === "z" || fmt === "Z") return "ab_append_string";
+  return null;
+}
 
 // Physical carriers allowed for each logical type. null = any physical is fine.
 const LOGICAL_PHYSICAL = {
@@ -76,7 +92,7 @@ const LOGICAL_PHYSICAL = {
 
 const REQUIRED_COL_KEYS = [
   "parquet_name", "physical_type", "logical_type", "encoding",
-  "is_dictionary_encoded", "arrow_array_type", "gendb_cpp_type",
+  "is_dictionary_encoded", "arrow_array_type", "arrow_format", "ab_append_fn",
   "nullable", "null_handling", "decode_strategy",
 ];
 
@@ -140,8 +156,22 @@ function validateColumn(table, colName, col) {
   if (col.null_handling !== undefined && !NULL_HANDLING.has(col.null_handling)) {
     issues.push(`${where}: unknown null_handling '${col.null_handling}' — allowed: ${[...NULL_HANDLING].join(", ")}`);
   }
-  if (col.gendb_cpp_type !== undefined && !GENDB_CPP_TYPES.has(col.gendb_cpp_type)) {
-    issues.push(`${where}: unknown gendb_cpp_type '${col.gendb_cpp_type}' — allowed: ${[...GENDB_CPP_TYPES].join(", ")}`);
+  // Arrow output format string + matching arrow_scaffold.h append fn (Jailbreak-style
+  // _check_format: known format, no '?' prefix, append fn consistent with the format).
+  const fmt = col.arrow_format;
+  const appendFn = col.ab_append_fn;
+  if (fmt !== undefined) {
+    const exp = expectedAppendFn(fmt);
+    if (exp && exp.bad === "prefix") {
+      issues.push(`${where}: arrow_format '${fmt}' starts with '?' — nullable uses a validity bitmap, not a '?' prefix. Remove it.`);
+    } else if (exp === null) {
+      issues.push(`${where}: unknown arrow_format '${fmt}' — allowed Arrow C Data Interface formats: b,c,C,s,S,i,I,l,L,f,g,u,U,z,Z,tdD,'d:M,D','tsX:tz'`);
+    } else if (appendFn !== undefined && ARROW_APPEND_FNS.has(appendFn) && appendFn !== exp) {
+      issues.push(`${where}: ab_append_fn '${appendFn}' does not match arrow_format '${fmt}' (expected '${exp}')`);
+    }
+  }
+  if (appendFn !== undefined && !ARROW_APPEND_FNS.has(appendFn)) {
+    issues.push(`${where}: unknown ab_append_fn '${appendFn}' — allowed: ${[...ARROW_APPEND_FNS].join(", ")}`);
   }
   if ("decode_strategy" in col && !isNonEmptyString(col.decode_strategy)) {
     issues.push(`${where}: 'decode_strategy' must be a non-empty string describing how to materialize one value per row`);

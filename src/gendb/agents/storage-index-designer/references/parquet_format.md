@@ -3,7 +3,9 @@
 Knowledge base for the Storage/Index Designer's **Parquet Architect** step. It contains
 the file layout, physical/logical type rules, encodings, null handling, the exact Apache
 Arrow C++ read patterns, and hard-won gotchas needed to produce a **correct** Parquet
-ingest reader that materializes GenDB's binary columnar storage.
+ingest reader. GenDB is **Arrow-native**: the reader decodes each column and appends values
+via `arrow_scaffold.h` (`ab_append_*`), then persists one **Arrow IPC/Feather** file per
+table via `gendb_arrow_storage.h`. Query binaries mmap those files for zero-copy reads.
 
 The Architect step reads this file, inspects the actual Parquet metadata, and emits a
 `parquet_spec.json` (contract at the end of this file). A mechanical validator
@@ -329,11 +331,11 @@ table. `tools/validate-parquet-spec.mjs` checks it before any C++ is generated.
           "is_dictionary_encoded": true,
           "compression": "SNAPPY",
           "arrow_array_type": "DictionaryArray",
-          "gendb_cpp_type": "char",
-          "gendb_encoding": "dictionary",
+          "arrow_format": "u",
+          "ab_append_fn": "ab_append_string",
           "nullable": false,
           "null_handling": "no_nulls",
-          "decode_strategy": "Cast the DictionaryArray chunk to utf8 (or index dictionary()[indices()[i]]); write one char per row across ALL chunks; emit exactly num_rows values.",
+          "decode_strategy": "Cast the DictionaryArray chunk to utf8 (or index dictionary()[indices()[i]]); ab_append_string(one char) per row across ALL chunks; emit exactly num_rows values.",
           "gotchas": ["low-cardinality string; dictionary-encoded; decode to logical values, not indices"]
         },
         "l_extendedprice": {
@@ -346,11 +348,11 @@ table. `tools/validate-parquet-spec.mjs` checks it before any C++ is generated.
           "is_dictionary_encoded": false,
           "compression": "SNAPPY",
           "arrow_array_type": "Decimal128Array",
-          "gendb_cpp_type": "double",
-          "gendb_encoding": "none",
+          "arrow_format": "g",
+          "ab_append_fn": "ab_append_float64",
           "nullable": false,
           "null_handling": "no_nulls",
-          "decode_strategy": "read unscaled integer, value = unscaled / 10^scale (scale=2), write double per row across all chunks",
+          "decode_strategy": "read unscaled integer, value = unscaled / 10^scale (scale=2), ab_append_float64 per row across all chunks",
           "gotchas": ["DECIMAL scale=2 — dividing wrong scales every SUM"]
         },
         "l_shipdate": {
@@ -361,11 +363,11 @@ table. `tools/validate-parquet-spec.mjs` checks it before any C++ is generated.
           "is_dictionary_encoded": false,
           "compression": "SNAPPY",
           "arrow_array_type": "Date32Array",
-          "gendb_cpp_type": "int32_t",
-          "gendb_encoding": "none",
+          "arrow_format": "tdD",
+          "ab_append_fn": "ab_append_int32",
           "nullable": false,
           "null_handling": "no_nulls",
-          "decode_strategy": "Date32 value is days since 1970-01-01 — write int32 directly, no shift",
+          "decode_strategy": "Date32 value is days since 1970-01-01 — ab_append_int32 directly, no shift",
           "gotchas": []
         }
       }
@@ -378,8 +380,12 @@ table. `tools/validate-parquet-spec.mjs` checks it before any C++ is generated.
 - Top level: `source_format` (must be `"parquet"`), `file_layout`, `tables` (non-empty).
 - Per table: `parquet_file`, `num_rows_source`, `columns` (non-empty).
 - Per column: `parquet_name`, `physical_type`, `logical_type`, `encoding` (array),
-  `is_dictionary_encoded` (bool), `arrow_array_type`, `gendb_cpp_type`, `nullable` (bool),
-  `null_handling`, `decode_strategy` (non-empty).
+  `is_dictionary_encoded` (bool), `arrow_array_type`, `arrow_format`, `ab_append_fn`,
+  `nullable` (bool), `null_handling`, `decode_strategy` (non-empty).
+- `arrow_format` is the Arrow C Data Interface format string of the OUTPUT column, and
+  `ab_append_fn` is the matching `arrow_scaffold.h` builder call — together they drive the
+  generated ingest, which appends decoded values and persists an Arrow IPC/Feather file
+  via `gendb_arrow_storage.h`.
 - When `logical_type == "DECIMAL"`: also `decimal_precision` and `decimal_scale`.
 - When `is_dictionary_encoded == true`: `decode_strategy` MUST describe decoding to logical
   values (mention "decode"/"dictionary"/"cast"/"values") and MUST NOT describe writing
@@ -393,8 +399,13 @@ table. `tools/validate-parquet-spec.mjs` checks it before any C++ is generated.
 - `encoding` entries ∈ {PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY, RLE, BIT_PACKED,
   DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT}.
 - `null_handling` ∈ {no_nulls, validity_bitmap, definition_levels}.
-- `gendb_cpp_type` ∈ {char, int8_t, int16_t, int32_t, int64_t, uint32_t, uint64_t, float,
-  double, string} (extend as the storage design requires).
+- `arrow_format` ∈ {b, c, C, s, S, i, I, l, L, f, g, u, U, z, Z, tdD, `d:M,D` (decimal),
+  `tsX:tz` (timestamp)} — the Arrow C Data Interface format string. NEVER prefix with `?`
+  (nullable uses a validity bitmap, not a `?` prefix).
+- `ab_append_fn` ∈ {ab_append_bool, ab_append_int8, ab_append_int16, ab_append_int32,
+  ab_append_int64, ab_append_float32, ab_append_float64, ab_append_string} and MUST match
+  `arrow_format`: b→bool; c/C→int8; s/S→int16; i/I/tdD→int32; l/L/tsX→int64; f→float32;
+  g/d:→float64; u/U/z/Z→string.
 
 ### Physical ↔ logical consistency the validator enforces
 - STRING/ENUM/JSON/BSON → BYTE_ARRAY.
