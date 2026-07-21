@@ -3,6 +3,11 @@
  * Mechanical validator for the Parquet Architect's `parquet_spec.json`
  * (GenDB port of Jailbreak's agents/spec_validator.py).
  *
+ * Benchmark-agnostic: it validates the spec for ANY workload (TPC-H, TPC-DS, or
+ * custom) — arbitrary tables/columns, TPC-DS decimals, integer surrogate keys,
+ * CHAR/VARCHAR strings, dates, and the many NULLABLE columns TPC-DS introduces are
+ * all covered by the type/null-handling rules below.
+ *
  * It runs NO LLM — it deterministically catches the hallucination / knowledge-gap
  * patterns that silently corrupt storage before any C++ is generated:
  *   - missing required keys

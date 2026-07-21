@@ -420,8 +420,45 @@ small relative tolerance; distinct counts for dict columns). A mismatch on a spe
 column that persists across ingest retries indicates a **spec-level** error for that column
 — revise `parquet_spec.json` for that column, don't just regenerate code.
 
-## 12. TPC-H high-risk columns (dictionary-encoded low-cardinality)
-Treat these as the columns most likely to trigger the row-count / value bug; verify their
-`is_dictionary_encoded` flag and decode strategy explicitly:
-`l_returnflag`, `l_linestatus`, `l_shipinstruct`, `l_shipmode`, `o_orderstatus`,
+## 12. High-risk dictionary-encoded columns (TPC-H & TPC-DS)
+Everything above is benchmark-agnostic — the same type/encoding/Arrow rules apply to any
+workload. The columns below are the ones most likely to trigger the row-count / value bug
+because they are **low-cardinality strings that writers almost always dictionary-encode**.
+Verify their `is_dictionary_encoded` flag and decode strategy explicitly (§6.3).
+
+**TPC-H:** `l_returnflag`, `l_linestatus`, `l_shipinstruct`, `l_shipmode`, `o_orderstatus`,
 `o_orderpriority`, `c_mktsegment`, `n_name`, `r_name`, `p_brand`, `p_mfgr`, `p_container`.
+
+**TPC-DS** (dimension tables are full of low-cardinality strings and Y/N flags):
+- `item`: `i_brand`, `i_category`, `i_class`, `i_color`, `i_size`, `i_units`, `i_container`, `i_manufact`
+- `customer_demographics`: `cd_gender`, `cd_marital_status`, `cd_education_status`, `cd_credit_rating`
+- `household_demographics`: `hd_buy_potential`
+- `customer`: `c_preferred_cust_flag`, `c_salutation`, `c_birth_country`
+- `customer_address`: `ca_state`, `ca_country`, `ca_city`, `ca_zip`, `ca_location_type`, `ca_gmt_offset`
+- `store` / `web_site` / `call_center`: `s_state`, `s_country`, `s_city`, `s_zip`, company/name columns
+- `date_dim`: `d_day_name`, `d_quarter_name`, `d_holiday`, `d_weekend`, `d_following_holiday`
+- `time_dim`: `t_am_pm`, `t_shift`, `t_sub_shift`, `t_meal_time`
+- `promotion`: `p_channel_dmail`, `p_channel_email`, `p_channel_catalog`, … (Y/N flags)
+- `ship_mode`, `reason`, `income_band`, `warehouse`, `web_page`, `catalog_page`: various codes/flags
+
+## 13. TPC-DS specifics (differences from TPC-H that affect the reader)
+1. **Many columns are NULLABLE.** Unlike TPC-H (mostly NOT NULL), TPC-DS fact tables
+   (`store_sales`, `catalog_sales`, `web_sales`, and their returns) have numerous nullable
+   measure and foreign-key columns, and dimension tables have nullable attributes. So
+   `nullable: true` with `null_handling: "validity_bitmap"` (Arrow) is the COMMON case, not
+   the exception. Never blanket-set `null_handling: "no_nulls"` — check each column's
+   `null_count` in the Parquet stats / Arrow `null_count()`. Skipping nulls or treating them
+   as 0/"" corrupts aggregates and join cardinalities.
+2. **Surrogate keys are integers.** All `*_sk` columns (e.g. `ss_item_sk`, `d_date_sk`,
+   `ss_sold_date_sk`) are `INT32`/`INT64` identifiers (logical `INT`/`NONE`), often the
+   join keys. `ss_sold_date_sk` etc. can be **NULL** in the fact tables — handle it.
+3. **Dates:** `date_dim.d_date` is a `DATE` (`INT32` days since epoch, §4). Most date
+   filtering, however, joins facts to `date_dim` via the integer `*_date_sk`, then filters
+   on `d_year`/`d_moy`/`d_qoy` (plain integers). `time_dim.t_time` is an integer number of
+   seconds since midnight (logical `NONE` on `INT32`), not a Parquet `TIME`.
+4. **Decimals everywhere.** Money/measure columns (e.g. `ss_ext_sales_price`,
+   `ss_net_profit`, `cs_wholesale_cost`) are `DECIMAL(7,2)`-style — get `decimal_scale`
+   right for every one or every SUM/AVG is wrong.
+5. **Scale:** TPC-DS has 24 tables and up to ~429 columns total; produce a spec entry for
+   **every** column of every table you ingest, and rely on the validator's schema-coverage
+   check to catch omissions.
