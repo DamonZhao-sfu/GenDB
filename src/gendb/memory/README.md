@@ -39,6 +39,28 @@ Claude SDK agents auto-discover skills via `settingSources: ['project']`. No man
 - **Phase 2**: Agents receive L0/L1 pre-injection + native skill access
 - **Phase 3**: Memory Manager extracts non-obvious knowledge, creates/evolves skills
 
+## Experience Graph (raw substrate beneath L0)
+
+The HAG stores *distilled* knowledge. The **Experience Graph**
+(`experience-graph.mjs`) stores the *raw branching search* that produced it —
+every optimization attempt, including the regressions and abandoned branches the
+distillation step discards. It implements the four-table
+Tasks/Sessions/Nodes/Prompts schema from **"Experience Graphs: The Data
+Foundation for Self-Improving Agents"** (arXiv:2606.29823): nodes carry a
+`parent_id` (causal lineage), an `artifact_ref` (C++ dir *by reference*), a
+`reward`, evaluation evidence, and MCTS-style `algo_meta` (visit_count,
+cumulative_reward) updated by `backpropagate()`. `findSimilarTasks()` enables
+cross-session reuse by task-embedding similarity.
+
+Backfill existing runs:
+
+```bash
+node src/gendb/memory/ingest-experience.mjs --scan output/<...> \
+  --benchmark tpc-h --scale-factor 10 --memory-dir gendb-memory
+```
+
+See `docs/experience-graph-integration.md` for the full plan and phase roadmap.
+
 ## Key Design Principles
 
 1. **Learn what's non-obvious**: Focus on iteration breakthroughs, not first-iteration successes

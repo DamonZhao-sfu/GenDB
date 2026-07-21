@@ -36,6 +36,23 @@ export {
 // Keep exports for backward compatibility during migration
 export { searchMemory, getLoadMemoryToolDefinition, handleLoadMemory } from "./search-tool.mjs";
 
+// Experience Graph (arXiv:2606.29823) — first-class raw search-trajectory store
+// that sits beneath L0. Captures every optimization attempt (incl. dead-ends)
+// as queryable Tasks/Sessions/Nodes/Prompts before distillation into skills.
+export {
+  initExperienceGraph,
+  upsertTask,
+  findSimilarTasks,
+  createSession,
+  insertNode,
+  ancestors,
+  siblings,
+  bestNode,
+  backpropagate,
+  ingestOptimizationHistory,
+  getExperienceGraphSummary,
+} from "./experience-graph.mjs";
+
 /**
  * Initialize the memory system.
  * Creates directory structure and config if they don't exist.
