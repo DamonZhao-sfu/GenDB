@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_task    ON nodes(task_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(task_id);
 CREATE INDEX IF NOT EXISTS idx_prompts_node  ON prompts(node_id);
 
--- HNSW ANN indexes for vector search (cosine). This is the real ANN index the
--- SQLite/sqlite-vec path lacks (sqlite-vec is exhaustive SIMD KNN).
+-- HNSW ANN indexes for vector search (cosine) — real approximate nearest
+-- neighbor, used by the searchSimilar* queries (ORDER BY embedding <=> $1).
 CREATE INDEX IF NOT EXISTS idx_tasks_hnsw ON tasks USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_nodes_hnsw ON nodes USING hnsw (embedding vector_cosine_ops);

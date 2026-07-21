@@ -3,89 +3,83 @@
 An **independent** self-evolving memory system based on *Experience Graphs: The
 Data Foundation for Self-Improving Agents* (arXiv:2606.29823). It does **not**
 reuse GenDB's HAG/skills memory (`src/gendb/memory/`) — separate store, separate
-capture, separate `--experience-dir` flag.
+capture, separate flag.
 
 It makes the optimize loop's **branching search tree** first-class, queryable
 state. `optimization_history.json` is a *linear projection* of that tree (each
 iteration warm-starts from best-so-far); this module recovers the parent edges,
 sibling sets, and dead branches the linear view throws away.
 
-## Backends (pluggable — same async interface)
+## Backing store: PostgreSQL + pgvector
 
-Open either backend through the unified entry point; the orchestrator and all
-callers are backend-agnostic:
+A single PostgreSQL database with the `vector` (pgvector) extension — a genuinely
+unified engine for the paper's three access patterns:
 
-```js
-import { openExperienceStore } from "./index.mjs";
-const store = await openExperienceStore({ backend: "sqlite", dir: "gendb-experience" });
-const store = await openExperienceStore({ backend: "postgres", connectionString: "postgres://…" });
-// selection precedence: opts.backend → env GENDB_EXPERIENCE_PG → "sqlite"
-```
-
-| Backend | Engine | Graph traverse | Relation join | Vector search |
-|---|---|---|---|---|
-| **sqlite** (default, zero setup) | `node:sqlite` (Node ≥ 22.5) | recursive CTE | SQL joins | **sqlite-vec** exhaustive SIMD KNN (JS-cosine fallback) |
-| **postgres** (unified engine) | PostgreSQL + `pg` | recursive CTE | SQL joins | **pgvector HNSW** — real approximate-NN index |
-
-Design doc: [`docs/experience-graph-plan.md`](../../../docs/experience-graph-plan.md).
-
-### ANN / HNSW
-
-- **Postgres backend = real ANN today.** `schema.pg.sql` creates
-  `USING hnsw (embedding vector_cosine_ops)` on `tasks` and `nodes`; queries
-  `ORDER BY embedding <=> $1` use it (`EXPLAIN` shows `Index Scan using
-  idx_nodes_hnsw`). This is the recommended path once the graph outgrows a
-  brute-force scan.
-- **SQLite backend** uses `sqlite-vec`, which is an *exhaustive* SIMD KNN (no
-  ANN index yet — ANN is on sqlite-vec's roadmap). Fine to ~10⁵ vectors. For
-  embedded ANN sooner, an `hnswlib-node` sidecar index is a drop-in option
-  behind the same `searchSimilar*` functions.
-
-## Four tables (paper-faithful)
-
-`tasks` → `sessions` → `nodes` (parent-pointer forest) → `prompts`. See
-[`schema.sql`](./schema.sql). Large artifacts (C++, plans, exec results, prompt
-logs) are stored **by reference** (paths into `output/**`).
-
-## Three access patterns (`query.mjs`)
-
-| Pattern | Implementation | Functions |
+| Access pattern | Engine mechanism | API (`query`/store methods) |
 |---|---|---|
 | **Graph traverse** | recursive CTE over `nodes.parent_node_id` | `getAncestors`, `getDescendants`, `getSiblings`, `getChildren`, `getSessionTree` |
-| **Relation join** | SQL joins across the four tables | `getBestNodeForTask`, `getWinningPrompt`, `getTaskLeaderboard` |
-| **Vector search** | **sqlite-vec** `vec_distance_cosine` (in-engine SIMD KNN) over the `embedding` BLOB columns; JS cosine fallback if the extension can't load | `searchSimilarTasks`, `searchSimilarStrategies` |
+| **Relation join** | SQL joins across `tasks/sessions/nodes/prompts` | `getBestNodeForTask`, `getWinningPrompt`, `getTaskLeaderboard` |
+| **Vector search** | pgvector cosine `<=>` over an **HNSW ANN index** | `searchSimilarTasks`, `searchSimilarStrategies` |
 
-MCTS-style `backpropReward` rolls a leaf's reward up its ancestor chain
-(`visit_count`, `best_descendant_ms`).
+The HNSW indexes (`schema.pg.sql`, `USING hnsw (embedding vector_cosine_ops)` on
+`tasks` and `nodes`) give real approximate-NN; `EXPLAIN` shows
+`Index Scan using idx_nodes_hnsw`. Large artifacts (C++, plans, exec results) are
+stored **by reference** (paths into `output/**`). Design doc:
+[`docs/experience-graph-plan.md`](../../../docs/experience-graph-plan.md).
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `index.mjs` | unified `openExperienceStore({ backend })` dispatcher |
-| `schema.sql` / `schema.pg.sql` | four-table DDL (SQLite / Postgres) |
-| `store.mjs` | SQLite open/init + capture (sync core) |
-| `query.mjs` | SQLite three access patterns (sync core) |
-| `backends/sqlite.mjs` | async facade over the SQLite core |
-| `backends/postgres.mjs` | Postgres/pgvector backend (async) |
+| `index.mjs` | `openExperienceStore({ connectionString })` entry point |
+| `schema.pg.sql` | four-table DDL + HNSW indexes |
+| `backends/postgres.mjs` | the store (capture + the three access patterns) |
+| `ids.mjs` | stable `taskId` / `sessionId` / `nodeId` |
 | `embed.mjs` | pluggable text→vector (deterministic offline default) |
 | `reconstruct.mjs` | best-so-far parent-pointer reconstruction |
-| `experience.test.mjs` | SQLite tests (Q24 / single-iter / all-regression) |
-| `experience.pg.test.mjs` | Postgres tests (skips without `GENDB_EXPERIENCE_PG_TEST`) |
+| `ingest.mjs` | history → store (shared by backfill + live capture) |
+| `capture.mjs` | `createCapture(args)` — NOOP-safe live capture for the orchestrator |
+| `experience.test.mjs` | tests (skip without `GENDB_EXPERIENCE_PG_TEST`) |
 
-## Usage
+## How to run
 
+### 0. Prerequisites — a Postgres with pgvector
 ```bash
-# Backfill the graph from existing runs (reconstructs the branching trees)
-node scripts/backfill_experience.mjs --root output --out gendb-experience          # SQLite (default)
-node scripts/backfill_experience.mjs --root output --backend postgres --pg-url postgres://…/db
-node scripts/backfill_experience.mjs --root output --dry-run                        # inspect, no writes
-
-# Run tests
-node src/gendb/experience/experience.test.mjs                                       # SQLite
-GENDB_EXPERIENCE_PG_TEST=postgres://…/throwaway node src/gendb/experience/experience.pg.test.mjs
+# Debian/Ubuntu example
+sudo apt-get install -y postgresql-16 postgresql-16-pgvector
+createdb gendb_experience
+psql -d gendb_experience -c "CREATE EXTENSION IF NOT EXISTS vector;"
+export GENDB_EXPERIENCE_PG="postgres://<user>@<host>:5432/gendb_experience"
 ```
 
-Live capture during the optimize loop (guarded by `--experience-dir`) is Phase
-(a) wiring into `orchestrator.mjs`; closed-loop warm-start reuse is Phase (c).
-Status/roadmap: see the design doc.
+### 1. Live capture during a GenDB run
+```bash
+# enable via the flag …
+node src/gendb/orchestrator.mjs --benchmark tpc-h --sf 10 \
+     --experience-pg "$GENDB_EXPERIENCE_PG"
+# … or via env (GENDB_EXPERIENCE_PG); with neither, capture is OFF (default).
+```
+Each query's search tree is written to Postgres as the query finishes.
+
+### 2. Backfill from existing runs
+```bash
+node scripts/backfill_experience.mjs --root output --pg-url "$GENDB_EXPERIENCE_PG"
+node scripts/backfill_experience.mjs --root output --dry-run     # inspect, no writes
+```
+
+### 3. Query the graph
+```bash
+node --input-type=module -e '
+import { openExperienceStore } from "./src/gendb/experience/index.mjs";
+const s = await openExperienceStore({});                 // uses GENDB_EXPERIENCE_PG / libpq env
+console.log(await s.getTaskLeaderboard("tpc-h"));
+console.log((await s.getAncestors("<node_id>")).map(n => n.iteration));
+console.log(await s.searchSimilarStrategies("cache-exceeding hash probe", 5));
+await s.close();'
+```
+
+### 4. Tests (throwaway DB — drops its four tables)
+```bash
+GENDB_EXPERIENCE_PG_TEST="postgres://user@host/throwaway" \
+  node src/gendb/experience/experience.test.mjs
+```

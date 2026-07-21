@@ -1,35 +1,25 @@
 /**
- * Experience Graph — unified entry point.
+ * Experience Graph — unified entry point (PostgreSQL backend).
  *
- * Opens a self-evolving memory store backed by either SQLite (embedded, zero
- * setup; sqlite-vec exhaustive KNN) or PostgreSQL (unified engine; pgvector
- * HNSW ANN). Both backends expose the SAME async interface, so callers and the
- * orchestrator are backend-agnostic.
+ * A self-evolving memory store backed by PostgreSQL + pgvector, exposing the
+ * paper's three access patterns as real database operations:
+ *   graph traverse — recursive CTE over nodes.parent_node_id
+ *   relation join   — SQL joins across tasks/sessions/nodes/prompts
+ *   vector search   — pgvector cosine (<=>) over an HNSW ANN index
  *
- *   const store = await openExperienceStore({ backend: "sqlite", dir });
- *   const store = await openExperienceStore({ backend: "postgres", connectionString });
+ *   const store = await openExperienceStore({ connectionString: "postgres://…" });
  *
- * Backend selection precedence: explicit opts.backend, else GENDB_EXPERIENCE_PG
- * (a Postgres connection string) if set, else "sqlite".
+ * Connection precedence: opts.connectionString → opts.pg → env GENDB_EXPERIENCE_PG
+ * → standard libpq env vars (PGHOST/PGPORT/PGUSER/PGDATABASE). Independent of
+ * GenDB's HAG memory.
  */
 
-import { createSqliteBackend } from "./backends/sqlite.mjs";
-
 // Re-export identity helpers + embedding so callers have one import surface.
-export { taskId, sessionId, nodeId } from "./store.mjs";
+export { taskId, sessionId, nodeId } from "./ids.mjs";
 export { embed, EMBED_DIM } from "./embed.mjs";
 
 export async function openExperienceStore(opts = {}) {
-  const pgUrl = opts.connectionString || process.env.GENDB_EXPERIENCE_PG || null;
-  const backend = opts.backend || (pgUrl ? "postgres" : "sqlite");
-
-  if (backend === "postgres") {
-    // Lazy import so SQLite-only users never need `pg` loaded.
-    const { createPostgresBackend } = await import("./backends/postgres.mjs");
-    return createPostgresBackend({ connectionString: pgUrl, pg: opts.pg });
-  }
-  if (backend === "sqlite") {
-    return createSqliteBackend({ dir: opts.dir });
-  }
-  throw new Error(`Unknown experience backend: ${backend}`);
+  const connectionString = opts.connectionString || process.env.GENDB_EXPERIENCE_PG || null;
+  const { createPostgresBackend } = await import("./backends/postgres.mjs");
+  return createPostgresBackend({ connectionString, pg: opts.pg });
 }

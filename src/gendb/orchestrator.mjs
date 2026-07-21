@@ -84,6 +84,7 @@ import {
 } from "./utils/paths.mjs";
 import { detectHardware, getHardwareFingerprint } from "./utils/hardware.mjs";
 import { extractTemplate } from "./tools/template-extractor.mjs";
+import { createCapture } from "./experience/capture.mjs";
 import {
   renderTemplate,
   runAgent,
@@ -118,6 +119,7 @@ function parseArgs(argv) {
     agentProvider: defaults.agentProvider,
     memoryDir: defaults.memoryDir,
     reoptimize: null,  // --reoptimize <queryId> to force re-optimization
+    experiencePg: null, // --experience-pg <conn>: enable Experience Graph live capture (Postgres)
   };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--schema" && argv[i + 1]) args.schema = resolve(argv[++i]);
@@ -137,6 +139,7 @@ function parseArgs(argv) {
     if (argv[i] === "--memory-dir" && argv[i + 1]) args.memoryDir = argv[++i];
     if (argv[i] === "--no-memory") args.memoryDir = null;
     if (argv[i] === "--reoptimize" && argv[i + 1]) args.reoptimize = argv[++i];
+    if (argv[i] === "--experience-pg" && argv[i + 1]) args.experiencePg = argv[++i];
   }
   if (args.useSkills === undefined) args.useSkills = defaults.useSkills;
   // Resolve schema/queries from benchmark dir if not explicitly provided
@@ -2045,6 +2048,10 @@ async function runQueryFullPipeline(
 
   progressTracker.update(queryId, "done");
 
+  // Experience Graph: capture this query's completed search tree (non-fatal no-op
+  // unless capture is enabled). Reconstructs parent edges from the linear history.
+  if (args.capture) await args.capture.captureQuery(queryId, query.sql, optimizationHistory, runQueryDir);
+
   // Record final timing/status in skill usage log
   if (skillUsageLog && skillUsageLog[queryId]) {
     try {
@@ -2760,6 +2767,10 @@ async function main() {
   args.runAuditDir = runAuditDir;
   args.runId = runId;
 
+  // Experience Graph live capture (Postgres). No-op unless --experience-pg or a
+  // Postgres connection env is set; never throws into the pipeline.
+  args.capture = await createCapture(args);
+
   // All persistent artifacts go into the workload directory
   const runDir = workloadDir;
 
@@ -3173,6 +3184,9 @@ async function main() {
       });
     } catch {}
   }
+
+  // Close the Experience Graph capture connection (no-op if disabled).
+  if (args.capture) await args.capture.close();
 
   // Always write telemetry (even on failure — cost data is always preserved)
   const parsedQueries = parseQueryFile(queries);
