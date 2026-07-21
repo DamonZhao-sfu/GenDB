@@ -3,11 +3,12 @@
 # GenDB Environment Setup
 #
 # Usage:
-#   bash scripts/setup.sh [--sf SCALE_FACTOR] [--years YEARS] [--skip-data]
+#   bash scripts/setup.sh [--sf SCALE_FACTOR] [--years YEARS] [--ds-sf SF] [--skip-data]
 #
 # Options:
 #   --sf SCALE_FACTOR    TPC-H scale factor (default: 10, ~10 GB)
 #   --years YEARS        SEC-EDGAR years of data (default: 3, ~5 GB)
+#   --ds-sf SF           TPC-DS scale factor (opt-in; omit to skip TPC-DS)
 #   --skip-data          Skip data download (only install dependencies)
 
 set -euo pipefail
@@ -18,12 +19,14 @@ cd "$REPO_DIR"
 
 SF="${SF:-10}"
 YEARS="${YEARS:-3}"
+DS_SF="${DS_SF:-}"
 SKIP_DATA=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sf) SF="$2"; shift 2 ;;
         --years) YEARS="$2"; shift 2 ;;
+        --ds-sf) DS_SF="$2"; shift 2 ;;
         --skip-data) SKIP_DATA=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -108,6 +111,14 @@ else
     echo ""
     echo "  SEC-EDGAR (${YEARS} years)..."
     bash benchmarks/sec-edgar/setup_data.sh "$YEARS"
+
+    if [ -n "$DS_SF" ]; then
+        echo ""
+        echo "  TPC-DS (SF${DS_SF})..."
+        bash benchmarks/tpc-ds/setup_data.sh "$DS_SF"
+        echo "  Generating TPC-DS ground truth..."
+        python3 benchmarks/tpc-ds/generate_ground_truth.py --sf "$DS_SF"
+    fi
 fi
 
 echo ""

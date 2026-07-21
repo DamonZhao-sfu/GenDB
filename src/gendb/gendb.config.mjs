@@ -10,8 +10,8 @@
 export const defaults = {
   // --- Pipeline settings (provider-agnostic) ---
   agentProvider: "claude",  // "claude" or "codex" — select the underlying agent SDK
-  targetBenchmark: "tpc-h", // "tpc-h" / "sec-edgar"
-  scaleFactor: 10,          // 10 for tpc-h, 3 for sec-edgar
+  targetBenchmark: "tpc-h", // "tpc-h" / "tpc-ds" / "sec-edgar"
+  scaleFactor: 10,          // 10 for tpc-h, 1 for tpc-ds, 3 for sec-edgar
   optimizationTarget: "hot",  // "hot" (optimize avg hot runs) or "cold" (optimize cold run)
   maxOptimizationIterations: 5,
   stallThreshold: 5,        // consecutive non-improving iterations before adaptive stop

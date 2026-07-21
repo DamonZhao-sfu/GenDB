@@ -146,7 +146,25 @@ To download data separately:
 ```bash
 bash benchmarks/tpc-h/setup_data.sh 10       # TPC-H at scale factor 10
 bash benchmarks/sec-edgar/setup_data.sh 3     # SEC-EDGAR, 3 years (2022-2024)
+bash benchmarks/tpc-ds/setup_data.sh 1        # TPC-DS at scale factor 1 (99 queries)
 ```
+
+**TPC-DS (99 queries).** TPC-DS support reuses the same convention-based layout as
+TPC-H (`schema.sql`, `queries.sql`, `data/sf<N>/*.tbl`, `query_results/Q<N>.csv`).
+Instead of an external `dbgen`, it uses DuckDB's self-contained `tpcds` extension to
+generate the data and the 99 standard queries in one step (needs network access to
+fetch the extension on first run). After generating data, produce the ground-truth
+results (DuckDB as the correctness oracle, same as TPC-H):
+```bash
+bash benchmarks/tpc-ds/setup_data.sh 1                       # -> schema.sql, queries.sql, data/, tables.json
+python3 benchmarks/tpc-ds/generate_ground_truth.py --sf 1    # -> query_results/Q1..Q99.csv
+
+# Run GenDB on TPC-DS, then compare against the DuckDB baseline
+node src/gendb/orchestrator.mjs --benchmark tpc-ds --sf 1
+python3 benchmarks/benchmark.py --benchmark tpc-ds --sf 1 --gendb-run output/tpc-ds-sf1
+```
+> TPC-DS baselines currently cover **DuckDB** only; PostgreSQL/ClickHouse/Umbra/MonetDB
+> need per-dialect porting of the 99 queries and are left as incremental follow-up.
 
 ### Operating Modes
 
@@ -230,6 +248,7 @@ src/demo/                   # Demo tooling
 benchmarks/
   benchmark.py              # Benchmark GenDB against baseline systems
   tpc-h/                    # TPC-H benchmark (queries, data, ground truth, baselines)
+  tpc-ds/                   # TPC-DS benchmark (99 queries via DuckDB tpcds extension; DuckDB baseline)
   sec-edgar/                # SEC-EDGAR benchmark (queries, data, ground truth, baselines)
   lib/                      # Benchmark runner, plotting, system configs
   figures/                  # Generated benchmark result figures
