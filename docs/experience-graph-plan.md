@@ -12,7 +12,7 @@
 
 | Paper access pattern | In GenDB today | In the existing HAG memory (which we do NOT reuse) | This feature delivers |
 |---|---|---|---|
-| **Vector search** | ✗ none | Fake: `search-tool.mjs` does lowercase **substring** matching over an `embedding_text` string; `classifyQuery` uses **Jaccard** over SQL features. No embeddings, no vectors. | Real embeddings (`BLOB`) + cosine ranking over Tasks/Nodes (optional `sqlite-vec`) |
+| **Vector search** | ✗ none | Fake: `search-tool.mjs` does lowercase **substring** matching over an `embedding_text` string; `classifyQuery` uses **Jaccard** over SQL features. No embeddings, no vectors. | Embedding `BLOB`s + **`sqlite-vec`** `vec_distance_cosine` in-engine KNN over Tasks/Nodes (JS cosine fallback) — **implemented** |
 | **Relation join** | ✗ none | JSON file scans over `nodes/L*/*.json`; no relational model, no joins | Four-table SQL schema joined by foreign keys (`Tasks⋈Sessions⋈Nodes⋈Prompts`) |
 | **Graph traverse** | ✗ none | Flat `edges.json` adjacency list; `getConnectedNodes` = one-hop filter, no lineage | Recursive CTE over `nodes.parent_node_id`: ancestors, descendants, siblings, MCTS backprop |
 

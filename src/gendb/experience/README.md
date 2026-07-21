@@ -13,7 +13,10 @@ sibling sets, and dead branches the linear view throws away.
 ## Backing store
 
 A single SQLite database (`<experience-dir>/experience.db`) via the built-in
-`node:sqlite` (Node ≥ 22.5) — **zero new dependencies**. Design doc:
+`node:sqlite` (Node ≥ 22.5). Vector search is accelerated by the loadable
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) extension (the only runtime
+dependency); if it can't load, the store still works and vector search falls
+back to an in-process JS cosine scan. Design doc:
 [`docs/experience-graph-plan.md`](../../../docs/experience-graph-plan.md).
 
 ## Four tables (paper-faithful)
@@ -28,7 +31,7 @@ logs) are stored **by reference** (paths into `output/**`).
 |---|---|---|
 | **Graph traverse** | recursive CTE over `nodes.parent_node_id` | `getAncestors`, `getDescendants`, `getSiblings`, `getChildren`, `getSessionTree` |
 | **Relation join** | SQL joins across the four tables | `getBestNodeForTask`, `getWinningPrompt`, `getTaskLeaderboard` |
-| **Vector search** | cosine over embedding BLOBs (`embed.mjs`) | `searchSimilarTasks`, `searchSimilarStrategies` |
+| **Vector search** | **sqlite-vec** `vec_distance_cosine` (in-engine SIMD KNN) over the `embedding` BLOB columns; JS cosine fallback if the extension can't load | `searchSimilarTasks`, `searchSimilarStrategies` |
 
 MCTS-style `backpropReward` rolls a leaf's reward up its ancestor chain
 (`visit_count`, `best_descendant_ms`).

@@ -104,9 +104,12 @@ function testAccessPatterns(store) {
   eq(root.best_descendant_ms, 127, "root best_descendant_ms via backprop");
   check(root.visit_count >= 1, "root visited by backprop");
 
-  // VECTOR SEARCH
+  // VECTOR SEARCH (sqlite-vec engine KNN when available, else JS cosine)
+  console.log(`  vector engine: ${store.vec ? "sqlite-vec (vec_distance_cosine)" : "JS cosine fallback"}`);
   const sim = q.searchSimilarStrategies(store, "partitioned exact membership storage extension in LLC", 3);
   check(sim.length > 0 && sim[0].score > 0, "vector search returns ranked strategies");
+  check(sim.every((r) => r.score >= -1.0001 && r.score <= 1.0001), "vector scores are cosine similarities in [-1,1]");
+  check(sim[0].score >= sim[sim.length - 1].score, "vector results ranked by descending similarity");
 
   // single-iteration + all-regression shapes
   const single = loadTrajectory(store, "tpc-h", "Q1", 10, SINGLE);

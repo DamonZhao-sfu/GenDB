@@ -10,7 +10,7 @@
  * they return empty results rather than throwing.
  */
 
-import { embed, cosine, fromBlob } from "./embed.mjs";
+import { embed, cosine, fromBlob, toBlob } from "./embed.mjs";
 
 function rows(store, sql, params = []) {
   if (!store?.enabled) return [];
@@ -121,7 +121,10 @@ export function getTaskLeaderboard(store, benchmark) {
 }
 
 // ---------------------------------------------------------------------------
-// VECTOR SEARCH (cosine over embedding BLOBs)
+// VECTOR SEARCH
+//   Preferred: sqlite-vec's vec_distance_cosine — an in-engine SIMD KNN scan.
+//   Fallback:  JS cosine over decoded BLOBs (when sqlite-vec is unavailable).
+//   Both return `score` = cosine similarity in [0,1] (higher = more similar).
 // ---------------------------------------------------------------------------
 
 function topKByCosine(candidates, queryVec, k) {
@@ -135,10 +138,26 @@ function topKByCosine(candidates, queryVec, k) {
   return scored.slice(0, k);
 }
 
+/** KNN via sqlite-vec: ORDER BY vec_distance_cosine ... LIMIT k, pushed into the engine. */
+function knnByVec(store, table, queryVec, k, whereExtra = "", whereParams = []) {
+  const res = rows(
+    store,
+    `SELECT *, vec_distance_cosine(embedding, ?) AS _dist
+       FROM ${table} WHERE embedding IS NOT NULL ${whereExtra}
+       ORDER BY _dist ASC LIMIT ?`,
+    [toBlob(queryVec), ...whereParams, k]
+  );
+  // cosine distance -> similarity, and drop the scratch column
+  return res.map(({ _dist, ...r }) => ({ ...r, score: 1 - _dist }));
+}
+
 /** Vector-search tasks most similar to a SQL string. Optionally exclude a task_id. */
 export function searchSimilarTasks(store, sqlText, k = 5, excludeTaskId = null) {
   if (!store?.enabled) return [];
   const q = embed(sqlText);
+  if (store.vec) {
+    return knnByVec(store, "tasks", q, k, "AND task_id != ?", [excludeTaskId ?? ""]);
+  }
   const cands = rows(store, `SELECT * FROM tasks WHERE embedding IS NOT NULL AND task_id != ?`, [excludeTaskId ?? ""]);
   return topKByCosine(cands, q, k);
 }
@@ -147,6 +166,9 @@ export function searchSimilarTasks(store, sqlText, k = 5, excludeTaskId = null) 
 export function searchSimilarStrategies(store, strategyText, k = 5) {
   if (!store?.enabled) return [];
   const q = embed(strategyText);
+  if (store.vec) {
+    return knnByVec(store, "nodes", q, k);
+  }
   const cands = rows(store, `SELECT * FROM nodes WHERE embedding IS NOT NULL`);
   return topKByCosine(cands, q, k);
 }

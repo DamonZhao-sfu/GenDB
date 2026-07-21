@@ -28,21 +28,49 @@ function loadSqlite() {
 }
 
 /**
+ * Load the sqlite-vec extension so vector search runs as an in-engine SIMD KNN
+ * (vec_distance_cosine) instead of a JS brute-force scan. Returns true on
+ * success; on any failure the store keeps working and vector search falls back
+ * to the JS cosine path in query.mjs.
+ */
+function tryLoadVec(db) {
+  try {
+    const vec = require("sqlite-vec");
+    db.enableLoadExtension(true);
+    db.loadExtension(vec.getLoadablePath());
+    db.enableLoadExtension(false); // re-disable after loading (defense-in-depth)
+    return true;
+  } catch (e) {
+    console.warn(`[experience] sqlite-vec not loaded (${e.message}); vector search uses JS cosine fallback.`);
+    return false;
+  }
+}
+
+/**
  * Open (creating if needed) the experience database at <experienceDir>/experience.db.
- * @returns {{ enabled: boolean, db: object|null, dir: string }}
+ * @returns {{ enabled: boolean, db: object|null, dir: string, vec: boolean }}
  */
 export function openStore(experienceDir) {
   const sqlite = loadSqlite();
   if (!sqlite || !sqlite.DatabaseSync) {
     console.warn("[experience] node:sqlite unavailable — experience graph disabled (needs Node >= 22.5).");
-    return { enabled: false, db: null, dir: experienceDir };
+    return { enabled: false, db: null, dir: experienceDir, vec: false };
   }
   mkdirSync(experienceDir, { recursive: true });
   const dbPath = resolve(experienceDir, "experience.db");
-  const db = new sqlite.DatabaseSync(dbPath);
+  let db;
+  let vecEnabled = false;
+  try {
+    // allowExtension is required before loadExtension is permitted.
+    db = new sqlite.DatabaseSync(dbPath, { allowExtension: true });
+    vecEnabled = tryLoadVec(db);
+  } catch {
+    // Older node:sqlite without allowExtension — open normally, JS fallback.
+    db = new sqlite.DatabaseSync(dbPath);
+  }
   const schema = readFileSync(SCHEMA_PATH, "utf-8");
   db.exec(schema);
-  return { enabled: true, db, dir: experienceDir };
+  return { enabled: true, db, dir: experienceDir, vec: vecEnabled };
 }
 
 /** Close the store (safe on a disabled handle). */
@@ -131,7 +159,8 @@ export function recordNode(store, node) {
     : null;
 
   const pct = (a, base) => (a != null && base) ? Math.round(((a - base) / base) * 1000) / 10 : null;
-  const emb = toBlob(embed(node.strategy || ""));
+  // Null (not a zero vector) when there is no strategy text, so vec_distance_cosine never sees a zero vector.
+  const emb = node.strategy ? toBlob(embed(node.strategy)) : null;
 
   db.prepare(
     `INSERT INTO nodes (node_id, session_id, task_id, parent_node_id, iteration,
