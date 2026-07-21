@@ -24,10 +24,12 @@ Think concisely and structurally:
 
 ## Output
 1. `storage_design.json` — storage layout, encodings, indexes, hardware config
-2. `ingest/ingest.cpp` — parallelized data ingestion
-3. `ingest/build_indexes.cpp` — index building from binary data
+2. `ingest/ingest.cpp` — parallelized data ingestion (Parquet → Arrow/Feather via
+   `arrow_scaffold.h` + `gendb_arrow_storage.h`; delimited text → `.bin`)
+3. `ingest/build_indexes.cpp` — index building
 4. `ingest/Makefile`
 5. `queries/<Qi>/guide.md` — per-query guide for all Phase 2 agents
+6. (Parquet path only) `ingest/parquet_spec.json` — validated Architect spec (see workflow below)
 
 ## Physical Design Reasoning
 
@@ -90,11 +92,11 @@ For each join and filter pattern in the workload:
 ## storage_design.json Contract
 ```json
 {
-  "persistent_storage": { "format": "binary_columnar", "base_dir_name": "<name>.gendb" },
+  "persistent_storage": { "format": "binary_columnar | arrow_feather", "base_dir_name": "<name>.gendb" },
   "tables": {
     "<table>": {
-      "columns": [{ "name": "<col>", "cpp_type": "<type>", "semantic_type": "...", "encoding": "..." }],
-      "file_format": { "source_format": "delimited|parquet", "filename": "<table>.<ext>", "delimiter": "<detected, or null for parquet>", "column_order": [...] },
+      "columns": [{ "name": "<col>", "cpp_type": "<type>", "arrow_format": "<for arrow_feather>", "semantic_type": "...", "encoding": "..." }],
+      "file_format": { "source_format": "delimited|parquet", "filename": "<table>.<ext>", "delimiter": "<detected, or null for parquet>", "column_order": [...], "feather_file": "<table>.feather (when arrow_feather)" },
       "sort_order": ["col1"], "block_size": 100000, "estimated_rows": "<N>",
       "indexes": [{ "name": "<name>", "type": "hash|zone_map|sorted", "columns": [...] }]
     }
@@ -105,49 +107,56 @@ For each join and filter pattern in the workload:
 }
 ```
 
-## Source Data Format (delimited text vs Parquet)
+## Source Data Format (delimited text → .bin, Parquet → Arrow/Feather)
 Detect the source format by file extension in the data directory (one file per table).
 Read `data_format` from the workload analysis and confirm against the actual filenames.
-The GenDB storage you produce (`.gendb`), the per-query guides, and all downstream query
-code are IDENTICAL regardless of source format — only `ingest.cpp` and the `Makefile` differ.
+Record the storage format you produce in `storage_design.json` `persistent_storage.format`
+so downstream query code knows how to read it.
 
 - **Delimited text** (`.tbl`, `.csv`): parse by splitting on the detected delimiter; map
-  columns by POSITION using `column_order`.
-- **Parquet** (`.parquet`): columnar, encoded, and (usually) compressed — you MUST decode
-  it via a library, NOT split bytes or read it as text. In `ingest.cpp`, use Apache Arrow C++:
-  - Includes: `#include <arrow/io/file.h>`, `#include <parquet/arrow/reader.h>`, `#include <arrow/table.h>`
-  - Open + read: `arrow::io::ReadableFile::Open(path)` → `parquet::arrow::OpenFile(file, pool, &reader)`.
-    For large fact tables, stream `RecordBatch`es (`reader->GetRecordBatchReader`) to bound memory
-    instead of materializing the whole `arrow::Table`.
-  - Map schema columns to Parquet columns **BY NAME** (e.g. `l_shipdate`, `l_extendedprice`),
-    never by position — do not assume Parquet column order matches the SQL schema.
-  - Pull typed values from the Arrow arrays (`Int64Array`, `DoubleArray`, `Date32Array`,
-    `StringArray`, …) and write them into the SAME GenDB binary columnar layout as the text
-    path (same encodings, sort orders, type narrowing, dictionaries).
-  - **CRITICAL correctness rules (a bug here silently corrupts storage — column row
-    counts will not match and every query fails):**
-    - A column is read as a `ChunkedArray` (or a stream of `RecordBatch`es). You MUST
-      iterate and consume **ALL chunks / ALL row groups** for every column. Never read
-      only `chunk(0)` or the first batch — that truncates the column and makes its row
-      count disagree with the other columns.
-    - Parquet dictionary-encodes low-cardinality columns (e.g. `l_returnflag`,
-      `l_linestatus`). Arrow may hand these back as a `DictionaryArray`. You MUST decode
-      to the LOGICAL values (e.g. `arrow::compute::Cast` to the value type, or read
-      `dictionary()[indices()[i]]`) and write ONE value per row. Never write the
-      dictionary size or the index buffer length as the row count.
-    - Preserve row order and handle nulls consistently (decide a sentinel/validity
-      scheme matching the text path); every column of a table must emit EXACTLY
-      `metadata->num_rows()` values.
-    - **Mandatory ingest-time self-check:** after writing a table, assert that every
-      column's written row count equals the Parquet footer `num_rows`. If any column
-      differs, print the column name + expected/actual counts and `exit(1)` — fail loudly
-      at ingest time rather than producing storage that breaks queries downstream.
-  - The generated `Makefile` MUST link Arrow + Parquet via pkg-config:
-    `CXXFLAGS += $(shell pkg-config --cflags arrow parquet)` and
-    `LDLIBS += $(shell pkg-config --libs arrow parquet)`.
-    (Requires arrow-cpp/libparquet installed; if `pkg-config` can't find them, ensure the
-    conda env is active or set `PKG_CONFIG_PATH` to `<env>/lib/pkgconfig`.)
-  - Prefer parallel per-table ingestion and streamed batches for throughput.
+  columns by POSITION using `column_order`; write the existing GenDB `binary_columnar`
+  `.bin` layout. This path is unchanged.
+- **Parquet** (`.parquet`): produce **Arrow-native storage** — one **Arrow IPC/Feather**
+  file per table (`persistent_storage.format = "arrow_feather"`). Follow the disciplined
+  5-step workflow below. Read the knowledge base FIRST: `references/parquet_format.md`.
+
+### Parquet ingest workflow: Architect → Validate → Engineer → QA → Refine
+This separates *understanding the format* (a spec) from *writing code*. Most failures are
+spec-level knowledge gaps (e.g. a dictionary-encoded column), so validate the spec before
+generating C++ and, on repeated failure, fix the SPEC — not just the code.
+
+1. **Architect — write `parquet_spec.json` (NO C++ yet).** Read
+   `references/parquet_format.md`, inspect the actual Parquet metadata with DuckDB/pyarrow
+   (schema, encodings, num_rows), and emit the `parquet_spec.json` contract (see the KB
+   §10): per column `physical_type`, `logical_type`, `encoding`, `is_dictionary_encoded`,
+   `arrow_format`, `ab_append_fn`, `nullable`, `null_handling`, `decode_strategy`.
+2. **Validate — mechanically check the spec.** Run
+   `node <repo>/src/gendb/tools/validate-parquet-spec.mjs parquet_spec.json <schema.json>`
+   and FIX every reported issue, then re-run until it prints OK. Do not write C++ against an
+   invalid spec.
+3. **Engineer — generate `ingest.cpp` from the spec.** Read Parquet with Apache Arrow C++
+   (`parquet::arrow::OpenFile`; stream `RecordBatch`es for large tables). For each column,
+   decode per the spec and append with the spec's `ab_append_fn` into an `arrow_scaffold.h`
+   builder; `ab_finalize`; then `gendb::WriteFeather(&sch, &arr, "<gendb_dir>/<table>.feather")`
+   from `gendb_arrow_storage.h`. Hard rules (KB §9): consume ALL chunks/row groups; decode
+   `DictionaryArray` to logical values (one per row); map columns BY NAME; emit exactly
+   `num_rows` per column; handle nulls via the validity path. Include a **mandatory
+   ingest-time self-check**: assert every column length == footer `num_rows`, else print
+   `column/expected/actual` and `exit(1)`.
+4. **QA — diff against the DuckDB oracle.** Generate ground truth with
+   `node <repo>/src/gendb/tools/parquet-oracle.mjs <table>.parquet --out oracle.json`, then
+   compare the ingested Feather (open with `gendb::OpenTableMmap`) against it: `row_count`
+   exact; numeric `min/max/sum` within a small relative tolerance; `distinct` for dictionary
+   columns. Report per-column pass/fail.
+5. **Refine — fix the SPEC on recurring failure.** If the SAME column fails QA across ≥3
+   attempts, the spec is wrong: revise that column in `parquet_spec.json` (re-run Validate),
+   then regenerate `ingest.cpp` — do NOT keep retrying code against a bad spec.
+
+**Makefile** (Parquet path) MUST link Arrow + Parquet and see the GenDB utils headers:
+`CXXFLAGS += -I<repo>/src/gendb/utils $(shell pkg-config --cflags arrow parquet)` and
+`LDLIBS += $(shell pkg-config --libs arrow parquet)`. (Needs arrow-cpp/libparquet; if
+`pkg-config` can't find them, activate the conda env or set `PKG_CONFIG_PATH` to
+`<env>/lib/pkgconfig`.) Prefer parallel per-table ingestion and streamed batches.
 
 ## No Precomputed Query Results
 The gendb storage directory may only contain **data-level** transformations: columnar encoding, type narrowing, sorting, indexes (hash indexes, zone maps, bloom filters), dense FK-lookup arrays, and dictionary encoding. You MUST NOT precompute query-specific intermediate results, partial aggregations (e.g., precomputed SUM/COUNT/AVG grouped by a key), filtered subsets, or materialized views. Each query binary must compute its answer from the stored data at runtime.
@@ -158,7 +167,8 @@ The gendb storage directory may only contain **data-level** transformations: col
 
 ## Column Reference
 ### <column_name> (<semantic_type>, <cpp_type>[, encoding details])
-- File: <table>/<column>.bin (<row_count> rows)
+- Source: `<table>/<column>.bin` (binary_columnar) OR column `<name>` of
+  `<table>.feather` via `gendb::OpenTableMmap(...)->GetColumnByName("<name>")` (arrow_feather)
 - This query: `<SQL_predicate>` → C++ `<comparison>`
 
 ## Table Stats
