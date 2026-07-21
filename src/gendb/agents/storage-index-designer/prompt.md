@@ -124,6 +124,24 @@ code are IDENTICAL regardless of source format — only `ingest.cpp` and the `Ma
   - Pull typed values from the Arrow arrays (`Int64Array`, `DoubleArray`, `Date32Array`,
     `StringArray`, …) and write them into the SAME GenDB binary columnar layout as the text
     path (same encodings, sort orders, type narrowing, dictionaries).
+  - **CRITICAL correctness rules (a bug here silently corrupts storage — column row
+    counts will not match and every query fails):**
+    - A column is read as a `ChunkedArray` (or a stream of `RecordBatch`es). You MUST
+      iterate and consume **ALL chunks / ALL row groups** for every column. Never read
+      only `chunk(0)` or the first batch — that truncates the column and makes its row
+      count disagree with the other columns.
+    - Parquet dictionary-encodes low-cardinality columns (e.g. `l_returnflag`,
+      `l_linestatus`). Arrow may hand these back as a `DictionaryArray`. You MUST decode
+      to the LOGICAL values (e.g. `arrow::compute::Cast` to the value type, or read
+      `dictionary()[indices()[i]]`) and write ONE value per row. Never write the
+      dictionary size or the index buffer length as the row count.
+    - Preserve row order and handle nulls consistently (decide a sentinel/validity
+      scheme matching the text path); every column of a table must emit EXACTLY
+      `metadata->num_rows()` values.
+    - **Mandatory ingest-time self-check:** after writing a table, assert that every
+      column's written row count equals the Parquet footer `num_rows`. If any column
+      differs, print the column name + expected/actual counts and `exit(1)` — fail loudly
+      at ingest time rather than producing storage that breaks queries downstream.
   - The generated `Makefile` MUST link Arrow + Parquet via pkg-config:
     `CXXFLAGS += $(shell pkg-config --cflags arrow parquet)` and
     `LDLIBS += $(shell pkg-config --libs arrow parquet)`.
