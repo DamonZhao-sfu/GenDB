@@ -54,6 +54,9 @@ gendb-memory*/
 output/memory_eval*/
 .claude/skills/*/
 
+# Experience Graph store (runtime artifact, machine-specific)
+gendb-experience*/
+
 # Non-release output versions (keep only latest release runs)
 output/tpc-h-sf10-3.11/
 output/tpc-h-sf10-3.12/
