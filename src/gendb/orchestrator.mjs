@@ -962,12 +962,16 @@ async function inspectWorkloadState(workloadDir, parsedQueries, opts = {}) {
     }
   }
 
-  // Storage was rebuilt (data changed or --rebuild-storage): a "skip" query still
-  // needs to be re-run and re-validated against the freshly ingested data, so
-  // downgrade skip -> rebenchmark (keeps the existing cpp, no LLM regeneration).
+  // Storage was rebuilt (data changed or --rebuild-storage). The existing query
+  // binaries were generated against the OLD storage (and possibly a different
+  // storage format, e.g. .bin binary_columnar -> Arrow/Feather when switching a
+  // table from .tbl to .parquet), so they may read stale/incompatible files
+  // (e.g. l_returnflag.dict.offsets.bin). Rebenchmarking would just re-run that
+  // broken binary, so force full REGENERATION of every affected query against the
+  // freshly ingested storage.
   if (opts.invalidateStorage) {
     for (const s of Object.values(state.queries)) {
-      if (s.action === "skip") s.action = "rebenchmark";
+      if (s.action === "skip" || s.action === "rebenchmark") s.action = "generate";
     }
   }
 
@@ -2967,6 +2971,21 @@ async function main() {
         console.log("\n[Orchestrator] ========== PHASE 0: PERSISTENT STORAGE FOUND ==========\n");
         console.log("[Orchestrator] Persistent storage found in workload directory — Phase 1 will be skipped.");
         skipPhase1 = true;
+      }
+    }
+
+    // On a storage rebuild, wipe the old storage directory first so a clean rebuild
+    // starts fresh — this removes stale .bin column files and, importantly, the old
+    // column_versions/registry.json (whose derived .bin extensions the Query Optimizer
+    // would otherwise reuse, pulling queries back onto .bin files that no longer match
+    // the new Arrow/Feather storage).
+    if (invalidateStorage) {
+      try {
+        rmSync(args.gendbDir, { recursive: true, force: true });
+        await mkdir(args.gendbDir, { recursive: true });
+        console.log(`[Orchestrator] Cleared old storage at ${args.gendbDir} for a clean rebuild.`);
+      } catch (err) {
+        console.warn(`[Orchestrator] Could not clear old storage (non-fatal): ${err.message}`);
       }
     }
 
