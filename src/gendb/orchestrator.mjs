@@ -3256,17 +3256,22 @@ async function main() {
   telemetryData.total_wall_clock_ms = Date.now() - runStartTime;
   telemetryData.status = pipelineError ? "failed" : "completed";
   if (pipelineError) telemetryData.error = pipelineError.message;
+  // Record run metadata so telemetry.json is self-describing (used by the CSV
+  // writer and the standalone scripts/results-to-csv.mjs backfill tool).
+  telemetryData.benchmark = args.targetBenchmark;
+  telemetryData.scale_factor = args.scaleFactor;
+  telemetryData.provider = args.agentProvider;
+  telemetryData.model = args.modelOverride || args.model || getProviderConfig(args.agentProvider).model;
   // Write telemetry to run audit dir (per-run), not workload dir
   const telemetryPath = resolve(runAuditDir, "telemetry.json");
   await writeFile(telemetryPath, JSON.stringify(telemetryData, null, 2));
 
   // Write unified per-query results CSV (dataset, sf, model, timing, phase breakdown, cost)
   try {
-    const csvModel = args.modelOverride || args.model || getProviderConfig(args.agentProvider).model;
     const csvPath = await writeRunResultsCsv(runAuditDir, queryData, telemetryData, {
       benchmark: args.targetBenchmark,
       sf: args.scaleFactor,
-      model: csvModel,
+      model: telemetryData.model,
       provider: args.agentProvider,
       runId: runAuditDir.split("/").pop(),
     });
