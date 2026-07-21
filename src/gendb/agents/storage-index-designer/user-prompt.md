@@ -14,6 +14,11 @@ Read the workload analysis from: {{workload_analysis_path}}
 ## Data Directory (source data files)
 {{data_dir}}
 
+Detect the source file format by extension (one file per table). For `.parquet` sources,
+follow the "Source Data Format" section of your system prompt: read via Apache Arrow C++ in
+`ingest.cpp` and link `arrow`+`parquet` in the Makefile. For delimited text, parse by the
+detected delimiter. The GenDB storage layout you build is the same in both cases.
+
 ## GenDB Storage Directory (output)
 Write binary columnar data to: {{gendb_dir}}
 

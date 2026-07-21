@@ -94,7 +94,7 @@ For each join and filter pattern in the workload:
   "tables": {
     "<table>": {
       "columns": [{ "name": "<col>", "cpp_type": "<type>", "semantic_type": "...", "encoding": "..." }],
-      "file_format": { "filename": "<table>.<ext>", "delimiter": "<detected>", "column_order": [...] },
+      "file_format": { "source_format": "delimited|parquet", "filename": "<table>.<ext>", "delimiter": "<detected, or null for parquet>", "column_order": [...] },
       "sort_order": ["col1"], "block_size": 100000, "estimated_rows": "<N>",
       "indexes": [{ "name": "<name>", "type": "hash|zone_map|sorted", "columns": [...] }]
     }
@@ -104,6 +104,32 @@ For each join and filter pattern in the workload:
   "hardware_config": { "cpu_cores": "<N>", "l3_cache_mb": "<N>", "disk_type": "ssd|hdd", "total_memory_gb": "<N>" }
 }
 ```
+
+## Source Data Format (delimited text vs Parquet)
+Detect the source format by file extension in the data directory (one file per table).
+Read `data_format` from the workload analysis and confirm against the actual filenames.
+The GenDB storage you produce (`.gendb`), the per-query guides, and all downstream query
+code are IDENTICAL regardless of source format — only `ingest.cpp` and the `Makefile` differ.
+
+- **Delimited text** (`.tbl`, `.csv`): parse by splitting on the detected delimiter; map
+  columns by POSITION using `column_order`.
+- **Parquet** (`.parquet`): columnar, encoded, and (usually) compressed — you MUST decode
+  it via a library, NOT split bytes or read it as text. In `ingest.cpp`, use Apache Arrow C++:
+  - Includes: `#include <arrow/io/file.h>`, `#include <parquet/arrow/reader.h>`, `#include <arrow/table.h>`
+  - Open + read: `arrow::io::ReadableFile::Open(path)` → `parquet::arrow::OpenFile(file, pool, &reader)`.
+    For large fact tables, stream `RecordBatch`es (`reader->GetRecordBatchReader`) to bound memory
+    instead of materializing the whole `arrow::Table`.
+  - Map schema columns to Parquet columns **BY NAME** (e.g. `l_shipdate`, `l_extendedprice`),
+    never by position — do not assume Parquet column order matches the SQL schema.
+  - Pull typed values from the Arrow arrays (`Int64Array`, `DoubleArray`, `Date32Array`,
+    `StringArray`, …) and write them into the SAME GenDB binary columnar layout as the text
+    path (same encodings, sort orders, type narrowing, dictionaries).
+  - The generated `Makefile` MUST link Arrow + Parquet via pkg-config:
+    `CXXFLAGS += $(shell pkg-config --cflags arrow parquet)` and
+    `LDLIBS += $(shell pkg-config --libs arrow parquet)`.
+    (Requires arrow-cpp/libparquet installed; if `pkg-config` can't find them, ensure the
+    conda env is active or set `PKG_CONFIG_PATH` to `<env>/lib/pkgconfig`.)
+  - Prefer parallel per-table ingestion and streamed batches for throughput.
 
 ## No Precomputed Query Results
 The gendb storage directory may only contain **data-level** transformations: columnar encoding, type narrowing, sorting, indexes (hash indexes, zone maps, bloom filters), dense FK-lookup arrays, and dictionary encoding. You MUST NOT precompute query-specific intermediate results, partial aggregations (e.g., precomputed SUM/COUNT/AVG grouped by a key), filtered subsets, or materialized views. Each query binary must compute its answer from the stored data at runtime.
