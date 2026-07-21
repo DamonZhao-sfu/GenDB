@@ -2619,19 +2619,20 @@ async function printPerQuerySummary(runDir, parsedQueries, runAuditDir) {
       iters.set(iterNum, {
         timing_ms: exec.timing_ms,
         validation: exec.validation?.status || "-",
+        operation_timings: exec.hot_operation_timings || exec.operation_timings || null,
       });
     }
     // Convert map to sparse array indexed by iteration number
     const maxIterNum = iters.size > 0 ? Math.max(...iters.keys()) + 1 : 0;
     const iterArray = [];
     for (let i = 0; i < maxIterNum; i++) {
-      iterArray.push(iters.get(i) || { timing_ms: null, validation: "-" });
+      iterArray.push(iters.get(i) || { timing_ms: null, validation: "-", operation_timings: null });
     }
     if (maxIterNum > maxIter) maxIter = maxIterNum;
     queryData.push({ id: query.id, iters: iterArray });
   }
 
-  if (queryData.length === 0 || maxIter === 0) return;
+  if (queryData.length === 0 || maxIter === 0) return queryData;
 
   // Build header
   const colW = 14;
@@ -2687,6 +2688,79 @@ async function printPerQuerySummary(runDir, parsedQueries, runAuditDir) {
     console.log(timingRow);
     console.log(validRow);
   }
+
+  return queryData;
+}
+
+/**
+ * Write a unified per-query results CSV: execution time, per-phase runtime
+ * breakdown, and generation cost — each row tagged with dataset / sf / model.
+ * One row per query plus a TOTAL row. Returns the CSV path.
+ */
+async function writeRunResultsCsv(runAuditDir, queryData, telemetry, meta) {
+  const csvEscape = (v) => {
+    const s = v === null || v === undefined ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const columns = [
+    "benchmark", "sf", "model", "provider", "run_id", "query_id", "status",
+    "best_time_ms", "best_iter", "num_iterations", "per_iter_ms",
+    "gen_wall_ms", "gen_cost_usd", "phase_breakdown",
+  ];
+  const rows = [columns.join(",")];
+
+  let sumBest = 0;
+  for (const q of queryData || []) {
+    const iters = q.iters || [];
+    // Best = fastest passing iteration
+    let bestTime = null, bestIter = -1, bestOps = null;
+    const perIter = [];
+    for (let i = 0; i < iters.length; i++) {
+      const it = iters[i];
+      perIter.push(it.timing_ms != null ? Math.round(it.timing_ms) : "");
+      if (it.validation === "pass" && it.timing_ms != null && (bestTime === null || it.timing_ms < bestTime)) {
+        bestTime = it.timing_ms; bestIter = i; bestOps = it.operation_timings || null;
+      }
+    }
+    const numIters = iters.filter((it) => it.timing_ms != null || it.validation !== "-").length;
+    const phaseObj = telemetry.phases?.[`query_${q.id}`];
+    const genWall = phaseObj?.total_ms;
+    const genCost = phaseObj
+      ? Object.values(phaseObj.agents || {}).reduce((s, a) => s + (a.cost_usd || 0), 0)
+      : null;
+    // Runtime [TIMING] breakdown of the best iteration, as key=value pairs.
+    const phaseBreakdown = bestOps
+      ? Object.entries(bestOps).map(([k, v]) => `${k}=${v}`).join(";")
+      : "";
+    const status = bestTime !== null
+      ? "PASS"
+      : (iters.some((it) => it.validation === "fail") ? "FAIL" : "-");
+    if (bestTime !== null) sumBest += bestTime;
+
+    rows.push([
+      meta.benchmark, meta.sf, meta.model, meta.provider, meta.runId, q.id, status,
+      bestTime !== null ? Math.round(bestTime) : "",
+      bestIter >= 0 ? bestIter : "",
+      numIters,
+      perIter.join(";"),
+      genWall != null ? Math.round(genWall) : "",
+      genCost != null ? genCost.toFixed(4) : "",
+      phaseBreakdown,
+    ].map(csvEscape).join(","));
+  }
+
+  // TOTAL row: summed best execution time + run-level wall clock / cost.
+  rows.push([
+    meta.benchmark, meta.sf, meta.model, meta.provider, meta.runId, "TOTAL", "",
+    Math.round(sumBest), "", "", "",
+    Math.round(telemetry.total_wall_clock_ms || 0),
+    (telemetry.total_cost_usd || 0).toFixed(4),
+    "",
+  ].map(csvEscape).join(","));
+
+  const csvPath = resolve(runAuditDir, "results.csv");
+  await writeFile(csvPath, rows.join("\n") + "\n");
+  return csvPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -3177,7 +3251,7 @@ async function main() {
 
   // Always write telemetry (even on failure — cost data is always preserved)
   const parsedQueries = parseQueryFile(queries);
-  await printPerQuerySummary(runDir, parsedQueries, runAuditDir);
+  const queryData = await printPerQuerySummary(runDir, parsedQueries, runAuditDir);
 
   telemetryData.total_wall_clock_ms = Date.now() - runStartTime;
   telemetryData.status = pipelineError ? "failed" : "completed";
@@ -3185,6 +3259,21 @@ async function main() {
   // Write telemetry to run audit dir (per-run), not workload dir
   const telemetryPath = resolve(runAuditDir, "telemetry.json");
   await writeFile(telemetryPath, JSON.stringify(telemetryData, null, 2));
+
+  // Write unified per-query results CSV (dataset, sf, model, timing, phase breakdown, cost)
+  try {
+    const csvModel = args.modelOverride || args.model || getProviderConfig(args.agentProvider).model;
+    const csvPath = await writeRunResultsCsv(runAuditDir, queryData, telemetryData, {
+      benchmark: args.targetBenchmark,
+      sf: args.scaleFactor,
+      model: csvModel,
+      provider: args.agentProvider,
+      runId: runAuditDir.split("/").pop(),
+    });
+    console.log(`[Orchestrator] Results CSV: ${csvPath}`);
+  } catch (err) {
+    console.error(`[Orchestrator] Failed to write results CSV (non-fatal): ${err.message}`);
+  }
 
   // Print cost summary
   console.log(`\n[Orchestrator] === Run Summary ===`);
