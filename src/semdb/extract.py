@@ -125,12 +125,13 @@ def _find_json(text):
                 blobs.append(text[start:i + 1])
                 start = None
     for blob in reversed(blobs):
-        try:
-            o = json.loads(blob)
-            if isinstance(o, dict):
-                return o
-        except json.JSONDecodeError:
-            pass
+        for candidate in (blob, _repair_json(blob)):
+            try:
+                o = json.loads(candidate)
+                if isinstance(o, dict):
+                    return o
+            except json.JSONDecodeError:
+                pass
         try:
             o = ast.literal_eval(blob)          # tolerate single-quoted dicts
             if isinstance(o, dict):
@@ -138,6 +139,22 @@ def _find_json(text):
         except (ValueError, SyntaxError):
             pass
     return None
+
+
+def _repair_json(blob):
+    """Best-effort repair of the malformations small models emit and that json
+    rejects: trailing commas, `0.`/`.5` numbers, and Python True/False/None."""
+    b = re.sub(r",(\s*[}\]])", r"\1", blob)             # trailing comma before } or ]
+    b = re.sub(r"(?<=[:\s\[,])\.(\d)", r"0.\1", b)      # .5 -> 0.5
+    b = re.sub(r"(\d)\.(?=\s*[,}\]])", r"\1.0", b)      # 0.  -> 0.0
+    b = re.sub(r"\bTrue\b", "true", b)
+    b = re.sub(r"\bFalse\b", "false", b)
+    b = re.sub(r"\bNone\b", "null", b)
+    return b
+
+
+def _norm_key(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
 
 def parse_json_object(text, schema):
@@ -149,11 +166,15 @@ def parse_json_object(text, schema):
     obj = _find_json(text)
     if not isinstance(obj, dict):
         return dict(default), False
+    # Match keys tolerantly: strip case/spaces/underscores so "is_logo " or
+    # "logoentitytype" still map to is_logo / logo_entity_type.
+    norm = {_norm_key(k): v for k, v in obj.items()}
     out = {}
     for a in schema.get("attributes", []):
-        v = obj.get(a["name"], default[a["name"]])
+        v = obj.get(a["name"], norm.get(_norm_key(a["name"]), default[a["name"]]))
         out[a["name"]] = "none" if v is None else v   # JSON null → 'none' sentinel
-    out["conf"] = float(obj.get("conf") or obj.get("logo_conf") or 0.0)
+    out["conf"] = float(obj.get("conf") or norm.get("conf") or norm.get("confidence")
+                        or obj.get("logo_conf") or 0.0)
     return out, True
 
 
