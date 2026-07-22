@@ -24,7 +24,14 @@
 
 ## Output
 - Write the compiled program to: {{code_path}}
-- Signature: `python3 {{code_basename}} <structured.csv> <attrs.json> <out.csv>`
+- Signature (MUST match — the orchestrator invokes it this way):
+  `python3 {{code_basename}} <structured.csv> <attrs.json> <out.csv> [--endpoint URL --api-key KEY]`
+  Write the result rows to `<out.csv>` with a header (columns in the query's
+  SELECT order, e.g. `ID,uri`). If `--endpoint` is given, route residual
+  `P.vlm_judge`/`P.llm` calls to that OpenAI-compatible server; otherwise the
+  residual path may be skipped (log how many rows were left unresolved).
+- Also write `compiled_{{query_id}}.meta.json` = `{"elapsed_sec": ..., "rows": ...,
+  "residual_calls": ...}` next to the program (the orchestrator reads it).
 - Print rows emitted and residual model calls.
 
 ## Validation

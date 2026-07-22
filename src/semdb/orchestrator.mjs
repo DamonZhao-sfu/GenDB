@@ -27,6 +27,7 @@ import { readFile, writeFile, mkdir, readdir } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
+import { spawnSync } from "child_process";
 
 import {
   renderTemplate,
@@ -55,6 +56,14 @@ function parseArgs(argv) {
     modelOverride: null,   // force one model for all agents (testing)
     groundTruthDir: null,  // SemBench raw_results/ground_truth
     telemetryCsv: null,    // append the telemetry+metrics row here
+    // Execution of the downstream Python steps (extract → compiled query → eval).
+    run: false,            // force-run; auto-enabled when --ground-truth-dir is set
+    noRun: false,          // disable auto-run
+    endpoint: null,        // vLLM/OpenAI base URL for extraction (+ residual)
+    apiKey: "EMPTY",
+    extractModel: null,    // small VLM/LLM id (default: config extraction.small*Model)
+    theta: null,
+    predCols: "0,1",       // predicted columns to compare vs GT tuple order
     dryRun: false,
   };
   for (let i = 2; i < argv.length; i++) {
@@ -71,6 +80,13 @@ function parseArgs(argv) {
     else if (a === "--ground-truth-dir" && argv[i + 1]) args.groundTruthDir = resolve(argv[++i]);
     else if (a === "--telemetry-csv" && argv[i + 1]) args.telemetryCsv = resolve(argv[++i]);
     else if (a === "--out" && argv[i + 1]) args.out = resolve(argv[++i]);
+    else if (a === "--run") args.run = true;
+    else if (a === "--no-run") args.noRun = true;
+    else if (a === "--endpoint" && argv[i + 1]) args.endpoint = argv[++i];
+    else if (a === "--api-key" && argv[i + 1]) args.apiKey = argv[++i];
+    else if (a === "--extract-model" && argv[i + 1]) args.extractModel = argv[++i];
+    else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
+    else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
     else if (a === "--dry-run") args.dryRun = true;
   }
   // Derive query/data dirs from the repo root when only --sembench-dir is given.
@@ -275,6 +291,47 @@ async function main() {
     code_basename: `compiled_${args.query || "q"}.py`,
   }, runDir, args));
 
+  // --- Execute downstream Python steps (extraction → compiled query) --------
+  // Auto-run when a ground-truth dir is given (the user wants metrics), unless
+  // --no-run. These produce the .meta.json sidecars the telemetry block reads.
+  const resultsCsv = resolve(runDir, `${args.query || "q"}_results.csv`);
+  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
+
+  // Guess corpus columns for extract.py.
+  let cols = [];
+  try {
+    cols = (await readFile(unstructured.path, "utf-8")).split(/\r?\n/, 1)[0].split(",").map((c) => c.trim());
+  } catch { /* corpus path may not be readable here */ }
+  const idCol = cols[0] || (isImage ? "uri" : "id");
+  const textCol = cols.find((c) => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text";
+  const imageCol = cols.find((c) => /image|uri|path|file/i.test(c)) || idCol;
+  const extractModel = args.extractModel || (isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel);
+
+  if (doRun) {
+    const py = (name) => resolve(__dirname, name);
+    // 1) Extraction (small model over the corpus, once).
+    const exArgs = [py("extract.py"), "--schema", schemaPath, "--table", unstructured.path,
+      "--modality", isImage ? "image" : "text", "--id-col", idCol,
+      ...(isImage ? ["--image-col", imageCol, "--image-dir", args.imageDir] : ["--text-col", textCol]),
+      "--model", extractModel, "--out", attrsPath,
+      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : []),
+      ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
+    console.log(`\n[SemDB] Running extraction: python3 ${exArgs.join(" ")}`);
+    const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
+    if (ex.status !== 0) console.warn(`[SemDB] extraction exited ${ex.status} — metrics may be incomplete.`);
+
+    // 2) Compiled query: python3 compiled_<q>.py <structured.csv> <attrs.json> <out.csv> [--endpoint ...]
+    if (existsSync(codePath) && existsSync(attrsPath)) {
+      const cqArgs = [codePath, structured.path, attrsPath, resultsCsv,
+        ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : [])];
+      console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
+      const cq = spawnSync("python3", cqArgs, { stdio: "inherit" });
+      if (cq.status !== 0) console.warn(`[SemDB] compiled query exited ${cq.status} — check its CLI signature.`);
+    } else {
+      console.warn(`[SemDB] skipping compiled query — missing ${existsSync(codePath) ? attrsPath : codePath}`);
+    }
+  }
+
   // --- Telemetry: agent-stage time + estimated cost -------------------------
   if (!args.dryRun) {
     // "code execution" = the extraction + compiled-query runtime. Those run in
@@ -351,36 +408,35 @@ async function main() {
     if (gt) console.log(`[SemDB]   ground truth       ${gt.count} rows — ${gt.file}`);
     console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);
 
-    // Score against ground truth + write the results CSV after you run the compiled query.
+    // Score against ground truth + write the results CSV.
     const csvPath = args.telemetryCsv || resolve(args.out, "results.csv");
-    console.log(`\n[SemDB] Score + append to CSV (after running the compiled query):`);
-    console.log(`  python3 src/semdb/evaluate.py --telemetry ${resolve(runDir, "telemetry.json")} \\`);
-    if (gt) console.log(`    --ground-truth ${gt.file} --pred ${resolve(runDir, `${args.query}_results.csv`)} --pred-cols 0,1 \\`);
-    console.log(`    --query ${args.query} --csv ${csvPath}`);
+    const telePath = resolve(runDir, "telemetry.json");
+    if (doRun && gt && existsSync(resultsCsv)) {
+      const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
+        "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
+        "--query", args.query, "--csv", csvPath];
+      console.log(`\n[SemDB] Scoring: python3 ${evArgs.join(" ")}`);
+      const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
+      if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
+      console.log(`[SemDB]   metrics + row saved -> ${telePath} and ${csvPath}`);
+    } else if (gt) {
+      console.log(`\n[SemDB] Score + append to CSV (compiled query output not found${doRun ? "" : "; re-run with --run"}):`);
+      console.log(`  python3 src/semdb/evaluate.py --telemetry ${telePath} \\`);
+      console.log(`    --ground-truth ${gt.file} --pred ${resultsCsv} --pred-cols ${args.predCols} \\`);
+      console.log(`    --query ${args.query} --csv ${csvPath}`);
+    }
   }
-
-  // Guess the corpus columns so the printed extract command is runnable as-is.
-  let cols = [];
-  try {
-    cols = (await readFile(unstructured.path, "utf-8")).split(/\r?\n/, 1)[0].split(",").map(c => c.trim());
-  } catch { /* corpus path may not be readable here */ }
-  const idCol = cols[0] || (isImage ? "uri" : "id");
-  const textCol = cols.find(c => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text";
-  const imageCol = cols.find(c => /image|uri|path|file/i.test(c)) || idCol;
-  const smallModel = isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel;
 
   console.log(`\n[SemDB] Done. Artifacts in ${runDir}`);
-  console.log(`[SemDB] Extract (${isImage ? "image" : "text"}) with:`);
-  console.log(`  python3 src/semdb/extract.py --schema ${schemaPath} \\`);
-  console.log(`    --table ${unstructured.path} --modality ${isImage ? "image" : "text"} \\`);
-  if (isImage) {
-    console.log(`    --id-col ${idCol} --image-col ${imageCol} --image-dir ${args.imageDir} \\`);
-  } else {
-    console.log(`    --id-col ${idCol} --text-col ${textCol} \\`);
+  if (!doRun && !args.dryRun) {
+    console.log(`[SemDB] (pass --ground-truth-dir or --run to execute extraction + compiled query + scoring)`);
+    console.log(`[SemDB] Extract manually:`);
+    console.log(`  python3 src/semdb/extract.py --schema ${schemaPath} --table ${unstructured.path} \\`);
+    console.log(`    --modality ${isImage ? "image" : "text"} --id-col ${idCol} `
+      + `${isImage ? `--image-col ${imageCol} --image-dir ${args.imageDir}` : `--text-col ${textCol}`} \\`);
+    console.log(`    --model ${extractModel} --out ${attrsPath}   # add --endpoint http://localhost:8000/v1 for vLLM`);
+    console.log(`  python3 ${codePath} ${structured.path} ${attrsPath} ${resultsCsv}`);
   }
-  console.log(`    --model ${smallModel} --out ${attrsPath}`);
-  console.log(`  # faster + guaranteed-valid JSON: add  --endpoint http://localhost:8000/v1  (vLLM guided decoding)`);
-  console.log(`[SemDB] Then run:      python3 ${codePath}`);
 }
 
 main().catch((err) => {
