@@ -98,16 +98,28 @@ def load_text_model(model_id):
     return ("text", tok, mdl)
 
 
+def _load_vlm_class():
+    """transformers renamed AutoModelForVision2Seq -> AutoModelForImageTextToText
+    (>=4.45); the old name is removed in recent releases. Try new, fall back to old."""
+    try:
+        from transformers import AutoModelForImageTextToText as VLM
+        return VLM
+    except ImportError:
+        from transformers import AutoModelForVision2Seq as VLM  # older transformers
+        return VLM
+
+
 def load_image_model(model_id):
     try:
         import torch  # noqa
-        from transformers import AutoProcessor, AutoModelForVision2Seq  # noqa
+        from transformers import AutoProcessor  # noqa
         from PIL import Image  # noqa
     except Exception as e:
         _dep_exit("torch transformers pillow accelerate", e)
-    from transformers import AutoProcessor, AutoModelForVision2Seq
+    from transformers import AutoProcessor
+    VLM = _load_vlm_class()
     proc = AutoProcessor.from_pretrained(model_id)
-    mdl = AutoModelForVision2Seq.from_pretrained(model_id, torch_dtype="auto")
+    mdl = VLM.from_pretrained(model_id, torch_dtype="auto")
     return ("image", proc, mdl)
 
 

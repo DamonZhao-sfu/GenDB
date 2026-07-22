@@ -43,7 +43,7 @@ EXTRACT_PROMPT = (
 def _require_deps():
     try:
         import torch  # noqa: F401
-        from transformers import AutoProcessor, AutoModelForVision2Seq  # noqa: F401
+        from transformers import AutoProcessor  # noqa: F401
         from PIL import Image  # noqa: F401
     except Exception as e:  # pragma: no cover - environment dependent
         sys.stderr.write(
@@ -52,6 +52,17 @@ def _require_deps():
             f"(import error: {e})\n"
         )
         sys.exit(2)
+
+
+def _load_vlm_class():
+    """transformers renamed AutoModelForVision2Seq -> AutoModelForImageTextToText
+    (>=4.45); the old name is removed in recent releases."""
+    try:
+        from transformers import AutoModelForImageTextToText as VLM
+        return VLM
+    except ImportError:
+        from transformers import AutoModelForVision2Seq as VLM  # older transformers
+        return VLM
 
 
 def parse_json_object(text):
@@ -80,13 +91,14 @@ def main():
 
     _require_deps()
     import torch
-    from transformers import AutoProcessor, AutoModelForVision2Seq
+    from transformers import AutoProcessor
     from PIL import Image
+    VLM = _load_vlm_class()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     processor = AutoProcessor.from_pretrained(args.model)
-    model = AutoModelForVision2Seq.from_pretrained(args.model, torch_dtype=dtype).to(device)
+    model = VLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
 
     rows = list(csv.DictReader(open(args.manifest)))
     attrs = []
