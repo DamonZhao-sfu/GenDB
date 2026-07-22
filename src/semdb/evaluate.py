@@ -99,11 +99,10 @@ def model_of(tele, phase):
 
 
 CSV_COLS = [
-    "query", "provider", "designer_model", "extractor_model", "codegen_model",
-    "wall_clock_ms", "agent_stage_ms", "code_execution_ms",
-    "total_estimated_cost_usd", "total_agent_tokens",
-    "agent_calls", "extraction_calls", "residual_calls", "total_llm_calls",
+    "query", "corpus", "provider", "operator", "codegen_model",
     "naive_llm_calls", "compiled_execution_calls", "call_reduction",
+    "schema_design_calls", "extraction_calls", "codegen_calls", "residual_calls",
+    "amortized_total_calls", "codegen_cost_usd", "total_estimated_cost_usd",
     "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
 ]
 
@@ -124,25 +123,24 @@ def main():
     tele = json.load(open(args.telemetry)) if args.telemetry and os.path.exists(args.telemetry) else {}
     llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
 
+    pq = tele.get("per_query", {}) if isinstance(tele.get("per_query"), dict) else {}
     row = {c: "" for c in CSV_COLS}
     row.update(
         query=args.query or tele.get("query", ""),
+        corpus=tele.get("corpus", ""),
         provider=tele.get("provider", ""),
-        designer_model=model_of(tele, "schema_designer"),
-        extractor_model=model_of(tele, "extractor"),
+        operator=tele.get("operator", ""),
         codegen_model=model_of(tele, "code_generator"),
-        wall_clock_ms=tele.get("wall_clock_ms", ""),
-        agent_stage_ms=tele.get("agent_stage_ms", ""),
-        code_execution_ms=tele.get("code_execution_ms", ""),
-        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
-        total_agent_tokens=tele.get("total_agent_tokens", ""),
-        agent_calls=llm.get("agent_stage", ""),
-        extraction_calls=llm.get("extraction", ""),
-        residual_calls=llm.get("residual", ""),
-        total_llm_calls=llm.get("total", ""),
         naive_llm_calls=tele.get("naive_llm_calls", ""),
         compiled_execution_calls=tele.get("compiled_execution_calls", ""),
         call_reduction=tele.get("call_reduction", ""),
+        schema_design_calls=llm.get("schema_design", ""),
+        extraction_calls=llm.get("extraction", ""),
+        codegen_calls=llm.get("codegen", ""),
+        residual_calls=llm.get("residual", ""),
+        amortized_total_calls=llm.get("amortized_total", ""),
+        codegen_cost_usd=pq.get("codegen_cost_usd", ""),
+        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
     )
 
     gt_path = args.ground_truth or (

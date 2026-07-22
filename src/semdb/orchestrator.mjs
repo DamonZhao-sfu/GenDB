@@ -1,26 +1,28 @@
 /**
- * SemDB Orchestrator — compile a SemBench semantic operator into a relational
- * program via three agents, reusing GenDB's provider/agent plumbing.
+ * SemDB Orchestrator — compile SemBench semantic operators into relational
+ * programs via three agents, reusing GenDB's provider/agent plumbing.
  *
- *   Phase A  Schema Designer  : query + table headers   -> schema.json
- *   Phase B  Extractor        : schema + corpus         -> <corpus>_attrs.json  (once, shared)
- *   Phase C  Code Generator   : query + schema + attrs  -> compiled_<q>.py
- *   Verify   compiled result  == naive oracle, report model-call reduction
+ * The work is amortized PER CORPUS, not per query:
+ *   Phase A  Schema Designer : ONCE per corpus, seeing ALL its queries  -> _corpus/<c>/schema.json
+ *   Phase B  Extractor       : ONCE per corpus (small model)            -> _corpus/<c>/<c>_attrs.json
+ *   Phase C  Code Generator  : PER query (reuses the corpus schema+attrs)-> compiled_<q>.py
+ *   Execute + evaluate       : per query -> results, telemetry.json, results.csv (P/R/F1)
  *
- * You provide two paths — the SemBench query folder and the data folder — and a
- * query id. The agents read the REAL .sql file and the REAL table headers and
- * emit artifacts that reference your real files.
+ * Queries are grouped by their extract-side "corpus" (e.g. all logo joins share
+ * the images corpus; q3a–g share the movie-text corpus), so the expensive schema
+ * design + extraction run once and every query over that corpus reuses them.
  *
  * Usage:
  *   node src/semdb/orchestrator.mjs \
- *        --query q3a \
- *        --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
- *        --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200 \
- *        [--out <dir>] [--dry-run]
+ *        [--query q3a] \                      # omit to process ALL *.sql in --query-dir
+ *        --query-dir /.../mmqa/query/bigquery \
+ *        --data-dir  /.../mmqa/data/sf_200 \
+ *        --ground-truth-dir /.../mmqa/raw_results/ground_truth \
+ *        [--endpoint http://localhost:8000/v1] [--force] [--dry-run]
  *
- * `--dry-run` prints the resolved plan + rendered prompts without spawning agents
- * (no Claude credentials needed) — use it to see exactly what each agent receives.
- * The self-contained, GPU-free demonstration lives in ./poc/ and ./examples/.
+ * --ground-truth-dir (or --run) executes extraction + compiled query + scoring.
+ * --force re-runs the cached corpus schema/extraction. --dry-run just prints the
+ * rendered prompts. GPU-free demos live in ./poc/ and ./examples/.
  */
 
 import { readFile, writeFile, mkdir, readdir } from "fs/promises";
@@ -64,6 +66,7 @@ function parseArgs(argv) {
     extractModel: null,    // small VLM/LLM id (default: config extraction.small*Model)
     theta: null,
     predCols: "0,1",       // predicted columns to compare vs GT tuple order
+    force: false,          // re-run corpus schema design + extraction even if cached
     dryRun: false,
   };
   for (let i = 2; i < argv.length; i++) {
@@ -87,6 +90,7 @@ function parseArgs(argv) {
     else if (a === "--extract-model" && argv[i + 1]) args.extractModel = argv[++i];
     else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
     else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
+    else if (a === "--force") args.force = true;
     else if (a === "--dry-run") args.dryRun = true;
   }
   // Derive query/data dirs from the repo root when only --sembench-dir is given.
@@ -276,19 +280,12 @@ async function runPhase(agentConfig, vars, runDir, args) {
   return result;
 }
 
-async function runOneQuery(args) {
-  const wallStart = Date.now();
-
-  const runDir = resolve(args.out, `${args.benchmark}-${args.query || "example"}`);
-  await mkdir(runDir, { recursive: true });
-
-  // Telemetry: one entry per agent phase (time, tokens, cost).
-  const telemetry = { phases: [] };
-  const record = (name, r) => {
+/** Build a phase-telemetry recorder bound to a phases[] array. */
+function makeRecorder(args, phases) {
+  return (name, r) => {
     if (!r || r.dryRun) return r;
-    telemetry.phases.push({
+    phases.push({
       phase: name,
-      provider: args.agentProvider,
       model: args.modelOverride || getAgentModel(name, args.agentProvider),
       duration_ms: r.durationMs || 0,
       tokens: r.tokens || {},
@@ -297,270 +294,306 @@ async function runOneQuery(args) {
     });
     return r;
   };
+}
 
-  const { sql, nl } = await loadQuery(args);
-  const tableHeaders = await readTableHeaders(args.dataDir);
+function agentModelsLine(args) {
+  const m = (k) => args.modelOverride || getAgentModel(k, args.agentProvider);
+  return `designer=${m("schema_designer")}, extractor=${m("extractor")}, codegen=${m("code_generator")}`;
+}
+
+/** Guess corpus columns + the small model for extraction. */
+async function corpusCols(corpus, args) {
+  let cols = [];
+  try { cols = (await headerOf(corpus.path)).split(",").map((c) => c.trim()); } catch { /* unreadable */ }
+  const isImage = corpus.isImages;
+  return {
+    idCol: cols[0] || (isImage ? "uri" : "id"),
+    textCol: cols.find((c) => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text",
+    imageCol: cols.find((c) => /image|uri|path|file/i.test(c)) || cols[0] || "uri",
+    extractModel: args.extractModel || (isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Per-query planning: which corpus (extract side), structured side, operator.
+// ---------------------------------------------------------------------------
+async function planQuery(args, query) {
+  const { sql, nl } = await loadQuery({ ...args, query });
   const tables = tablesInSql(sql, args.dataDir);
-  const imageTable = tables.find((t) => t.isImages);
-  const unstructured = await chooseCorpus(sql, tables, args.dataDir);
+  const corpus = await chooseCorpus(sql, tables, args.dataDir);
+  const structured = tables.find((t) => !t.isImages && t.path !== corpus.path)
+    || tables.find((t) => !t.isImages) || corpus;
+  const plan = await computeNaive(sql, args.dataDir);
+  return { query, sql, nl, tables, corpus, structured, isImage: !!corpus.isImages, plan };
+}
 
-  const schemaPath = resolve(runDir, "schema.json");
-  const attrsPath = resolve(runDir, `${unstructured.table}_attrs.json`);
-  const codePath = resolve(runDir, `compiled_${args.query || "q"}.py`);
+// ---------------------------------------------------------------------------
+// Corpus-level Phase A + B — run ONCE per corpus, shared by all its queries.
+// ---------------------------------------------------------------------------
+async function ensureCorpus(args, corpus, corpusQueries) {
+  const corpusDir = resolve(args.out, "_corpus", corpus.table);
+  await mkdir(corpusDir, { recursive: true });
+  const schemaPath = resolve(corpusDir, "schema.json");
+  const attrsPath = resolve(corpusDir, `${corpus.table}_attrs.json`);
+  const isImage = corpus.isImages;
+  const modality = isImage ? "image" : "text";
+  const { idCol, textCol, imageCol, extractModel } = await corpusCols(corpus, args);
+  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
 
-  console.log(`[SemDB] benchmark=${args.benchmark} query=${args.query || "example"}`);
-  console.log(`[SemDB] provider=${args.agentProvider} models: designer=${args.modelOverride || getAgentModel("schema_designer", args.agentProvider)}, extractor=${args.modelOverride || getAgentModel("extractor", args.agentProvider)}, codegen=${args.modelOverride || getAgentModel("code_generator", args.agentProvider)}`);
-  console.log(`[SemDB] query-dir: ${args.queryDir || "(none)"}`);
-  console.log(`[SemDB] data-dir:  ${args.dataDir || "(none)"}`);
-  console.log(`[SemDB] tables in SQL: ${tables.map((t) => t.table).join(", ") || "(none parsed)"}`);
-  console.log(`[SemDB] run dir:   ${runDir}`);
-  console.log(`[SemDB] query:\n${sql}\n`);
+  const phases = [];
+  const record = makeRecorder(args, phases);
 
-  // Phase A — Schema Designer (sees the real SQL + real table headers)
-  record("schema_designer", await runPhase(schemaDesignerConfig, {
-    query_id: args.query || "example",
-    query_sql: sql,
-    query_nl: nl,
-    table_schemas: tableHeaders,
-    corpus_name: unstructured.table,
-    corpus_size: "(rows in " + basename(unstructured.path || "corpus") + ")",
-    modality: imageTable ? "image" : "text",
-    structured_name: (tables.find((t) => !t.isImages) || {}).table || "(structured side)",
-    structured_size: "N/A",
-    schema_path: schemaPath,
-    existing_schema: "",
-  }, runDir, args));
+  console.log(`\n[SemDB] ===== CORPUS ${corpus.table} [${modality}] — ${corpusQueries.length} quer${corpusQueries.length === 1 ? "y" : "ies"}: ${corpusQueries.map((p) => p.query).join(", ")} =====`);
+
+  // Phase A — Schema Designer ONCE, seeing ALL queries over this corpus so the
+  // schema covers every attribute they need (skip if cached unless --force).
+  if (!existsSync(schemaPath) || args.force) {
+    const tableHeaders = await readTableHeaders(args.dataDir);
+    const querySqls = corpusQueries.map((p) => `-- ${p.query}\n${p.sql}`).join("\n\n");
+    record("schema_designer", await runPhase(schemaDesignerConfig, {
+      query_id: `${corpus.table} [${corpusQueries.map((p) => p.query).join(",")}]`,
+      query_sql: querySqls,
+      query_nl: corpusQueries.map((p) => p.nl).filter(Boolean).join(" | "),
+      table_schemas: tableHeaders,
+      corpus_name: corpus.table,
+      corpus_size: "(rows in " + basename(corpus.path || "corpus") + ")",
+      modality,
+      structured_name: "(varies per query)",
+      structured_size: "N/A",
+      schema_path: schemaPath,
+      existing_schema: "",
+    }, corpusDir, args));
+  } else {
+    console.log(`[SemDB] reuse cached corpus schema: ${schemaPath}`);
+  }
 
   const schema = args.dryRun ? null : await readJSON(schemaPath);
   if (schema && schema.decomposable === false) {
-    console.log(`[SemDB] Not decomposable: ${schema.rationale}. Fall back to naive execution.`);
-    return;
+    console.log(`[SemDB] corpus ${corpus.table} not decomposable: ${schema.rationale}`);
   }
 
-  // Phase B — Extractor (small model, once per corpus; reused by every query over it)
-  const isImage = !!imageTable;
-  record("extractor", await runPhase(extractorConfig, {
-    corpus_name: unstructured.table,
-    schema_json: schema ? JSON.stringify(schema, null, 2) : "{{schema.json from Phase A}}",
-    corpus_manifest: unstructured.path || "(corpus table path)",
-    modality: isImage ? "image" : "text",
-    corpus_size: "(all rows)",
-    small_model: isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel,
-    escalation_model: defaults.extraction.escalationImageModel,
-    attrs_path: attrsPath,
-  }, runDir, args));
+  // Phase B — Extractor ONCE (deterministic extract.py). Skip if attrs cached.
+  if (doRun && (!existsSync(attrsPath) || args.force)) {
+    const exArgs = [resolve(__dirname, "extract.py"), "--schema", schemaPath, "--table", corpus.path,
+      "--modality", modality, "--id-col", idCol,
+      ...(isImage ? ["--image-col", imageCol, "--image-dir", args.imageDir] : ["--text-col", textCol]),
+      "--model", extractModel, "--out", attrsPath,
+      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : []),
+      ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
+    console.log(`\n[SemDB] Extracting corpus ${corpus.table} (once): python3 ${exArgs.join(" ")}`);
+    const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
+    if (ex.status !== 0) console.warn(`[SemDB] extraction exited ${ex.status}.`);
+  } else if (existsSync(attrsPath)) {
+    console.log(`[SemDB] reuse cached corpus attrs: ${attrsPath}`);
+  }
 
-  // Phase C — Code Generator (compiled program references the real table paths)
-  const structured = tables.find((t) => !t.isImages) || unstructured;
+  const extMeta = await readJSON(attrsPath + ".meta.json");
+  const sd = phases.filter((p) => p.phase === "schema_designer");
+  const corpusTelemetry = {
+    corpus: corpus.table,
+    modality,
+    queries: corpusQueries.map((p) => p.query),
+    query_count: corpusQueries.length,
+    schema_design: {
+      ms: sd.reduce((s, p) => s + p.duration_ms, 0),
+      calls: sd.reduce((s, p) => s + p.llm_calls, 0),
+      cost_usd: sd.reduce((s, p) => s + p.cost_usd, 0),
+      model: agentModelsLine(args),
+    },
+    extraction: {
+      sec: extMeta?.elapsed_sec ?? null,
+      calls: extMeta?.llm_calls ?? null,
+      model: extractModel,
+    },
+  };
+  if (!args.dryRun) await writeFile(resolve(corpusDir, "corpus_telemetry.json"), JSON.stringify(corpusTelemetry, null, 2));
+  return { corpusDir, schemaPath, attrsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
+}
+
+// ---------------------------------------------------------------------------
+// Per-query Phase C + execute + evaluate (reuses the corpus schema + attrs).
+// ---------------------------------------------------------------------------
+async function runQueryCodegen(args, planObj, art, csvPath) {
+  const { query, sql, structured, plan, corpus } = planObj;
+  const wallStart = Date.now();
+  const runDir = resolve(args.out, `${args.benchmark}-${query}`);
+  await mkdir(runDir, { recursive: true });
+  const codePath = resolve(runDir, `compiled_${query}.py`);
+  const resultsCsv = resolve(runDir, `${query}_results.csv`);
+  const { schemaPath, attrsPath, schema, corpusTelemetry, extractModel } = art;
+  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
+
+  const phases = [];
+  const record = makeRecorder(args, phases);
+
+  console.log(`\n[SemDB] ---- ${query}  (corpus ${corpus.table}, ${plan.type}) ----`);
+
+  // Phase C — Code Generator (per query; reuses the corpus schema + attrs).
   record("code_generator", await runPhase(codeGeneratorConfig, {
-    query_id: args.query || "q",
+    query_id: query,
     query_sql: sql,
-    schema_json: schema ? JSON.stringify(schema, null, 2) : "{{schema.json from Phase A}}",
+    schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
     attrs_path: attrsPath,
     attrs_columns: "(schema attributes + conf)",
     structured_path: structured.path || "(structured table path)",
     structured_columns: "(see table headers)",
     code_path: codePath,
-    code_basename: `compiled_${args.query || "q"}.py`,
+    code_basename: `compiled_${query}.py`,
   }, runDir, args));
 
-  // --- Execute downstream Python steps (extraction → compiled query) --------
-  // Auto-run when a ground-truth dir is given (the user wants metrics), unless
-  // --no-run. These produce the .meta.json sidecars the telemetry block reads.
-  const resultsCsv = resolve(runDir, `${args.query || "q"}_results.csv`);
-  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
-
-  // Guess corpus columns for extract.py.
-  let cols = [];
-  try {
-    cols = (await readFile(unstructured.path, "utf-8")).split(/\r?\n/, 1)[0].split(",").map((c) => c.trim());
-  } catch { /* corpus path may not be readable here */ }
-  const idCol = cols[0] || (isImage ? "uri" : "id");
-  const textCol = cols.find((c) => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text";
-  const imageCol = cols.find((c) => /image|uri|path|file/i.test(c)) || idCol;
-  const extractModel = args.extractModel || (isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel);
-
-  if (doRun) {
-    const py = (name) => resolve(__dirname, name);
-    // 1) Extraction (small model over the corpus, once).
-    const exArgs = [py("extract.py"), "--schema", schemaPath, "--table", unstructured.path,
-      "--modality", isImage ? "image" : "text", "--id-col", idCol,
-      ...(isImage ? ["--image-col", imageCol, "--image-dir", args.imageDir] : ["--text-col", textCol]),
-      "--model", extractModel, "--out", attrsPath,
-      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : []),
-      ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
-    console.log(`\n[SemDB] Running extraction: python3 ${exArgs.join(" ")}`);
-    const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
-    if (ex.status !== 0) console.warn(`[SemDB] extraction exited ${ex.status} — metrics may be incomplete.`);
-
-    // 2) Compiled query: python3 compiled_<q>.py <structured.csv> <attrs.json> <out.csv> [--endpoint ...]
-    if (existsSync(codePath) && existsSync(attrsPath)) {
-      const cqArgs = [codePath, structured.path, attrsPath, resultsCsv,
-        ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
-      console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
-      const cq = spawnSync("python3", cqArgs, { stdio: "inherit" });
-      if (cq.status !== 0) console.warn(`[SemDB] compiled query exited ${cq.status} — check its CLI signature.`);
-    } else {
-      console.warn(`[SemDB] skipping compiled query — missing ${existsSync(codePath) ? attrsPath : codePath}`);
-    }
+  if (doRun && existsSync(codePath) && existsSync(attrsPath)) {
+    const cqArgs = [codePath, structured.path, attrsPath, resultsCsv,
+      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
+    console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
+    const cq = spawnSync("python3", cqArgs, { stdio: "inherit" });
+    if (cq.status !== 0) console.warn(`[SemDB] compiled query exited ${cq.status} — check its CLI signature.`);
+  } else if (doRun) {
+    console.warn(`[SemDB] skipping compiled query — missing ${existsSync(codePath) ? attrsPath : codePath}`);
   }
 
-  // --- Telemetry: agent-stage time + estimated cost -------------------------
-  if (!args.dryRun) {
-    // "code execution" = the extraction + compiled-query runtime. Those run in
-    // separate scripts (extract.py, compiled_<q>.py), each of which writes an
-    // elapsed_sec into its own <out>.meta.json. Merge them if present.
-    const codeExec = { extraction_sec: null, compiled_query_sec: null };
-    const extMeta = await readJSON(attrsPath + ".meta.json");
-    if (extMeta?.elapsed_sec != null) codeExec.extraction_sec = extMeta.elapsed_sec;
-    const cqMeta = await readJSON(resolve(runDir, `compiled_${args.query || "q"}.meta.json`));
-    if (cqMeta?.elapsed_sec != null) codeExec.compiled_query_sec = cqMeta.elapsed_sec;
+  if (args.dryRun) return null;
 
-    const agentMs = telemetry.phases.reduce((s, p) => s + p.duration_ms, 0);
-    const costUsd = telemetry.phases.reduce((s, p) => s + p.cost_usd, 0);
-    const totalTok = telemetry.phases.reduce((s, p) =>
-      s + (p.tokens.input || 0) + (p.tokens.output || 0), 0);
-    const codeExecMs = 1000 * ((codeExec.extraction_sec || 0) + (codeExec.compiled_query_sec || 0));
+  // --- Per-query telemetry (codegen + residual) + shared corpus (amortized) ---
+  const cg = phases.find((p) => p.phase === "code_generator") || { duration_ms: 0, cost_usd: 0, llm_calls: 0, tokens: {} };
+  const cqMeta = await readJSON(resolve(runDir, `compiled_${query}.meta.json`));
+  const residualCalls = cqMeta?.residual_calls || 0;
+  const N = await countRows(corpus.path);
+  const extractionCalls = corpusTelemetry.extraction.calls ?? (N ?? 0);
+  const schemaCalls = corpusTelemetry.schema_design.calls || 0;
+  const K = corpusTelemetry.query_count || 1;
+  const naiveCalls = plan.naive;
+  const compiledExecCalls = extractionCalls + residualCalls;
+  const reduction = (naiveCalls && compiledExecCalls) ? Number((naiveCalls / compiledExecCalls).toFixed(1)) : null;
+  const amortizedTotal = cg.llm_calls + residualCalls + (schemaCalls + extractionCalls) / K;
+  const codegenCost = cg.cost_usd;
+  const amortizedCost = codegenCost + (corpusTelemetry.schema_design.cost_usd || 0) / K;
+  const gt = await resolveGroundTruth(args.groundTruthDir, query);
 
-    // Total LLM calls for this query = agent-stage turns + extraction calls + residual calls.
-    const agentCalls = telemetry.phases.reduce((s, p) => s + (p.llm_calls || 0), 0);
-    const extractionCalls = extMeta?.llm_calls || 0;
-    const residualCalls = cqMeta?.residual_calls || 0;
-    const llmCalls = {
-      agent_stage: agentCalls,
-      extraction: extractionCalls,      // one small-model call per corpus item
-      residual: residualCalls,          // compiled query's live VLM/LLM calls
-      total: agentCalls + extractionCalls + residualCalls,
-    };
+  const report = {
+    query, corpus: corpus.table, provider: args.agentProvider, operator: plan.type,
+    wall_clock_ms: Date.now() - wallStart,
+    per_query: {
+      codegen_ms: cg.duration_ms, codegen_calls: cg.llm_calls,
+      codegen_cost_usd: Number(codegenCost.toFixed(4)),
+      codegen_tokens: (cg.tokens.input || 0) + (cg.tokens.output || 0),
+      compiled_query_sec: cqMeta?.elapsed_sec ?? null, residual_calls: residualCalls,
+    },
+    shared_corpus: {
+      corpus: corpus.table, query_count: K,
+      schema_design_calls: schemaCalls,
+      schema_design_cost_usd: Number((corpusTelemetry.schema_design.cost_usd || 0).toFixed(4)),
+      extraction_calls: extractionCalls, extraction_sec: corpusTelemetry.extraction.sec,
+      amortized_schema_design_calls: Number((schemaCalls / K).toFixed(2)),
+      amortized_extraction_calls: Number((extractionCalls / K).toFixed(2)),
+    },
+    llm_calls: {
+      schema_design: schemaCalls, extraction: extractionCalls,
+      codegen: cg.llm_calls, residual: residualCalls,
+      amortized_total: Number(amortizedTotal.toFixed(2)),
+    },
+    naive_llm_calls: naiveCalls ?? null,
+    compiled_execution_calls: compiledExecCalls,
+    call_reduction: reduction,
+    total_estimated_cost_usd: Number(amortizedCost.toFixed(4)),
+    ground_truth: gt ? { file: gt.file, count: gt.count } : null,
+    phases,
+  };
+  const telePath = resolve(runDir, "telemetry.json");
+  await writeFile(telePath, JSON.stringify(report, null, 2));
 
-    // Original (naive) plan by operator (sem_join = left×right, sem_filter/map = N).
-    const plan = await computeNaive(sql, args.dataDir);
-    const N = await countRows(unstructured.path);
-    const naiveCalls = plan.naive;
-    // Compiled EXECUTION model calls (excludes one-time compile-stage agents):
-    // the shared per-item extraction (N) + the residual live calls (k).
-    const execExtraction = extractionCalls || (N != null ? N : 0);
-    const compiledExecCalls = execExtraction + residualCalls;
-    const reduction = (naiveCalls && compiledExecCalls)
-      ? Number((naiveCalls / compiledExecCalls).toFixed(1)) : null;
+  // --- Summary print ---
+  console.log(`\n[SemDB] === ${query} ===`);
+  console.log(`[SemDB]   code_generator     ${(cg.duration_ms / 1000).toFixed(1)}s  ${cg.llm_calls} calls  $${cg.cost_usd.toFixed(4)}  (${report.phases[0]?.model || ""})`);
+  console.log(`[SemDB]   shared/corpus      schema_design ${schemaCalls} + extraction ${extractionCalls} calls  ÷ ${K} queries  (amortized ${(schemaCalls / K).toFixed(1)}+${(extractionCalls / K).toFixed(1)})`);
+  console.log(`[SemDB]   residual           ${residualCalls}`);
+  const naiveExpr = plan.type === "join"
+    ? `= ${plan.tables.map((t) => plan.counts[t]).join(" × ")} (${plan.tables.join(" × ")})`
+    : (plan.naive != null ? `= ${plan.naive} rows` : "");
+  console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"} [${plan.type}] ${naiveExpr}`);
+  console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls} (extraction ${extractionCalls} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
 
-    const gt = await resolveGroundTruth(args.groundTruthDir, args.query);
-
-    const report = {
-      query: args.query, provider: args.agentProvider,
-      wall_clock_ms: Date.now() - wallStart,
-      agent_stage_ms: agentMs,
-      code_execution_ms: codeExecMs || null,
-      code_execution: codeExec,
-      total_estimated_cost_usd: Number(costUsd.toFixed(4)),
-      total_agent_tokens: totalTok,
-      llm_calls: llmCalls,
-      naive_llm_calls: naiveCalls ?? null,          // original M×N (join) or N (filter)
-      compiled_execution_calls: compiledExecCalls,  // extraction (shared) + residual
-      call_reduction: reduction,                    // naive / compiled-execution
-      operator: plan.type, corpus_rows: N, table_rows: plan.counts,
-      ground_truth: gt ? { file: gt.file, count: gt.count } : null,
-      phases: telemetry.phases,
-    };
-    await writeFile(resolve(runDir, "telemetry.json"), JSON.stringify(report, null, 2));
-
-    console.log(`\n[SemDB] === Telemetry ===`);
-    for (const p of telemetry.phases) {
-      console.log(`[SemDB]   ${p.phase.padEnd(16)} ${(p.duration_ms / 1000).toFixed(1)}s  `
-        + `${p.llm_calls} calls  ${((p.tokens.input || 0) + (p.tokens.output || 0))} tok  $${p.cost_usd.toFixed(4)}  (${p.model})`);
+  // --- Score against ground truth + append CSV ---
+  if (doRun && gt && existsSync(resultsCsv)) {
+    const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
+      "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
+      "--query", query, "--csv", csvPath];
+    const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
+    if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
+    const scored = await readJSON(telePath);
+    const m = scored?.metrics;
+    if (m) {
+      console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+      console.log(`[SemDB]   saved -> ${telePath} and ${csvPath}`);
     }
-    console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  ${totalTok} tok  $${costUsd.toFixed(4)}`);
-    console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
-    console.log(`[SemDB]   LLM CALLS          total=${llmCalls.total}  (agents ${agentCalls} + extraction ${extractionCalls} + residual ${residualCalls})`);
-    const naiveExpr = plan.type === "join"
-      ? `= ${plan.tables.map((t) => plan.counts[t]).join(" × ")}  (${plan.tables.join(" × ")})`
-      : (plan.naive != null ? `= ${plan.naive} rows  (${plan.tables[0] || unstructured.table})` : "");
-    console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"}  [${plan.type}] ${naiveExpr}`);
-    console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls}  (extraction ${execExtraction} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
-    console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
-    if (gt) console.log(`[SemDB]   ground truth       ${gt.count} rows — ${gt.file}`);
-    console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);
-
-    // Score against ground truth + write the results CSV.
-    const csvPath = args.telemetryCsv || resolve(args.out, "results.csv");
-    const telePath = resolve(runDir, "telemetry.json");
-    if (doRun && gt && existsSync(resultsCsv)) {
-      const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
-        "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
-        "--query", args.query, "--csv", csvPath];
-      console.log(`\n[SemDB] Scoring: python3 ${evArgs.join(" ")}`);
-      const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
-      if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
-      // Read the metrics back and surface them in the summary.
-      const scored = await readJSON(telePath);
-      const m = scored?.metrics;
-      if (m) {
-        console.log(`\n[SemDB]   ============ METRICS (${args.query}) ============`);
-        console.log(`[SemDB]   precision = ${m.precision}   recall = ${m.recall}   F1 = ${m.f1}`);
-        console.log(`[SemDB]   tp=${m.tp}  fp=${m.fp}  fn=${m.fn}   (ground truth ${m.gt_count}, predicted ${m.pred_count})`);
-      }
-      console.log(`[SemDB]   metrics + row saved -> ${telePath} and ${csvPath}`);
-    } else if (gt) {
-      console.log(`\n[SemDB] Score + append to CSV (compiled query output not found${doRun ? "" : "; re-run with --run"}):`);
-      console.log(`  python3 src/semdb/evaluate.py --telemetry ${telePath} \\`);
-      console.log(`    --ground-truth ${gt.file} --pred ${resultsCsv} --pred-cols ${args.predCols} \\`);
-      console.log(`    --query ${args.query} --csv ${csvPath}`);
-    }
+  } else if (gt) {
+    console.log(`[SemDB]   (compiled output not found — score later with evaluate.py --pred ${resultsCsv})`);
   }
-
-  console.log(`\n[SemDB] Done. Artifacts in ${runDir}`);
-  if (!doRun && !args.dryRun) {
-    console.log(`[SemDB] (pass --ground-truth-dir or --run to execute extraction + compiled query + scoring)`);
-    console.log(`[SemDB] Extract manually:`);
-    console.log(`  python3 src/semdb/extract.py --schema ${schemaPath} --table ${unstructured.path} \\`);
-    console.log(`    --modality ${isImage ? "image" : "text"} --id-col ${idCol} `
-      + `${isImage ? `--image-col ${imageCol} --image-dir ${args.imageDir}` : `--text-col ${textCol}`} \\`);
-    console.log(`    --model ${extractModel} --out ${attrsPath}   # add --endpoint http://localhost:8000/v1 for vLLM`);
-    console.log(`  python3 ${codePath} ${structured.path} ${attrsPath} ${resultsCsv}`);
-  }
+  return report;
 }
 
 async function main() {
   const base = parseArgs(process.argv);
   setAgentProvider(base.agentProvider);
+  const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
 
-  // No --query → process every *.sql under the query dir into one shared CSV.
   const queries = base.query ? [base.query] : await listQueries(base.queryDir);
   if (queries.length === 0) {
     console.error("[SemDB] no query given and no *.sql found in --query-dir.");
     process.exit(1);
   }
-  const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
+  console.log(`[SemDB] provider=${base.agentProvider} models: ${agentModelsLine(base)}`);
   console.log(`[SemDB] processing ${queries.length} quer${queries.length === 1 ? "y" : "ies"}: ${queries.join(", ")}`);
-  if (queries.length > 1) console.log(`[SemDB] metrics CSV: ${csvPath}`);
 
-  const summary = [];
+  // 1) Plan every query and group by corpus (the extract-side table).
+  const plans = [];
   for (const q of queries) {
-    console.log(`\n[SemDB] ==================== ${q} ====================`);
+    try { plans.push(await planQuery(base, q)); }
+    catch (e) { console.error(`[SemDB] [${q}] plan failed: ${e.message}`); }
+  }
+  const corpora = new Map();
+  for (const p of plans) {
+    const key = p.corpus.table;
+    if (!corpora.has(key)) corpora.set(key, { corpus: p.corpus, queries: [] });
+    corpora.get(key).queries.push(p);
+  }
+  console.log(`[SemDB] ${corpora.size} corpus/corpora: ${[...corpora.entries()].map(([k, v]) => `${k}(${v.queries.length})`).join(", ")}`);
+
+  // 2) Schema Designer + Extractor ONCE per corpus (shared by its queries).
+  const corpusArt = new Map();
+  for (const [key, info] of corpora) {
+    try { corpusArt.set(key, await ensureCorpus(base, info.corpus, info.queries)); }
+    catch (e) { console.error(`[SemDB] corpus ${key} failed: ${e.message}`); }
+  }
+
+  // 3) Code Generator + execute + evaluate PER query.
+  const summary = [];
+  for (const p of plans) {
+    console.log(`\n[SemDB] ==================== ${p.query} ====================`);
+    const art = corpusArt.get(p.corpus.table);
+    if (!art) { summary.push({ q: p.query, error: "corpus artifacts missing" }); continue; }
     try {
-      await runOneQuery({ ...base, query: q });
-      const tele = await readJSON(resolve(base.out, `${base.benchmark}-${q}`, "telemetry.json"));
-      if (tele?.metrics) summary.push({ q, ...tele.metrics });
+      await runQueryCodegen(base, p, art, csvPath);
+      const tele = await readJSON(resolve(base.out, `${base.benchmark}-${p.query}`, "telemetry.json"));
+      if (tele?.metrics) summary.push({ q: p.query, ...tele.metrics });
     } catch (e) {
-      console.error(`[SemDB] [${q}] failed: ${e.message}`);
-      summary.push({ q, error: e.message });
+      console.error(`[SemDB] [${p.query}] failed: ${e.message}`);
+      summary.push({ q: p.query, error: e.message });
     }
   }
 
-  if (queries.length > 1) {
-    console.log(`\n[SemDB] ==================== SUMMARY ====================`);
-    for (const s of summary) {
-      console.log(s.error
-        ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
-        : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`);
-    }
-    const scored = summary.filter((s) => s.f1 != null);
-    if (scored.length) {
-      const mean = (k) => (scored.reduce((a, s) => a + s[k], 0) / scored.length).toFixed(4);
-      console.log(`[SemDB]   ${"MEAN".padEnd(6)} P=${mean("precision")} R=${mean("recall")} F1=${mean("f1")}  (${scored.length} scored)`);
-    }
-    console.log(`[SemDB]   full metrics CSV -> ${csvPath}`);
+  // 4) Workload summary.
+  console.log(`\n[SemDB] ==================== SUMMARY ====================`);
+  for (const s of summary) {
+    console.log(s.error
+      ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
+      : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`);
   }
+  const scored = summary.filter((s) => s.f1 != null);
+  if (scored.length) {
+    const mean = (k) => (scored.reduce((a, s) => a + s[k], 0) / scored.length).toFixed(4);
+    console.log(`[SemDB]   ${"MEAN".padEnd(6)} P=${mean("precision")} R=${mean("recall")} F1=${mean("f1")}  (${scored.length} scored)`);
+  }
+  console.log(`[SemDB]   metrics CSV -> ${csvPath}`);
 }
 
 main().catch((err) => {
