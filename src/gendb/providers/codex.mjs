@@ -37,6 +37,7 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
   let tokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
   let costUsd = 0;
   let agentError = null;
+  let numTurns = 0;
 
   let timer;
   const abortController = new AbortController();
@@ -83,6 +84,9 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
       }
 
       // Capture usage from turn.completed events (includes cached_input_tokens)
+      if (event.type === "turn.completed") {
+        numTurns++;
+      }
       if (event.type === "turn.completed" && event.usage) {
         tokens = {
           input: (tokens.input || 0) + (event.usage.input_tokens || 0),
@@ -119,11 +123,11 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
 
   if (agentError) {
     console.error(`\n[Orchestrator] Agent "${name}" failed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)}): ${agentError}`);
-    return { result: resultText, durationMs, tokens, costUsd, error: agentError, skillsUsed: {} };
+    return { result: resultText, durationMs, tokens, costUsd, numTurns, error: agentError, skillsUsed: {} };
   }
 
   console.log(`\n[Orchestrator] Agent "${name}" completed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)})`);
-  return { result: resultText, durationMs, tokens, costUsd, skillsUsed: {} };
+  return { result: resultText, durationMs, tokens, costUsd, numTurns, skillsUsed: {} };
 }
 
 /**

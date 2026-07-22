@@ -46,6 +46,7 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
   let tokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
   let costUsd = 0;
   let agentError = null;
+  let numTurns = 0;
   const skillsUsed = {};
 
   try {
@@ -85,6 +86,7 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
 
       if (message.type === "result") {
         costUsd = message.total_cost_usd || 0;
+        numTurns = message.num_turns || numTurns;
         if (message.usage) {
           tokens = {
             input: message.usage.input_tokens || 0,
@@ -117,9 +119,9 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
 
   if (agentError) {
     console.error(`\n[Orchestrator] Agent "${name}" failed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)}): ${agentError}`);
-    return { result: resultText, durationMs, tokens, costUsd, error: agentError, skillsUsed };
+    return { result: resultText, durationMs, tokens, costUsd, numTurns, error: agentError, skillsUsed };
   }
 
   console.log(`\n[Orchestrator] Agent "${name}" completed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)})`);
-  return { result: resultText, durationMs, tokens, costUsd, skillsUsed };
+  return { result: resultText, durationMs, tokens, costUsd, numTurns, skillsUsed };
 }

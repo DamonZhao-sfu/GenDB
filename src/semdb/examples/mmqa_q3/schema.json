@@ -1,0 +1,71 @@
+{
+  "query_id": "q3_genre_family",
+  "decomposable": true,
+  "rationale": "Every q3 filter and the q4 aggregation depend on the same nameable slot in the movie description: its set of genres. Extract a single multi-valued `genres` set once per movie, then each AI.IF(\"is a <G> movie\") compiles to exact set-membership (G IN genres) and q4 compiles to UNNEST(genres) + GROUP BY. One extraction amortizes over all 8 queries.",
+  "extract_side": { "table": "movies", "column": "description", "modality": "text", "key_column": "title" },
+  "attributes": [
+    {
+      "name": "genres",
+      "type": "set<string>",
+      "description": "The set of applicable film genres implied by the title and description, drawn from a fixed controlled vocabulary.",
+      "extract_instruction": "Read the title and description and output the set of ALL genres that apply, choosing only from this controlled vocabulary: comedy, sci-fi, horror, thriller, drama, action, romance. Include every genre the plot clearly supports (a film may have several, e.g. a scary supernatural film that is also tense = {horror, thriller}). Do NOT invent genres outside the vocabulary. Emit canonical spellings exactly as listed. If none of the seven apply, output the empty set [].",
+      "vocabulary": ["comedy", "sci-fi", "horror", "thriller", "drama", "action", "romance"],
+      "allow_none": true,
+      "low_conf_fallback": []
+    },
+    {
+      "name": "genre_conf",
+      "type": "map<string,float>",
+      "description": "Per-genre confidence in [0,1], backing the residual fallthrough decision.",
+      "extract_instruction": "For each genre placed in `genres`, emit a confidence score in [0,1] reflecting how strongly the description supports it.",
+      "allow_none": true
+    }
+  ],
+  "join_key": {
+    "left": "predicate_genre_literal",
+    "right": "movies.genres",
+    "op": "set_membership_after_normalize"
+  },
+  "predicate_rewrite": {
+    "q3a_comedy": "'comedy' IN genres",
+    "q3b_sci-fi": "'sci-fi' IN genres",
+    "q3c_horror": "'horror' IN genres",
+    "q3d_thriller": "'thriller' IN genres",
+    "q3e_drama": "'drama' IN genres",
+    "q3f_action": "'action' IN genres",
+    "q3g_romance": "'romance' IN genres",
+    "q4_aggregate": "SELECT genre, COUNT(*) FROM movies t, UNNEST(t.genres) AS genre GROUP BY genre",
+    "note": "AI.IF(t.title || ' is a <G> movie ...') becomes the constant-time test <G> IN t.genres; the AI.GENERATE genres-array in q4 IS this same extracted set, so no second extraction is needed."
+  },
+  "normalization": {
+    "rules": ["lowercase", "trim", "map every surface spelling to a canonical vocabulary term before set insertion", "drop any term not in the vocabulary"],
+    "synonym_map": {
+      "science fiction": "sci-fi",
+      "scifi": "sci-fi",
+      "sci fi": "sci-fi",
+      "sf": "sci-fi",
+      "romantic": "romance",
+      "rom-com": "comedy",
+      "romcom": "comedy",
+      "comedic": "comedy",
+      "comedies": "comedy",
+      "horror/supernatural": "horror",
+      "supernatural horror": "horror",
+      "scary": "horror",
+      "suspense": "thriller",
+      "psychological thriller": "thriller",
+      "action/adventure": "action",
+      "adventure": "action",
+      "dramatic": "drama",
+      "biopic": "drama",
+      "biographical": "drama"
+    },
+    "note": "The controlled vocabulary plus this canonicalization map is the hidden difficulty: without it the model's free-form genre wording (e.g. 'science fiction', 'romantic') would never set-match the query literals ('sci-fi', 'romance'). Built once at compile time so every downstream filter is exact rather than fuzzy."
+  },
+  "residual": {
+    "condition": "genres == [] OR max(genre_conf) < theta OR (for a given query G: G absent from genres AND second-best genre_conf for G-adjacent evidence >= theta)",
+    "theta": 0.5,
+    "action": "For a movie whose extraction is empty or low-confidence, fall through to the original AI.IF(title, description) for only the specific genre G being queried, rather than trusting set-membership."
+  },
+  "reused_by": ["q3a", "q3b", "q3c", "q3d", "q3e", "q3f", "q3g", "q4"]
+}
