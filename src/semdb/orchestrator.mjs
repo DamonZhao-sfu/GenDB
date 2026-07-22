@@ -172,6 +172,7 @@ async function main() {
       duration_ms: r.durationMs || 0,
       tokens: r.tokens || {},
       cost_usd: r.costUsd || 0,
+      llm_calls: r.numTurns || 1,   // internal turns this agent made (min 1)
     });
     return r;
   };
@@ -259,6 +260,17 @@ async function main() {
       s + (p.tokens.input || 0) + (p.tokens.output || 0), 0);
     const codeExecMs = 1000 * ((codeExec.extraction_sec || 0) + (codeExec.compiled_query_sec || 0));
 
+    // Total LLM calls for this query = agent-stage turns + extraction calls + residual calls.
+    const agentCalls = telemetry.phases.reduce((s, p) => s + (p.llm_calls || 0), 0);
+    const extractionCalls = extMeta?.llm_calls || 0;
+    const residualCalls = cqMeta?.residual_calls || 0;
+    const llmCalls = {
+      agent_stage: agentCalls,
+      extraction: extractionCalls,      // one small-model call per corpus item
+      residual: residualCalls,          // compiled query's live VLM/LLM calls
+      total: agentCalls + extractionCalls + residualCalls,
+    };
+
     const report = {
       query: args.query, provider: args.agentProvider,
       wall_clock_ms: Date.now() - wallStart,
@@ -267,6 +279,7 @@ async function main() {
       code_execution: codeExec,
       total_estimated_cost_usd: Number(costUsd.toFixed(4)),
       total_agent_tokens: totalTok,
+      llm_calls: llmCalls,
       phases: telemetry.phases,
     };
     await writeFile(resolve(runDir, "telemetry.json"), JSON.stringify(report, null, 2));
@@ -274,18 +287,36 @@ async function main() {
     console.log(`\n[SemDB] === Telemetry ===`);
     for (const p of telemetry.phases) {
       console.log(`[SemDB]   ${p.phase.padEnd(16)} ${(p.duration_ms / 1000).toFixed(1)}s  `
-        + `${((p.tokens.input || 0) + (p.tokens.output || 0))} tok  $${p.cost_usd.toFixed(4)}  (${p.model})`);
+        + `${p.llm_calls} calls  ${((p.tokens.input || 0) + (p.tokens.output || 0))} tok  $${p.cost_usd.toFixed(4)}  (${p.model})`);
     }
-    console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${totalTok} tok  $${costUsd.toFixed(4)}`);
+    console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  ${totalTok} tok  $${costUsd.toFixed(4)}`);
     console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
+    console.log(`[SemDB]   LLM CALLS          total=${llmCalls.total}  (agents ${agentCalls} + extraction ${extractionCalls} + residual ${residualCalls})`);
     console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
     console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);
   }
 
+  // Guess the corpus columns so the printed extract command is runnable as-is.
+  let cols = [];
+  try {
+    cols = (await readFile(unstructured.path, "utf-8")).split(/\r?\n/, 1)[0].split(",").map(c => c.trim());
+  } catch { /* corpus path may not be readable here */ }
+  const idCol = cols[0] || (isImage ? "uri" : "id");
+  const textCol = cols.find(c => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text";
+  const imageCol = cols.find(c => /image|uri|path|file/i.test(c)) || idCol;
+  const smallModel = isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel;
+
   console.log(`\n[SemDB] Done. Artifacts in ${runDir}`);
-  console.log(`[SemDB] Extract with:  python3 src/semdb/extract.py --schema ${schemaPath} \\`);
-  console.log(`[SemDB]                  --table ${unstructured.path} --modality ${isImage ? "image" : "text"} \\`);
-  console.log(`[SemDB]                  ${isImage ? `--image-dir ${args.imageDir} ` : ""}--out ${attrsPath}`);
+  console.log(`[SemDB] Extract (${isImage ? "image" : "text"}) with:`);
+  console.log(`  python3 src/semdb/extract.py --schema ${schemaPath} \\`);
+  console.log(`    --table ${unstructured.path} --modality ${isImage ? "image" : "text"} \\`);
+  if (isImage) {
+    console.log(`    --id-col ${idCol} --image-col ${imageCol} --image-dir ${args.imageDir} \\`);
+  } else {
+    console.log(`    --id-col ${idCol} --text-col ${textCol} \\`);
+  }
+  console.log(`    --model ${smallModel} --out ${attrsPath}`);
+  console.log(`  # faster + guaranteed-valid JSON: add  --endpoint http://localhost:8000/v1  (vLLM guided decoding)`);
   console.log(`[SemDB] Then run:      python3 ${codePath}`);
 }
 

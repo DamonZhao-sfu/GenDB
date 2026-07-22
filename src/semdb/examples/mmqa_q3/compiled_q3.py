@@ -70,6 +70,8 @@ def q4_group_by_genre(attrs):
 
 
 def main():
+    import time, json, os
+    t0 = time.time()
     path = sys.argv[1] if len(sys.argv) > 1 else "movie_attrs.json"
     attrs = load_attrs(path)
 
@@ -86,6 +88,11 @@ def main():
         print(f"    {genre:<9} -> {', '.join(titles)}")
 
     print(f"\n# model calls this run: 0 (all answers served from the extracted schema)")
+
+    # Sidecar for orchestrator telemetry (code-execution time + residual calls).
+    meta = {"elapsed_sec": round(time.time() - t0, 4), "rows": len(attrs), "residual_calls": 0}
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "compiled_q3.meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 if __name__ == "__main__":

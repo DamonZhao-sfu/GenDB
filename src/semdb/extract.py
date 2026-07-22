@@ -392,7 +392,7 @@ def main():
         else schema.get("attributes", [{}])[0].get("name")
     theta = schema.get("residual", {}).get("theta", 0.5)
     attrs = []
-    n_parse_fail = n_none = n_lowconf = 0
+    n_parse_fail = n_none = n_lowconf = n_calls = 0
     for i, r in enumerate(rows):
         if args.modality == "text":
             col = args.text_col or "text"
@@ -400,6 +400,7 @@ def main():
                 raw = gen_endpoint(args, json_schema, prompt, "text", text=r.get(col, ""))
             else:
                 raw = gen_text(backend, prompt + "\n\nINPUT:\n" + r.get(col, ""), args.max_new_tokens)
+            n_calls += 1                     # one small-LLM call per text row
         else:
             uri = r[args.image_col or args.id_col]
             path = resolve_image_path(uri, args.image_dir)
@@ -416,6 +417,7 @@ def main():
                 raw = gen_endpoint(args, json_schema, prompt, "image", image_path=path)
             else:
                 raw = gen_image(backend, path, prompt, args.max_new_tokens)
+            n_calls += 1                     # one small-VLM call per image
 
         rec, ok = parse(raw)
         rec[args.id_col] = r[args.id_col]
@@ -441,6 +443,7 @@ def main():
         "model": args.model, "endpoint": args.endpoint, "modality": args.modality,
         "rows": len(attrs), "extracted": n_ok, "none": n_none,
         "low_conf": n_lowconf, "parse_fail": n_parse_fail,
+        "llm_calls": n_calls,            # actual small-model calls (excludes missing images)
         "elapsed_sec": round(elapsed, 2),
         "sec_per_row": round(elapsed / max(1, len(attrs)), 3),
     }
