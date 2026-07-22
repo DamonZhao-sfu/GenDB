@@ -1,0 +1,47 @@
+{
+  "query_id": "q7",
+  "decomposable": true,
+  "rationale": "Asymmetric semantic join: the image side has a nameable slot (logo_brand); the airline side is already structured. Extract one side, then hash-join.",
+  "extract_side": { "table": "images", "column": "uri", "modality": "image" },
+  "attributes": [
+    {
+      "name": "logo_brand",
+      "type": "string",
+      "description": "Brand/company whose logo the image shows",
+      "extract_instruction": "Identify the brand or company whose logo appears in the image; if none, output 'none'.",
+      "allow_none": true,
+      "low_conf_fallback": "none"
+    },
+    {
+      "name": "ocr_text",
+      "type": "string",
+      "description": "Any text visible in the logo (backstop for fuzzy matching)",
+      "extract_instruction": "Transcribe any text visible in the logo.",
+      "allow_none": true
+    }
+  ],
+  "join_key": {
+    "left": "tampa_international_airport.Airlines",
+    "right": "images.logo_brand",
+    "op": "equality_after_normalize"
+  },
+  "predicate_rewrite": "hash_join(normalize(Airlines), normalize(logo_brand))",
+  "normalization": {
+    "rules": ["lowercase", "strip punctuation", "strip suffix {air lines, airlines, airways, airline, air}"],
+    "synonym_map": {
+      "swa": "southwest",
+      "southwest airlines": "southwest",
+      "delta air lines": "delta",
+      "spirit airlines": "spirit",
+      "silver airways": "silver",
+      "british airways": "british"
+    },
+    "note": "Alias/abbreviation reconciliation is the hidden difficulty; built once at compile time."
+  },
+  "residual": {
+    "condition": "logo_brand == 'none' OR conf < theta",
+    "theta": 0.5,
+    "action": "run original AI.IF(airline, image) only for unsure images against candidate airlines"
+  },
+  "reused_by": ["q2a", "q2b", "q7"]
+}

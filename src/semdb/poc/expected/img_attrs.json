@@ -1,0 +1,62 @@
+[
+  {
+    "uri": "img/001.jpg",
+    "logo_brand": "Southwest",
+    "conf": 0.92,
+    "ocr_text": "Southwest"
+  },
+  {
+    "uri": "img/002.jpg",
+    "logo_brand": "Delta",
+    "conf": 0.92,
+    "ocr_text": "Delta"
+  },
+  {
+    "uri": "img/003.jpg",
+    "logo_brand": "Lufthansa",
+    "conf": 0.92,
+    "ocr_text": "Lufthansa"
+  },
+  {
+    "uri": "img/004.jpg",
+    "logo_brand": "Spirit",
+    "conf": 0.92,
+    "ocr_text": "Spirit"
+  },
+  {
+    "uri": "img/005.jpg",
+    "logo_brand": "British",
+    "conf": 0.92,
+    "ocr_text": "British"
+  },
+  {
+    "uri": "img/006.jpg",
+    "logo_brand": "Coca-Cola",
+    "conf": 0.92,
+    "ocr_text": "Coca-Cola"
+  },
+  {
+    "uri": "img/007.jpg",
+    "logo_brand": "none",
+    "conf": 0.97,
+    "ocr_text": ""
+  },
+  {
+    "uri": "img/008.jpg",
+    "logo_brand": "none",
+    "conf": 0.3,
+    "ocr_text": ""
+  },
+  {
+    "uri": "img/009.jpg",
+    "logo_brand": "Frontier",
+    "conf": 0.92,
+    "ocr_text": "Frontier"
+  },
+  {
+    "uri": "img/010.jpg",
+    "logo_brand": "Delta",
+    "conf": 0.92,
+    "ocr_text": "Delta"
+  }
+]
