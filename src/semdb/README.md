@@ -56,7 +56,18 @@ Dry-run the live agent pipeline (renders the three prompts, no credentials):
 node src/semdb/orchestrator.mjs --query q7 --dry-run
 ```
 
+## Use it on your own SemBench data
+Point it at your query folder + data folder and a query id — see
+[`USAGE.md`](USAGE.md):
+
+```bash
+node src/semdb/orchestrator.mjs --query q3a \
+  --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
+  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200
+```
+
 ## Docs
+- [`USAGE.md`](USAGE.md) — how to run it on your SemBench paths (both autonomous and step-by-step).
 - [`docs/PLAN.md`](docs/PLAN.md) — implementation roadmap (PoC → real VLM → full SemBench → optimizer).
 - [`docs/SEMBENCH_ANALYSIS.md`](docs/SEMBENCH_ANALYSIS.md) — which SemBench queries compile, and why.
 - [`docs/Q2A_COMPILED_EXAMPLE.md`](docs/Q2A_COMPILED_EXAMPLE.md) — the airline-logo join, phase by phase.
