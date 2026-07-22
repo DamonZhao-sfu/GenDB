@@ -106,31 +106,54 @@ def parse_simple(text, schema):
     return rec, True   # simple mode always "parses"; genuine none is signalled by the value
 
 
+def _find_json(text):
+    """Return the LAST parseable JSON object in the text, or None.
+
+    Models often echo the prompt (which contains the schema TEMPLATE, e.g.
+    {"is_logo": <boolean>, ...}) before the real answer. A greedy {.*} match would
+    fuse the two. We scan for balanced {...} objects and prefer the last one that
+    actually parses — the template has placeholders like <boolean> and won't."""
+    blobs, depth, start = [], 0, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blobs.append(text[start:i + 1])
+                start = None
+    for blob in reversed(blobs):
+        try:
+            o = json.loads(blob)
+            if isinstance(o, dict):
+                return o
+        except json.JSONDecodeError:
+            pass
+        try:
+            o = ast.literal_eval(blob)          # tolerate single-quoted dicts
+            if isinstance(o, dict):
+                return o
+        except (ValueError, SyntaxError):
+            pass
+    return None
+
+
 def parse_json_object(text, schema):
     """Returns (record, ok). ok=False means no valid JSON was found in the model
     output — i.e. the 'none' is a PARSE FAILURE, not a genuine empty extraction."""
-    m = re.search(r"\{.*\}", text, re.DOTALL)
     default = {a["name"]: ([] if "array" in a.get("type", "") or a.get("multi")
                            else "none") for a in schema.get("attributes", [])}
     default["conf"] = 0.0
-    if not m:
-        return dict(default), False
-    obj = None
-    try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        try:
-            cand = ast.literal_eval(m.group(0))   # tolerate single-quoted dicts
-            if isinstance(cand, dict):
-                obj = cand
-        except (ValueError, SyntaxError):
-            obj = None
+    obj = _find_json(text)
     if not isinstance(obj, dict):
         return dict(default), False
     out = {}
     for a in schema.get("attributes", []):
-        out[a["name"]] = obj.get(a["name"], default[a["name"]])
-    out["conf"] = float(obj.get("conf", 0.0))
+        v = obj.get(a["name"], default[a["name"]])
+        out[a["name"]] = "none" if v is None else v   # JSON null → 'none' sentinel
+    out["conf"] = float(obj.get("conf") or obj.get("logo_conf") or 0.0)
     return out, True
 
 
@@ -206,9 +229,11 @@ def gen_image(backend, image_path, prompt, max_new_tokens):
     messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
     chat = proc.apply_chat_template(messages, add_generation_prompt=True)
     inputs = proc(text=chat, images=[image], return_tensors="pt").to(mdl.device)
+    input_len = inputs["input_ids"].shape[1]
     with torch.no_grad():
         out = mdl.generate(**inputs, max_new_tokens=max_new_tokens, **_GEN)
-    return proc.batch_decode(out, skip_special_tokens=True)[0].split("Assistant:")[-1]
+    # Slice off the echoed prompt — decode only the newly generated tokens.
+    return proc.batch_decode(out[:, input_len:], skip_special_tokens=True)[0]
 
 
 def resolve_image_path(uri, image_dir):
@@ -217,6 +242,80 @@ def resolve_image_path(uri, image_dir):
         if os.path.exists(cand):
             return cand
     return uri  # assume the column already holds a local path
+
+
+# ---------------------------------------------------------------------------
+# vLLM / OpenAI-compatible endpoint backend, with GUIDED JSON decoding.
+#
+# This is the recommended production path: the server constrains generation to a
+# JSON Schema, so the output is ALWAYS schema-valid (no parse failures at all),
+# and requests are batched/fast. Serve the small VLM with, e.g.:
+#   vllm serve Qwen/Qwen3-VL-2B-Instruct --port 8000
+# then pass  --endpoint http://localhost:8000/v1  to this script.
+# ---------------------------------------------------------------------------
+
+def build_json_schema(schema):
+    """Turn schema.json attributes into a JSON Schema for guided decoding."""
+    props, required = {}, []
+    for a in schema.get("attributes", []):
+        t = a.get("type", "string").lower()
+        if a.get("vocabulary"):
+            js = {"type": "string", "enum": list(a["vocabulary"])}
+        elif "bool" in t:
+            js = {"type": "boolean"}
+        elif any(k in t for k in ("float", "double", "number", "real", "int")):
+            js = {"type": "number"}
+        elif "array" in t or "list" in t:
+            js = {"type": "array", "items": {"type": "string"}}
+        else:
+            js = {"type": "string"}
+        if a.get("allow_none") and js.get("type") in ("string", "number", "boolean"):
+            js = {"type": [js["type"], "null"], **({"enum": js["enum"]} if "enum" in js else {})}
+        props[a["name"]] = js
+        required.append(a["name"])
+    props["conf"] = {"type": "number"}
+    required.append("conf")
+    return {"type": "object", "properties": props, "required": required,
+            "additionalProperties": False}
+
+
+def _data_url(path):
+    import base64
+    ext = (os.path.splitext(path)[1].lstrip(".") or "png").lower()
+    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:image/{mime};base64,{b64}"
+
+
+def gen_endpoint(args, json_schema, prompt, modality, image_path=None, text=None):
+    """POST one chat completion to an OpenAI-compatible server with guided_json.
+    Returns the assistant message content (guaranteed schema-valid JSON)."""
+    import urllib.request
+    content = [{"type": "text", "text": prompt}]
+    if modality == "image":
+        content.append({"type": "image_url", "image_url": {"url": _data_url(image_path)}})
+    else:
+        content[0]["text"] = prompt + "\n\nINPUT:\n" + (text or "")
+    body = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": args.max_new_tokens,
+        "temperature": 0,
+        # vLLM guided decoding — also mirror as response_format for other servers.
+        "guided_json": json_schema,
+        "response_format": {"type": "json_schema",
+                            "json_schema": {"name": "extract", "schema": json_schema}},
+    }
+    req = urllib.request.Request(
+        args.endpoint.rstrip("/") + "/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {args.api_key}"},
+    )
+    with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+        out = json.loads(resp.read())
+    return out["choices"][0]["message"]["content"]
 
 
 def main():
@@ -238,21 +337,35 @@ def main():
                     help="'json' = strict multi-field JSON (capable models, e.g. Qwen3-VL-2B); "
                          "'simple' = ask only for the entity name + lenient parse (small models "
                          "like SmolVLM-256M that ramble/emit prose)")
+    ap.add_argument("--endpoint",
+                    help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1). When set, "
+                         "calls a vLLM server with GUIDED JSON decoding instead of loading a "
+                         "local model — output is always schema-valid, no parse failures.")
+    ap.add_argument("--api-key", default="EMPTY", help="bearer token for --endpoint (vLLM: EMPTY)")
+    ap.add_argument("--timeout", type=int, default=120, help="--endpoint request timeout (s)")
     args = ap.parse_args()
 
     schema = json.load(open(args.schema))
-    prompt = build_prompt(schema, args.prompt_style)
-    parse = (lambda raw: parse_simple(raw, schema)) if args.prompt_style == "simple" \
+    use_endpoint = bool(args.endpoint)
+    # Guided decoding enforces the schema, so always use the json prompt + parser there.
+    style = "json" if use_endpoint else args.prompt_style
+    prompt = build_prompt(schema, style)
+    json_schema = build_json_schema(schema) if use_endpoint else None
+    parse = (lambda raw: parse_simple(raw, schema)) if style == "simple" \
         else (lambda raw: parse_json_object(raw, schema))
     rows = list(csv.DictReader(open(args.table)))
     if args.limit:
         rows = rows[: args.limit]
 
-    backend = (load_text_model(args.model) if args.modality == "text"
-               else load_image_model(args.model))
+    backend = None
+    if not use_endpoint:
+        backend = (load_text_model(args.model) if args.modality == "text"
+                   else load_image_model(args.model))
+    else:
+        print(f"[extract] using guided-JSON endpoint {args.endpoint} (model {args.model})")
 
     # In simple mode the reporting/join key is the entity attribute, not attr[0].
-    primary = entity_attr(schema) if args.prompt_style == "simple" \
+    primary = entity_attr(schema) if style == "simple" \
         else schema.get("attributes", [{}])[0].get("name")
     theta = schema.get("residual", {}).get("theta", 0.5)
     attrs = []
@@ -260,7 +373,10 @@ def main():
     for i, r in enumerate(rows):
         if args.modality == "text":
             col = args.text_col or "text"
-            raw = gen_text(backend, prompt + "\n\nINPUT:\n" + r.get(col, ""), args.max_new_tokens)
+            if use_endpoint:
+                raw = gen_endpoint(args, json_schema, prompt, "text", text=r.get(col, ""))
+            else:
+                raw = gen_text(backend, prompt + "\n\nINPUT:\n" + r.get(col, ""), args.max_new_tokens)
         else:
             uri = r[args.image_col or args.id_col]
             path = resolve_image_path(uri, args.image_dir)
@@ -273,7 +389,10 @@ def main():
                 rec[args.id_col] = r[args.id_col]
                 attrs.append(rec); n_none += 1
                 continue
-            raw = gen_image(backend, path, prompt, args.max_new_tokens)
+            if use_endpoint:
+                raw = gen_endpoint(args, json_schema, prompt, "image", image_path=path)
+            else:
+                raw = gen_image(backend, path, prompt, args.max_new_tokens)
 
         rec, ok = parse(raw)
         rec[args.id_col] = r[args.id_col]

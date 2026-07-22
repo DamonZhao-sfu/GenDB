@@ -102,6 +102,30 @@ python3 src/semdb/extract.py \
 `--image-dir` lets the driver resolve `uri` → `images/<basename>`; if the column
 already holds a local path, omit it. Use `--limit N` to smoke-test on a few rows.
 
+**Recommended: serve the model with vLLM + guided JSON decoding.** This constrains
+generation to the schema, so output is *always* valid JSON (zero parse failures)
+and requests are batched/fast:
+
+```bash
+# 1) serve the small VLM (separate terminal)
+vllm serve Qwen/Qwen3-VL-2B-Instruct --port 8000
+
+# 2) point the extractor at it — same flags, plus --endpoint
+python3 src/semdb/extract.py \
+  --schema    src/semdb/runs/mmqa-q2a/schema.json \
+  --table     .../sf_200/thalamusdb_images.csv \
+  --modality  image --id-col image_filepath --image-col image_filepath \
+  --image-dir .../sf_200/images \
+  --model     Qwen/Qwen3-VL-2B-Instruct \
+  --endpoint  http://localhost:8000/v1 \
+  --out       img_attrs.json
+```
+
+`--endpoint` builds a JSON Schema from `schema.json` and sends it as `guided_json`
+(also `response_format: json_schema`), so the server can't emit malformed output.
+`--api-key` defaults to `EMPTY` (vLLM). Local (no-endpoint) runs still work; for a
+weak local model without guided decoding, add `--prompt-style simple`.
+
 ### C. Run the compiled query on your real data
 
 The Code Generator writes `compiled_<q>.py` referencing the attribute table.
