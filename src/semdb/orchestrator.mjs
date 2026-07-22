@@ -175,6 +175,81 @@ function tablesInSql(sql, dataDir) {
   });
 }
 
+/** alias → table map from FROM/JOIN clauses (mmqa.table alias / mmqa.table AS alias). */
+function aliasMap(sql) {
+  const m = {};
+  for (const x of sql.matchAll(/mmqa\.(\w+)\s+(?:AS\s+)?(\w+)/gi)) m[x[2]] = x[1];
+  return m;
+}
+
+/** The argument text of the AI.IF / AI.GENERATE call (up to connection_id). */
+function semanticArgs(sql) {
+  const i = sql.search(/AI\.(IF|GENERATE)\s*\(/i);
+  if (i < 0) return "";
+  const j = sql.toLowerCase().indexOf("connection_id", i);
+  return sql.slice(i, j < 0 ? Math.min(i + 500, sql.length) : j);
+}
+
+/** Tables whose alias is referenced inside the semantic predicate. */
+function tablesInPredicate(sql) {
+  const amap = aliasMap(sql);
+  const arg = semanticArgs(sql);
+  const used = Object.keys(amap)
+    .filter((al) => new RegExp(`\\b${al}\\.`).test(arg))
+    .map((al) => amap[al]);
+  return [...new Set(used)];
+}
+
+/** First header line of a CSV, or "" if unreadable. */
+async function headerOf(path) {
+  try { return (await readFile(path, "utf-8")).split(/\r?\n/, 1)[0]; } catch { return ""; }
+}
+
+/**
+ * Naive (original) semantic-call count, by operator:
+ *   sem_join   (predicate spans ≥2 tables): |left| × |right|
+ *   sem_filter / sem_map (one table):       |table|
+ * Row counts read from the CSVs.
+ */
+async function computeNaive(sql, dataDir) {
+  let tabs = tablesInPredicate(sql);
+  if (tabs.length === 0) tabs = [...new Set(Object.values(aliasMap(sql)))];
+  const counts = {};
+  for (const t of tabs) counts[t] = dataDir ? await countRows(resolve(dataDir, `${t}.csv`)) : null;
+  if (tabs.length >= 2 && Object.values(counts).every((c) => c != null)) {
+    const naive = Object.values(counts).reduce((a, b) => a * b, 1);
+    return { type: "join", naive, tables: tabs, counts };
+  }
+  const t0 = tabs[0];
+  return { type: tabs.length >= 2 ? "join" : "filter", naive: counts[t0] ?? null, tables: tabs, counts };
+}
+
+/**
+ * Choose the "corpus" table to extract from: the image table if any, else the
+ * predicate-referenced table that has a text-like column (text/description/...).
+ */
+async function chooseCorpus(sql, tables, dataDir) {
+  const img = tables.find((t) => t.isImages);
+  if (img) return img;
+  const used = tablesInPredicate(sql);
+  const TEXT = /(^|,)\s*(text|description|overview|body|content|synopsis|plot)\s*(,|$)/i;
+  for (const t of used) {
+    const path = dataDir ? resolve(dataDir, `${t}.csv`) : `${t}.csv`;
+    if (TEXT.test(await headerOf(path))) return { table: t, path, isImages: false };
+  }
+  // fallback: any table with a text column, else the last table.
+  for (const t of tables) if (TEXT.test(await headerOf(t.path))) return t;
+  return tables[tables.length - 1] || { table: "corpus", path: "" };
+}
+
+/** List query ids (<name>.sql → <name>) in a query dir, sorted. */
+async function listQueries(dir) {
+  if (!dir) return [];
+  const files = await readdir(dir);
+  return files.filter((f) => f.toLowerCase().endsWith(".sql"))
+    .map((f) => f.replace(/\.sql$/i, "")).sort();
+}
+
 async function runPhase(agentConfig, vars, runDir, args) {
   const systemPrompt = await readFile(agentConfig.promptPath, "utf-8");
   const template = await readFile(agentConfig.userPromptPath, "utf-8");
@@ -201,9 +276,7 @@ async function runPhase(agentConfig, vars, runDir, args) {
   return result;
 }
 
-async function main() {
-  const args = parseArgs(process.argv);
-  setAgentProvider(args.agentProvider);
+async function runOneQuery(args) {
   const wallStart = Date.now();
 
   const runDir = resolve(args.out, `${args.benchmark}-${args.query || "example"}`);
@@ -229,7 +302,7 @@ async function main() {
   const tableHeaders = await readTableHeaders(args.dataDir);
   const tables = tablesInSql(sql, args.dataDir);
   const imageTable = tables.find((t) => t.isImages);
-  const unstructured = imageTable || tables[tables.length - 1] || { table: "corpus", path: "" };
+  const unstructured = await chooseCorpus(sql, tables, args.dataDir);
 
   const schemaPath = resolve(runDir, "schema.json");
   const attrsPath = resolve(runDir, `${unstructured.table}_attrs.json`);
@@ -323,7 +396,7 @@ async function main() {
     // 2) Compiled query: python3 compiled_<q>.py <structured.csv> <attrs.json> <out.csv> [--endpoint ...]
     if (existsSync(codePath) && existsSync(attrsPath)) {
       const cqArgs = [codePath, structured.path, attrsPath, resultsCsv,
-        ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : [])];
+        ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
       console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
       const cq = spawnSync("python3", cqArgs, { stdio: "inherit" });
       if (cq.status !== 0) console.warn(`[SemDB] compiled query exited ${cq.status} — check its CLI signature.`);
@@ -360,13 +433,10 @@ async function main() {
       total: agentCalls + extractionCalls + residualCalls,
     };
 
-    // Original (naive) plan = one semantic model call per candidate:
-    //   join  (structured × corpus): M × N        (e.g. q2a: racetracks × images)
-    //   filter/map (single corpus):  N            (one AI.IF/AI.GENERATE per row)
-    const structuredForCount = tables.find((t) => !t.isImages && t.path !== unstructured.path);
+    // Original (naive) plan by operator (sem_join = left×right, sem_filter/map = N).
+    const plan = await computeNaive(sql, args.dataDir);
     const N = await countRows(unstructured.path);
-    const M = structuredForCount ? await countRows(structuredForCount.path) : null;
-    const naiveCalls = (imageTable && M != null && N != null) ? M * N : N;
+    const naiveCalls = plan.naive;
     // Compiled EXECUTION model calls (excludes one-time compile-stage agents):
     // the shared per-item extraction (N) + the residual live calls (k).
     const execExtraction = extractionCalls || (N != null ? N : 0);
@@ -388,7 +458,7 @@ async function main() {
       naive_llm_calls: naiveCalls ?? null,          // original M×N (join) or N (filter)
       compiled_execution_calls: compiledExecCalls,  // extraction (shared) + residual
       call_reduction: reduction,                    // naive / compiled-execution
-      corpus_rows: N, structured_rows: M,
+      operator: plan.type, corpus_rows: N, table_rows: plan.counts,
       ground_truth: gt ? { file: gt.file, count: gt.count } : null,
       phases: telemetry.phases,
     };
@@ -402,7 +472,10 @@ async function main() {
     console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  ${totalTok} tok  $${costUsd.toFixed(4)}`);
     console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
     console.log(`[SemDB]   LLM CALLS          total=${llmCalls.total}  (agents ${agentCalls} + extraction ${extractionCalls} + residual ${residualCalls})`);
-    console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"}  ${imageTable && M != null ? `= ${M} × ${N}` : (N != null ? `= ${N} rows` : "")}`);
+    const naiveExpr = plan.type === "join"
+      ? `= ${plan.tables.map((t) => plan.counts[t]).join(" × ")}  (${plan.tables.join(" × ")})`
+      : (plan.naive != null ? `= ${plan.naive} rows  (${plan.tables[0] || unstructured.table})` : "");
+    console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"}  [${plan.type}] ${naiveExpr}`);
     console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls}  (extraction ${execExtraction} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
     console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
     if (gt) console.log(`[SemDB]   ground truth       ${gt.count} rows — ${gt.file}`);
@@ -444,6 +517,49 @@ async function main() {
       + `${isImage ? `--image-col ${imageCol} --image-dir ${args.imageDir}` : `--text-col ${textCol}`} \\`);
     console.log(`    --model ${extractModel} --out ${attrsPath}   # add --endpoint http://localhost:8000/v1 for vLLM`);
     console.log(`  python3 ${codePath} ${structured.path} ${attrsPath} ${resultsCsv}`);
+  }
+}
+
+async function main() {
+  const base = parseArgs(process.argv);
+  setAgentProvider(base.agentProvider);
+
+  // No --query → process every *.sql under the query dir into one shared CSV.
+  const queries = base.query ? [base.query] : await listQueries(base.queryDir);
+  if (queries.length === 0) {
+    console.error("[SemDB] no query given and no *.sql found in --query-dir.");
+    process.exit(1);
+  }
+  const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
+  console.log(`[SemDB] processing ${queries.length} quer${queries.length === 1 ? "y" : "ies"}: ${queries.join(", ")}`);
+  if (queries.length > 1) console.log(`[SemDB] metrics CSV: ${csvPath}`);
+
+  const summary = [];
+  for (const q of queries) {
+    console.log(`\n[SemDB] ==================== ${q} ====================`);
+    try {
+      await runOneQuery({ ...base, query: q });
+      const tele = await readJSON(resolve(base.out, `${base.benchmark}-${q}`, "telemetry.json"));
+      if (tele?.metrics) summary.push({ q, ...tele.metrics });
+    } catch (e) {
+      console.error(`[SemDB] [${q}] failed: ${e.message}`);
+      summary.push({ q, error: e.message });
+    }
+  }
+
+  if (queries.length > 1) {
+    console.log(`\n[SemDB] ==================== SUMMARY ====================`);
+    for (const s of summary) {
+      console.log(s.error
+        ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
+        : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`);
+    }
+    const scored = summary.filter((s) => s.f1 != null);
+    if (scored.length) {
+      const mean = (k) => (scored.reduce((a, s) => a + s[k], 0) / scored.length).toFixed(4);
+      console.log(`[SemDB]   ${"MEAN".padEnd(6)} P=${mean("precision")} R=${mean("recall")} F1=${mean("f1")}  (${scored.length} scored)`);
+    }
+    console.log(`[SemDB]   full metrics CSV -> ${csvPath}`);
   }
 }
 

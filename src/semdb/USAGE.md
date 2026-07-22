@@ -46,14 +46,37 @@ models (`defaults.extraction.*`) are independent of this choice.
 
 ---
 
-## Mode 1 — autonomous (agents do A→C for you)
+## Mode 1 — autonomous (agents + extraction + compiled query + scoring)
+
+```bash
+# one query, end-to-end with ground-truth scoring:
+node src/semdb/orchestrator.mjs \
+  --query q7 \
+  --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
+  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200 \
+  --ground-truth-dir /localhome/hza214/SemBench/files/mmqa/raw_results/ground_truth \
+  --endpoint http://localhost:8000/v1        # vLLM: extraction + residual judge
+```
+
+Passing `--ground-truth-dir` auto-runs the whole pipeline (extraction → compiled
+query → scoring) and writes **precision/recall/F1** into that run's
+`telemetry.json` and appends a row to `runs/results.csv`. `--endpoint` routes both
+the extraction and the residual `vlm_judge` calls to your vLLM server.
+
+**Omit `--query` to process every `*.sql` in the query dir** into one shared CSV,
+with a mean-F1 summary at the end:
 
 ```bash
 node src/semdb/orchestrator.mjs \
-  --query q3a \
   --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
-  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200
+  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200 \
+  --ground-truth-dir /localhome/hza214/SemBench/files/mmqa/raw_results/ground_truth \
+  --endpoint http://localhost:8000/v1
 ```
+
+Naive baseline is computed per operator: **sem_join = |left| × |right|**,
+**sem_filter / sem_map = |table|** (detected from which tables the AI predicate
+references).
 
 The orchestrator reads the real `q3a.sql` and the real table headers, then runs
 the three agents into `src/semdb/runs/mmqa-q3a/` (`schema.json`,
