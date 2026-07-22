@@ -37,6 +37,7 @@ Image (airline logos over the images table + images/ dir):
 import argparse
 import csv
 import json
+import ast
 import os
 import re
 import sys
@@ -46,8 +47,26 @@ import sys
 # Prompt built from the schema so the driver is query-agnostic.
 # ---------------------------------------------------------------------------
 
-def build_prompt(schema):
+def entity_attr(schema):
+    """The single attribute a weak model should extract in --prompt-style simple:
+    the join key (brand/entity/name), not the boolean/type/alias/conf helpers."""
     attrs = schema.get("attributes", [])
+    for a in attrs:
+        n = a["name"].lower()
+        if re.search(r"entity|brand|name", n) and not re.search(r"type|alias|conf", n):
+            return a["name"]
+    return attrs[0]["name"] if attrs else "value"
+
+
+def build_prompt(schema, style="json"):
+    attrs = schema.get("attributes", [])
+    if style == "simple":
+        ent = entity_attr(schema)
+        a = next((x for x in attrs if x["name"] == ent), {})
+        instr = a.get("extract_instruction", a.get("description", f"the {ent}"))
+        return ("Look at the image. " + instr +
+                "\nAnswer with ONLY the name (at most a few words). "
+                "If there is no logo, answer exactly: none. Do not describe the image.")
     fields, instrs = [], []
     for a in attrs:
         t = a.get("type", "string")
@@ -65,6 +84,28 @@ def build_prompt(schema):
     )
 
 
+def parse_simple(text, schema):
+    """Salvage the entity name from a weak model's prose/dict output.
+    Handles: "The logo is 'edelweiss'." / bare name / "none" / rambling → none."""
+    ent = entity_attr(schema)
+    t = (text or "").strip()
+    # Prefer a quoted phrase, but skip schema keys / literals if the model emitted a dict.
+    skip = {a["name"].lower() for a in schema.get("attributes", [])} | {"true", "false", "none"}
+    quotes = [q.strip() for q in re.findall(r"['\"]([^'\"]{1,60})['\"]", t)
+              if q.strip().lower() not in skip]
+    val = quotes[0] if quotes else (t.splitlines()[0].strip() if t else "")
+    val = re.sub(r"^(the logo is( a| an)?|this is( a| an)?|it is( a| an)?|logo:|answer:)\s*",
+                 "", val, flags=re.I).strip().strip(".").strip()
+    if not val or re.match(r"^(none|no logo|no|n/?a|unknown|not a logo)$", val, re.I) \
+            or len(val.split()) > 8:                         # long prose ⇒ no clean logo
+        val = "none"
+    rec = {a["name"]: ([] if "array" in a.get("type", "") else "none")
+           for a in schema.get("attributes", [])}
+    rec[ent] = val
+    rec["conf"] = 0.0 if val == "none" else 0.7
+    return rec, True   # simple mode always "parses"; genuine none is signalled by the value
+
+
 def parse_json_object(text, schema):
     """Returns (record, ok). ok=False means no valid JSON was found in the model
     output — i.e. the 'none' is a PARSE FAILURE, not a genuine empty extraction."""
@@ -74,9 +115,17 @@ def parse_json_object(text, schema):
     default["conf"] = 0.0
     if not m:
         return dict(default), False
+    obj = None
     try:
         obj = json.loads(m.group(0))
     except json.JSONDecodeError:
+        try:
+            cand = ast.literal_eval(m.group(0))   # tolerate single-quoted dicts
+            if isinstance(cand, dict):
+                obj = cand
+        except (ValueError, SyntaxError):
+            obj = None
+    if not isinstance(obj, dict):
         return dict(default), False
     out = {}
     for a in schema.get("attributes", []):
@@ -133,6 +182,11 @@ def _dep_exit(pkgs, e):
     sys.exit(2)
 
 
+# Anti-degeneration decoding — stops the "santa anita park" ×50 repetition
+# collapse that small models fall into with plain greedy decoding.
+_GEN = dict(do_sample=False, repetition_penalty=1.3, no_repeat_ngram_size=3)
+
+
 def gen_text(backend, prompt, max_new_tokens):
     import torch
     _, tok, mdl = backend
@@ -140,7 +194,7 @@ def gen_text(backend, prompt, max_new_tokens):
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tok(text, return_tensors="pt").to(mdl.device)
     with torch.no_grad():
-        out = mdl.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        out = mdl.generate(**inputs, max_new_tokens=max_new_tokens, **_GEN)
     return tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
@@ -153,7 +207,7 @@ def gen_image(backend, image_path, prompt, max_new_tokens):
     chat = proc.apply_chat_template(messages, add_generation_prompt=True)
     inputs = proc(text=chat, images=[image], return_tensors="pt").to(mdl.device)
     with torch.no_grad():
-        out = mdl.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        out = mdl.generate(**inputs, max_new_tokens=max_new_tokens, **_GEN)
     return proc.batch_decode(out, skip_special_tokens=True)[0].split("Assistant:")[-1]
 
 
@@ -180,10 +234,16 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="only process first N rows (0=all)")
     ap.add_argument("--debug", type=int, default=0,
                     help="print the raw model output for the first N rows (diagnose 'none')")
+    ap.add_argument("--prompt-style", choices=["json", "simple"], default="json",
+                    help="'json' = strict multi-field JSON (capable models, e.g. Qwen3-VL-2B); "
+                         "'simple' = ask only for the entity name + lenient parse (small models "
+                         "like SmolVLM-256M that ramble/emit prose)")
     args = ap.parse_args()
 
     schema = json.load(open(args.schema))
-    prompt = build_prompt(schema)
+    prompt = build_prompt(schema, args.prompt_style)
+    parse = (lambda raw: parse_simple(raw, schema)) if args.prompt_style == "simple" \
+        else (lambda raw: parse_json_object(raw, schema))
     rows = list(csv.DictReader(open(args.table)))
     if args.limit:
         rows = rows[: args.limit]
@@ -191,7 +251,9 @@ def main():
     backend = (load_text_model(args.model) if args.modality == "text"
                else load_image_model(args.model))
 
-    primary = schema.get("attributes", [{}])[0].get("name")
+    # In simple mode the reporting/join key is the entity attribute, not attr[0].
+    primary = entity_attr(schema) if args.prompt_style == "simple" \
+        else schema.get("attributes", [{}])[0].get("name")
     theta = schema.get("residual", {}).get("theta", 0.5)
     attrs = []
     n_parse_fail = n_none = n_lowconf = 0
@@ -213,7 +275,7 @@ def main():
                 continue
             raw = gen_image(backend, path, prompt, args.max_new_tokens)
 
-        rec, ok = parse_json_object(raw, schema)
+        rec, ok = parse(raw)
         rec[args.id_col] = r[args.id_col]
         if i < args.debug:
             print(f"[debug row {i}] raw output:\n{raw}\n[debug row {i}] parsed ok={ok} -> {rec}\n")
