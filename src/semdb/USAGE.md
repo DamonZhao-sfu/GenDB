@@ -137,6 +137,31 @@ Run it, then compare against SemBench's ground truth in
 
 ---
 
+### D. Score against ground truth + write the results CSV
+SemBench ground truth lives at `.../raw_results/ground_truth/<Query>.json`
+(`{"ground_truth": [[0,"117d...png"], ...]}` — the expected result rows). Pass the
+dir to the orchestrator so it records it, then score the compiled output:
+
+```bash
+python3 src/semdb/evaluate.py \
+  --pred runs/mmqa-q2a/q2a_results.csv --pred-cols 0,1 \
+  --ground-truth-dir /localhome/hza214/SemBench/files/mmqa/raw_results/ground_truth \
+  --query q2a \
+  --telemetry runs/mmqa-q2a/telemetry.json \
+  --csv runs/results.csv
+```
+
+This prints precision / recall / F1 and appends ONE row to `results.csv` with the
+full telemetry (time, cost, LLM-call breakdown) **and** the metrics. Cells are
+normalized (image path → basename, lowercased) so a full path matches a bare
+filename. `--pred-cols` selects/reorders the predicted columns to match the GT
+tuple order (`[t.ID, i.uri]` → `0,1`). Omit `--pred` for a telemetry-only row.
+Run it once per query to build a full benchmark CSV.
+
+Add `--ground-truth-dir <dir>` (and optionally `--telemetry-csv <path>`) to the
+orchestrator and it records the GT file in `telemetry.json` and prints the exact
+`evaluate.py` command to run.
+
 ## Which file backs each SemBench table
 
 | SQL identifier | CSV in `data/sf_200/` | queries |

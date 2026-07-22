@@ -53,6 +53,8 @@ function parseArgs(argv) {
     out: resolve(__dirname, "runs"),
     agentProvider: defaults.agentProvider,
     modelOverride: null,   // force one model for all agents (testing)
+    groundTruthDir: null,  // SemBench raw_results/ground_truth
+    telemetryCsv: null,    // append the telemetry+metrics row here
     dryRun: false,
   };
   for (let i = 2; i < argv.length; i++) {
@@ -66,6 +68,8 @@ function parseArgs(argv) {
     else if (a === "--query-dir" && argv[i + 1]) args.queryDir = resolve(argv[++i]);
     else if (a === "--data-dir" && argv[i + 1]) args.dataDir = resolve(argv[++i]);
     else if (a === "--image-dir" && argv[i + 1]) args.imageDir = resolve(argv[++i]);
+    else if (a === "--ground-truth-dir" && argv[i + 1]) args.groundTruthDir = resolve(argv[++i]);
+    else if (a === "--telemetry-csv" && argv[i + 1]) args.telemetryCsv = resolve(argv[++i]);
     else if (a === "--out" && argv[i + 1]) args.out = resolve(argv[++i]);
     else if (a === "--dry-run") args.dryRun = true;
   }
@@ -115,6 +119,24 @@ async function readTableHeaders(dataDir) {
   const hasImages = existsSync(resolve(dataDir, "images"));
   if (hasImages) lines.push(`- images/: (directory of image files)`);
   return lines.length ? lines.join("\n") : "(no CSV tables found in data dir)";
+}
+
+/** Resolve a SemBench ground-truth file (Q2a.json for query q2a) + its row count. */
+async function resolveGroundTruth(gtDir, query) {
+  if (!gtDir || !query) return null;
+  const n = query.replace(/^[qQ]/, "");
+  const candidates = [`${query}.json`, `Q${n}.json`, `q${n}.json`,
+    `${query.toUpperCase()}.json`, `${query[0].toUpperCase()}${query.slice(1)}.json`];
+  for (const name of candidates) {
+    const p = resolve(gtDir, name);
+    if (existsSync(p)) {
+      const gt = await readJSON(p);
+      const rows = Array.isArray(gt?.ground_truth) ? gt.ground_truth.length
+        : (Array.isArray(gt) ? gt.length : null);
+      return { file: p, count: rows, question: gt?.nl_question || null };
+    }
+  }
+  return null;
 }
 
 /** Which SemBench table(s) does this query touch? Best-effort from the SQL. */
@@ -271,6 +293,8 @@ async function main() {
       total: agentCalls + extractionCalls + residualCalls,
     };
 
+    const gt = await resolveGroundTruth(args.groundTruthDir, args.query);
+
     const report = {
       query: args.query, provider: args.agentProvider,
       wall_clock_ms: Date.now() - wallStart,
@@ -280,6 +304,7 @@ async function main() {
       total_estimated_cost_usd: Number(costUsd.toFixed(4)),
       total_agent_tokens: totalTok,
       llm_calls: llmCalls,
+      ground_truth: gt ? { file: gt.file, count: gt.count } : null,
       phases: telemetry.phases,
     };
     await writeFile(resolve(runDir, "telemetry.json"), JSON.stringify(report, null, 2));
@@ -293,7 +318,15 @@ async function main() {
     console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
     console.log(`[SemDB]   LLM CALLS          total=${llmCalls.total}  (agents ${agentCalls} + extraction ${extractionCalls} + residual ${residualCalls})`);
     console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
+    if (gt) console.log(`[SemDB]   ground truth       ${gt.count} rows — ${gt.file}`);
     console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);
+
+    // Score against ground truth + write the results CSV after you run the compiled query.
+    const csvPath = args.telemetryCsv || resolve(args.out, "results.csv");
+    console.log(`\n[SemDB] Score + append to CSV (after running the compiled query):`);
+    console.log(`  python3 src/semdb/evaluate.py --telemetry ${resolve(runDir, "telemetry.json")} \\`);
+    if (gt) console.log(`    --ground-truth ${gt.file} --pred ${resolve(runDir, `${args.query}_results.csv`)} --pred-cols 0,1 \\`);
+    console.log(`    --query ${args.query} --csv ${csvPath}`);
   }
 
   // Guess the corpus columns so the printed extract command is runnable as-is.
