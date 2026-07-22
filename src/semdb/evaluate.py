@@ -103,6 +103,7 @@ CSV_COLS = [
     "wall_clock_ms", "agent_stage_ms", "code_execution_ms",
     "total_estimated_cost_usd", "total_agent_tokens",
     "agent_calls", "extraction_calls", "residual_calls", "total_llm_calls",
+    "naive_llm_calls", "compiled_execution_calls", "call_reduction",
     "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
 ]
 
@@ -139,6 +140,9 @@ def main():
         extraction_calls=llm.get("extraction", ""),
         residual_calls=llm.get("residual", ""),
         total_llm_calls=llm.get("total", ""),
+        naive_llm_calls=tele.get("naive_llm_calls", ""),
+        compiled_execution_calls=tele.get("compiled_execution_calls", ""),
+        call_reduction=tele.get("call_reduction", ""),
     )
 
     gt_path = args.ground_truth or (

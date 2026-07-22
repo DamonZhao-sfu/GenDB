@@ -162,6 +162,34 @@ Add `--ground-truth-dir <dir>` (and optionally `--telemetry-csv <path>`) to the
 orchestrator and it records the GT file in `telemetry.json` and prints the exact
 `evaluate.py` command to run.
 
+## Setting theta (the residual confidence floor)
+
+`theta` decides which rows the compiled query re-checks with a live model call:
+a row is **residual** if its extracted join key is `none`/empty **or** its
+`conf < theta`. Higher theta → more residual calls → higher recall but more cost;
+lower theta → fewer calls, trusts the extractor more.
+
+Three places, in priority order:
+1. **`--theta` on `extract.py`** — overrides everything for that run.
+2. **`schema.json → residual.theta`** — what the Schema Designer emits; the
+   compiled query reads this. Edit it to change the compiled query's behavior.
+3. **`semdb.config.mjs → defaults.extraction.theta`** (0.5) — the fallback default.
+
+Tune it against F1: sweep `--theta 0.3 0.5 0.7`, run `evaluate.py` each time, and
+pick the knee where F1 stops improving — that's the fewest residual calls for the
+recall you want.
+
+## Original vs compiled call count
+
+`telemetry.json` now reports the naive baseline so you can see the reduction:
+- `naive_llm_calls` — the original plan: **M × N** for a join (e.g. q2a: racetracks
+  × images) or **N** for a filter/map (one `AI.IF`/`AI.GENERATE` per row).
+- `compiled_execution_calls` — `extraction (N, shared) + residual (k)`.
+- `call_reduction` — `naive / compiled_execution` (e.g. `5.9×`).
+- `llm_calls.total` still includes the one-time agent (compile) stage.
+
+These are also columns in the results CSV.
+
 ## Which file backs each SemBench table
 
 | SQL identifier | CSV in `data/sf_200/` | queries |

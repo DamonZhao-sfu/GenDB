@@ -103,6 +103,16 @@ async function loadQuery(args) {
   return { sql, nl };
 }
 
+/** Count data rows (excluding header) in a CSV. Returns null if unreadable. */
+async function countRows(path) {
+  try {
+    const lines = (await readFile(path, "utf-8")).split(/\r?\n/).filter((l) => l.trim().length);
+    return Math.max(0, lines.length - 1);
+  } catch {
+    return null;
+  }
+}
+
 /** Read the header row of every CSV table in the data dir → a schema summary. */
 async function readTableHeaders(dataDir) {
   if (!dataDir || !existsSync(dataDir)) {
@@ -293,6 +303,20 @@ async function main() {
       total: agentCalls + extractionCalls + residualCalls,
     };
 
+    // Original (naive) plan = one semantic model call per candidate:
+    //   join  (structured × corpus): M × N        (e.g. q2a: racetracks × images)
+    //   filter/map (single corpus):  N            (one AI.IF/AI.GENERATE per row)
+    const structuredForCount = tables.find((t) => !t.isImages && t.path !== unstructured.path);
+    const N = await countRows(unstructured.path);
+    const M = structuredForCount ? await countRows(structuredForCount.path) : null;
+    const naiveCalls = (imageTable && M != null && N != null) ? M * N : N;
+    // Compiled EXECUTION model calls (excludes one-time compile-stage agents):
+    // the shared per-item extraction (N) + the residual live calls (k).
+    const execExtraction = extractionCalls || (N != null ? N : 0);
+    const compiledExecCalls = execExtraction + residualCalls;
+    const reduction = (naiveCalls && compiledExecCalls)
+      ? Number((naiveCalls / compiledExecCalls).toFixed(1)) : null;
+
     const gt = await resolveGroundTruth(args.groundTruthDir, args.query);
 
     const report = {
@@ -304,6 +328,10 @@ async function main() {
       total_estimated_cost_usd: Number(costUsd.toFixed(4)),
       total_agent_tokens: totalTok,
       llm_calls: llmCalls,
+      naive_llm_calls: naiveCalls ?? null,          // original M×N (join) or N (filter)
+      compiled_execution_calls: compiledExecCalls,  // extraction (shared) + residual
+      call_reduction: reduction,                    // naive / compiled-execution
+      corpus_rows: N, structured_rows: M,
       ground_truth: gt ? { file: gt.file, count: gt.count } : null,
       phases: telemetry.phases,
     };
@@ -317,6 +345,8 @@ async function main() {
     console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  ${totalTok} tok  $${costUsd.toFixed(4)}`);
     console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
     console.log(`[SemDB]   LLM CALLS          total=${llmCalls.total}  (agents ${agentCalls} + extraction ${extractionCalls} + residual ${residualCalls})`);
+    console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"}  ${imageTable && M != null ? `= ${M} × ${N}` : (N != null ? `= ${N} rows` : "")}`);
+    console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls}  (extraction ${execExtraction} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
     console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
     if (gt) console.log(`[SemDB]   ground truth       ${gt.count} rows — ${gt.file}`);
     console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);

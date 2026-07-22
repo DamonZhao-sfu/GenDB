@@ -365,6 +365,11 @@ def main():
                          "local model — output is always schema-valid, no parse failures.")
     ap.add_argument("--api-key", default="EMPTY", help="bearer token for --endpoint (vLLM: EMPTY)")
     ap.add_argument("--timeout", type=int, default=120, help="--endpoint request timeout (s)")
+    ap.add_argument("--theta", type=float, default=None,
+                    help="residual confidence floor: rows with conf < theta (or a 'none' key) are "
+                         "flagged residual (re-checked by a live model in the compiled query). "
+                         "Overrides schema.residual.theta. Higher = more residual calls, higher "
+                         "recall; lower = cheaper, trusts the extractor more.")
     args = ap.parse_args()
 
     schema = json.load(open(args.schema))
@@ -390,7 +395,7 @@ def main():
     # In simple mode the reporting/join key is the entity attribute, not attr[0].
     primary = entity_attr(schema) if style == "simple" \
         else schema.get("attributes", [{}])[0].get("name")
-    theta = schema.get("residual", {}).get("theta", 0.5)
+    theta = args.theta if args.theta is not None else schema.get("residual", {}).get("theta", 0.5)
     attrs = []
     n_parse_fail = n_none = n_lowconf = n_calls = 0
     for i, r in enumerate(rows):
@@ -444,6 +449,7 @@ def main():
         "rows": len(attrs), "extracted": n_ok, "none": n_none,
         "low_conf": n_lowconf, "parse_fail": n_parse_fail,
         "llm_calls": n_calls,            # actual small-model calls (excludes missing images)
+        "theta": theta,                  # residual floor used to flag low_conf
         "elapsed_sec": round(elapsed, 2),
         "sec_per_row": round(elapsed / max(1, len(attrs)), 3),
     }
