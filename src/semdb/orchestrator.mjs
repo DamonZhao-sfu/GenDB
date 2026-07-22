@@ -418,6 +418,14 @@ async function main() {
       console.log(`\n[SemDB] Scoring: python3 ${evArgs.join(" ")}`);
       const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
       if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
+      // Read the metrics back and surface them in the summary.
+      const scored = await readJSON(telePath);
+      const m = scored?.metrics;
+      if (m) {
+        console.log(`\n[SemDB]   ============ METRICS (${args.query}) ============`);
+        console.log(`[SemDB]   precision = ${m.precision}   recall = ${m.recall}   F1 = ${m.f1}`);
+        console.log(`[SemDB]   tp=${m.tp}  fp=${m.fp}  fn=${m.fn}   (ground truth ${m.gt_count}, predicted ${m.pred_count})`);
+      }
       console.log(`[SemDB]   metrics + row saved -> ${telePath} and ${csvPath}`);
     } else if (gt) {
       console.log(`\n[SemDB] Score + append to CSV (compiled query output not found${doRun ? "" : "; re-run with --run"}):`);
