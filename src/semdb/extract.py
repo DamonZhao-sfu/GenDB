@@ -41,6 +41,7 @@ import ast
 import os
 import re
 import sys
+import time
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +375,7 @@ def main():
     json_schema = build_json_schema(schema) if use_endpoint else None
     parse = (lambda raw: parse_simple(raw, schema)) if style == "simple" \
         else (lambda raw: parse_json_object(raw, schema))
+    t_start = time.time()
     rows = list(csv.DictReader(open(args.table)))
     if args.limit:
         rows = rows[: args.limit]
@@ -431,13 +433,24 @@ def main():
         print(f"[extract] {i+1}/{len(rows)} {str(r[args.id_col])[:40]!r} -> {rec.get(primary)}"
               + ("" if ok else "  [PARSE-FAIL]"))
 
+    elapsed = time.time() - t_start
     json.dump(attrs, open(args.out, "w"), indent=2)
     n_ok = len(attrs) - n_parse_fail - n_none
-    print(f"\n[extract] wrote {len(attrs)} rows -> {args.out}")
+    # Sidecar consumed by orchestrator telemetry (code-execution time + counts).
+    meta = {
+        "model": args.model, "endpoint": args.endpoint, "modality": args.modality,
+        "rows": len(attrs), "extracted": n_ok, "none": n_none,
+        "low_conf": n_lowconf, "parse_fail": n_parse_fail,
+        "elapsed_sec": round(elapsed, 2),
+        "sec_per_row": round(elapsed / max(1, len(attrs)), 3),
+    }
+    json.dump(meta, open(args.out + ".meta.json", "w"), indent=2)
+    print(f"\n[extract] wrote {len(attrs)} rows -> {args.out}  ({elapsed:.1f}s, {meta['sec_per_row']}s/row)")
     print(f"[extract]   extracted a value : {n_ok}")
     print(f"[extract]   genuine 'none'    : {n_none}   (no such attribute in the item)")
     print(f"[extract]   low confidence    : {n_lowconf}   (< theta {theta}; residual)")
     print(f"[extract]   JSON PARSE FAILS  : {n_parse_fail}   (model didn't emit valid JSON — see below)")
+    print(f"[extract]   meta -> {args.out}.meta.json")
     if n_parse_fail > len(attrs) * 0.3:
         print("[extract] >30% parse failures: the model is too weak for strict JSON. "
               "Try --model Qwen/Qwen3-VL-2B-Instruct, raise --max-new-tokens, or rerun with --debug 3.")

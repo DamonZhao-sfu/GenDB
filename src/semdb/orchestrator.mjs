@@ -156,9 +156,25 @@ async function runPhase(agentConfig, vars, runDir, args) {
 async function main() {
   const args = parseArgs(process.argv);
   setAgentProvider(args.agentProvider);
+  const wallStart = Date.now();
 
   const runDir = resolve(args.out, `${args.benchmark}-${args.query || "example"}`);
   await mkdir(runDir, { recursive: true });
+
+  // Telemetry: one entry per agent phase (time, tokens, cost).
+  const telemetry = { phases: [] };
+  const record = (name, r) => {
+    if (!r || r.dryRun) return r;
+    telemetry.phases.push({
+      phase: name,
+      provider: args.agentProvider,
+      model: args.modelOverride || getAgentModel(name, args.agentProvider),
+      duration_ms: r.durationMs || 0,
+      tokens: r.tokens || {},
+      cost_usd: r.costUsd || 0,
+    });
+    return r;
+  };
 
   const { sql, nl } = await loadQuery(args);
   const tableHeaders = await readTableHeaders(args.dataDir);
@@ -179,7 +195,7 @@ async function main() {
   console.log(`[SemDB] query:\n${sql}\n`);
 
   // Phase A — Schema Designer (sees the real SQL + real table headers)
-  await runPhase(schemaDesignerConfig, {
+  record("schema_designer", await runPhase(schemaDesignerConfig, {
     query_id: args.query || "example",
     query_sql: sql,
     query_nl: nl,
@@ -191,7 +207,7 @@ async function main() {
     structured_size: "N/A",
     schema_path: schemaPath,
     existing_schema: "",
-  }, runDir, args);
+  }, runDir, args));
 
   const schema = args.dryRun ? null : await readJSON(schemaPath);
   if (schema && schema.decomposable === false) {
@@ -201,7 +217,7 @@ async function main() {
 
   // Phase B — Extractor (small model, once per corpus; reused by every query over it)
   const isImage = !!imageTable;
-  await runPhase(extractorConfig, {
+  record("extractor", await runPhase(extractorConfig, {
     corpus_name: unstructured.table,
     schema_json: schema ? JSON.stringify(schema, null, 2) : "{{schema.json from Phase A}}",
     corpus_manifest: unstructured.path || "(corpus table path)",
@@ -210,11 +226,11 @@ async function main() {
     small_model: isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel,
     escalation_model: defaults.extraction.escalationImageModel,
     attrs_path: attrsPath,
-  }, runDir, args);
+  }, runDir, args));
 
   // Phase C — Code Generator (compiled program references the real table paths)
   const structured = tables.find((t) => !t.isImages) || unstructured;
-  await runPhase(codeGeneratorConfig, {
+  record("code_generator", await runPhase(codeGeneratorConfig, {
     query_id: args.query || "q",
     query_sql: sql,
     schema_json: schema ? JSON.stringify(schema, null, 2) : "{{schema.json from Phase A}}",
@@ -224,7 +240,47 @@ async function main() {
     structured_columns: "(see table headers)",
     code_path: codePath,
     code_basename: `compiled_${args.query || "q"}.py`,
-  }, runDir, args);
+  }, runDir, args));
+
+  // --- Telemetry: agent-stage time + estimated cost -------------------------
+  if (!args.dryRun) {
+    // "code execution" = the extraction + compiled-query runtime. Those run in
+    // separate scripts (extract.py, compiled_<q>.py), each of which writes an
+    // elapsed_sec into its own <out>.meta.json. Merge them if present.
+    const codeExec = { extraction_sec: null, compiled_query_sec: null };
+    const extMeta = await readJSON(attrsPath + ".meta.json");
+    if (extMeta?.elapsed_sec != null) codeExec.extraction_sec = extMeta.elapsed_sec;
+    const cqMeta = await readJSON(resolve(runDir, `compiled_${args.query || "q"}.meta.json`));
+    if (cqMeta?.elapsed_sec != null) codeExec.compiled_query_sec = cqMeta.elapsed_sec;
+
+    const agentMs = telemetry.phases.reduce((s, p) => s + p.duration_ms, 0);
+    const costUsd = telemetry.phases.reduce((s, p) => s + p.cost_usd, 0);
+    const totalTok = telemetry.phases.reduce((s, p) =>
+      s + (p.tokens.input || 0) + (p.tokens.output || 0), 0);
+    const codeExecMs = 1000 * ((codeExec.extraction_sec || 0) + (codeExec.compiled_query_sec || 0));
+
+    const report = {
+      query: args.query, provider: args.agentProvider,
+      wall_clock_ms: Date.now() - wallStart,
+      agent_stage_ms: agentMs,
+      code_execution_ms: codeExecMs || null,
+      code_execution: codeExec,
+      total_estimated_cost_usd: Number(costUsd.toFixed(4)),
+      total_agent_tokens: totalTok,
+      phases: telemetry.phases,
+    };
+    await writeFile(resolve(runDir, "telemetry.json"), JSON.stringify(report, null, 2));
+
+    console.log(`\n[SemDB] === Telemetry ===`);
+    for (const p of telemetry.phases) {
+      console.log(`[SemDB]   ${p.phase.padEnd(16)} ${(p.duration_ms / 1000).toFixed(1)}s  `
+        + `${((p.tokens.input || 0) + (p.tokens.output || 0))} tok  $${p.cost_usd.toFixed(4)}  (${p.model})`);
+    }
+    console.log(`[SemDB]   ${"AGENT STAGE TOTAL".padEnd(16)} ${(agentMs / 1000).toFixed(1)}s  ${totalTok} tok  $${costUsd.toFixed(4)}`);
+    console.log(`[SemDB]   code execution     ${codeExecMs ? (codeExecMs / 1000).toFixed(1) + "s" : "(run extract.py + compiled query to populate)"}`);
+    console.log(`[SemDB]   WALL CLOCK         ${((Date.now() - wallStart) / 1000).toFixed(1)}s`);
+    console.log(`[SemDB]   telemetry -> ${resolve(runDir, "telemetry.json")}`);
+  }
 
   console.log(`\n[SemDB] Done. Artifacts in ${runDir}`);
   console.log(`[SemDB] Extract with:  python3 src/semdb/extract.py --schema ${schemaPath} \\`);

@@ -33,6 +33,9 @@ table. Your program must:
 - Inputs: attribute table path + structured table path + output path. No hidden
   state, no network except the masked residual model calls.
 - Instrument counts: rows emitted, residual model calls made.
+- Time the run and write a sidecar `compiled_<query_id>.meta.json` next to the
+  program containing `{"elapsed_sec": <float>, "rows": <int>, "residual_calls": <int>}`.
+  The orchestrator merges this into telemetry.json as the code-execution time.
 - Mirror `compiled_q7.py`: build hash side, scan extracted side, defer unsure
   rows to `P.vlm_judge`, `write_pairs`.
 
