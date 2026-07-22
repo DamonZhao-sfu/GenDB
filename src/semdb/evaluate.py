@@ -149,10 +149,17 @@ def main():
         gold = load_ground_truth(gt_path, cols)
         pred = load_pred(args.pred, cols, args.pred_no_header)
         m = prf(pred, gold)
-        row.update(gt_count=len(gold), pred_count=len(pred), **m)
+        metrics = {"gt_count": len(gold), "pred_count": len(pred), **m}
+        row.update(**metrics)
         print(f"[eval] {args.query}: GT={len(gold)} pred={len(pred)}  "
               f"P={m['precision']} R={m['recall']} F1={m['f1']}  (tp={m['tp']} fp={m['fp']} fn={m['fn']})")
         print(f"[eval] ground truth: {gt_path}")
+        # Persist the metrics back into telemetry.json too (not just the CSV).
+        if args.telemetry and os.path.exists(args.telemetry):
+            tele["metrics"] = metrics
+            tele["ground_truth_file"] = gt_path
+            json.dump(tele, open(args.telemetry, "w"), indent=2)
+            print(f"[eval] wrote metrics into {args.telemetry}")
     elif args.pred or args.ground_truth or args.ground_truth_dir:
         print("[eval] need BOTH --pred and a ground truth to compute metrics; writing telemetry-only row.")
     else:
