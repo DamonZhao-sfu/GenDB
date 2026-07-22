@@ -28,6 +28,22 @@ pip install torch transformers pillow accelerate
 The agent phases need Claude credentials (`ANTHROPIC_API_KEY`, same as GenDB).
 The extraction phase needs `huggingface.co` reachable to fetch the small model.
 
+### Choosing the agent provider (Claude or Codex)
+The three compiler agents run on either provider — set it in `semdb.config.mjs`
+(`defaults.agentProvider`) or per run with `--agent-provider`:
+
+```bash
+# use OpenAI Codex (gpt-5.6-codex) instead of Claude
+node src/semdb/orchestrator.mjs --query q3a --query-dir <...> --data-dir <...> \
+     --agent-provider codex
+```
+
+Codex needs `@openai/codex-sdk` (already in `package.json`) and Codex auth. The
+model per agent lives in `semdb.config.mjs → defaults.providers.codex` — change
+the single `model:` line to re-point every agent, or edit `agentModels` per agent.
+`--model <id>` forces one model for all agents (testing). The *extraction* small
+models (`defaults.extraction.*`) are independent of this choice.
+
 ---
 
 ## Mode 1 — autonomous (agents do A→C for you)

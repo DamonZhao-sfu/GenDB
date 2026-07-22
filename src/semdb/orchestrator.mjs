@@ -34,7 +34,7 @@ import {
   readJSON,
   setAgentProvider,
 } from "../gendb/shared.mjs";
-import { defaults } from "./semdb.config.mjs";
+import { defaults, getAgentModel, getAgentEffort } from "./semdb.config.mjs";
 import { config as schemaDesignerConfig } from "./agents/schema-designer/index.mjs";
 import { config as extractorConfig } from "./agents/extractor/index.mjs";
 import { config as codeGeneratorConfig } from "./agents/code-generator/index.mjs";
@@ -52,12 +52,15 @@ function parseArgs(argv) {
     imageDir: null,      // .../data/<sf>/images  (defaults to <dataDir>/images)
     out: resolve(__dirname, "runs"),
     agentProvider: defaults.agentProvider,
+    modelOverride: null,   // force one model for all agents (testing)
     dryRun: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--query" && argv[i + 1]) args.query = argv[++i];
     else if (a === "--benchmark" && argv[i + 1]) args.benchmark = argv[++i];
+    else if (a === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
+    else if (a === "--model" && argv[i + 1]) args.modelOverride = argv[++i];
     else if (a === "--query-source" && argv[i + 1]) args.querySource = argv[++i];
     else if (a === "--sembench-dir" && argv[i + 1]) args.sembenchDir = resolve(argv[++i]);
     else if (a === "--query-dir" && argv[i + 1]) args.queryDir = resolve(argv[++i]);
@@ -139,7 +142,8 @@ async function runPhase(agentConfig, vars, runDir, args) {
     systemPrompt,
     userPrompt,
     allowedTools: agentConfig.allowedTools,
-    model: defaults.agentModels[agentConfig.configKey] || agentConfig.model,
+    model: args.modelOverride || getAgentModel(agentConfig.configKey, args.agentProvider),
+    effortLevel: getAgentEffort(agentConfig.configKey, args.agentProvider),
     configName: agentConfig.configKey,
     cwd: runDir,
     timeoutMs: defaults.agentTimeoutMs,
@@ -167,6 +171,7 @@ async function main() {
   const codePath = resolve(runDir, `compiled_${args.query || "q"}.py`);
 
   console.log(`[SemDB] benchmark=${args.benchmark} query=${args.query || "example"}`);
+  console.log(`[SemDB] provider=${args.agentProvider} models: designer=${args.modelOverride || getAgentModel("schema_designer", args.agentProvider)}, extractor=${args.modelOverride || getAgentModel("extractor", args.agentProvider)}, codegen=${args.modelOverride || getAgentModel("code_generator", args.agentProvider)}`);
   console.log(`[SemDB] query-dir: ${args.queryDir || "(none)"}`);
   console.log(`[SemDB] data-dir:  ${args.dataDir || "(none)"}`);
   console.log(`[SemDB] tables in SQL: ${tables.map((t) => t.table).join(", ") || "(none parsed)"}`);
