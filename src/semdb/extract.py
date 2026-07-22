@@ -66,21 +66,23 @@ def build_prompt(schema):
 
 
 def parse_json_object(text, schema):
+    """Returns (record, ok). ok=False means no valid JSON was found in the model
+    output — i.e. the 'none' is a PARSE FAILURE, not a genuine empty extraction."""
     m = re.search(r"\{.*\}", text, re.DOTALL)
     default = {a["name"]: ([] if "array" in a.get("type", "") or a.get("multi")
                            else "none") for a in schema.get("attributes", [])}
     default["conf"] = 0.0
     if not m:
-        return dict(default)
+        return dict(default), False
     try:
         obj = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return dict(default)
+        return dict(default), False
     out = {}
     for a in schema.get("attributes", []):
         out[a["name"]] = obj.get(a["name"], default[a["name"]])
     out["conf"] = float(obj.get("conf", 0.0))
-    return out
+    return out, True
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +178,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--limit", type=int, default=0, help="only process first N rows (0=all)")
+    ap.add_argument("--debug", type=int, default=0,
+                    help="print the raw model output for the first N rows (diagnose 'none')")
     args = ap.parse_args()
 
     schema = json.load(open(args.schema))
@@ -187,26 +191,54 @@ def main():
     backend = (load_text_model(args.model) if args.modality == "text"
                else load_image_model(args.model))
 
-    attrs, n_residual = [], 0
+    primary = schema.get("attributes", [{}])[0].get("name")
+    theta = schema.get("residual", {}).get("theta", 0.5)
+    attrs = []
+    n_parse_fail = n_none = n_lowconf = 0
     for i, r in enumerate(rows):
         if args.modality == "text":
             col = args.text_col or "text"
             raw = gen_text(backend, prompt + "\n\nINPUT:\n" + r.get(col, ""), args.max_new_tokens)
         else:
             uri = r[args.image_col or args.id_col]
-            raw = gen_image(backend, resolve_image_path(uri, args.image_dir), prompt, args.max_new_tokens)
-        rec = parse_json_object(raw, schema)
+            path = resolve_image_path(uri, args.image_dir)
+            if not os.path.exists(path):
+                # image missing → not a model 'none'; record and warn loudly
+                print(f"[extract] {i+1}/{len(rows)} MISSING IMAGE: {path}")
+                rec = {a["name"]: ([] if "array" in a.get("type","") else "none")
+                       for a in schema.get("attributes", [])}
+                rec["conf"] = 0.0
+                rec[args.id_col] = r[args.id_col]
+                attrs.append(rec); n_none += 1
+                continue
+            raw = gen_image(backend, path, prompt, args.max_new_tokens)
+
+        rec, ok = parse_json_object(raw, schema)
         rec[args.id_col] = r[args.id_col]
-        # residual = empty/none primary attribute or low conf
-        primary = schema.get("attributes", [{}])[0].get("name")
+        if i < args.debug:
+            print(f"[debug row {i}] raw output:\n{raw}\n[debug row {i}] parsed ok={ok} -> {rec}\n")
+
         val = rec.get(primary)
-        if val in (None, "none", "", []) or rec["conf"] < schema.get("residual", {}).get("theta", 0.5):
-            n_residual += 1
+        if not ok:
+            n_parse_fail += 1
+        elif val in (None, "none", "", []):
+            n_none += 1
+        elif rec["conf"] < theta:
+            n_lowconf += 1
         attrs.append(rec)
-        print(f"[extract] {i+1}/{len(rows)} {r[args.id_col][:40]!r} -> {rec.get(primary)}")
+        print(f"[extract] {i+1}/{len(rows)} {str(r[args.id_col])[:40]!r} -> {rec.get(primary)}"
+              + ("" if ok else "  [PARSE-FAIL]"))
 
     json.dump(attrs, open(args.out, "w"), indent=2)
-    print(f"[extract] wrote {len(attrs)} rows -> {args.out}  ({n_residual} residual/unsure)")
+    n_ok = len(attrs) - n_parse_fail - n_none
+    print(f"\n[extract] wrote {len(attrs)} rows -> {args.out}")
+    print(f"[extract]   extracted a value : {n_ok}")
+    print(f"[extract]   genuine 'none'    : {n_none}   (no such attribute in the item)")
+    print(f"[extract]   low confidence    : {n_lowconf}   (< theta {theta}; residual)")
+    print(f"[extract]   JSON PARSE FAILS  : {n_parse_fail}   (model didn't emit valid JSON — see below)")
+    if n_parse_fail > len(attrs) * 0.3:
+        print("[extract] >30% parse failures: the model is too weak for strict JSON. "
+              "Try --model Qwen/Qwen3-VL-2B-Instruct, raise --max-new-tokens, or rerun with --debug 3.")
 
 
 if __name__ == "__main__":
