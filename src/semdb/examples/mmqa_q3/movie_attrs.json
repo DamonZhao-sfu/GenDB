@@ -1,0 +1,14 @@
+[
+  {"title": "Mean Girls", "genres": ["comedy", "drama"], "conf": 0.75},
+  {"title": "Cloverfield", "genres": ["sci-fi", "thriller"], "conf": 0.85},
+  {"title": "127 Hours", "genres": ["thriller", "drama"], "conf": 0.80},
+  {"title": "Hot Tub Time Machine", "genres": ["comedy", "sci-fi"], "conf": 0.85},
+  {"title": "The Interview", "genres": ["comedy", "action"], "conf": 0.75},
+  {"title": "Now You See Me 2", "genres": ["thriller", "action"], "conf": 0.80},
+  {"title": "The Disaster Artist", "genres": ["drama", "comedy"], "conf": 0.80},
+  {"title": "Extinction", "genres": ["sci-fi", "horror", "thriller"], "conf": 0.80},
+  {"title": "Allied", "genres": ["romance", "thriller", "drama"], "conf": 0.80},
+  {"title": "Orange County", "genres": ["comedy"], "conf": 0.85},
+  {"title": "Bachelorette", "genres": ["comedy", "drama"], "conf": 0.75},
+  {"title": "Cobweb", "genres": ["horror", "thriller"], "conf": 0.80}
+]
