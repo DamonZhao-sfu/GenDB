@@ -547,6 +547,9 @@ Add above `runQueryCodegen`:
  *  Returns { status, f1, metrics, diff, stderrTail }. status: "ok"|"empty" (crash is
  *  detected by the caller from the run step). Only writes results.csv when finalize. */
 async function scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPath, csvPath, finalize) {
+  // Dry-run must never invoke evaluate.py (guarantees --dry-run is a no-op even when a
+  // stale iter_0 results CSV is lying around in --out from a prior real run).
+  if (args.dryRun) return { status: "ok", f1: null, metrics: null, diff: null };
   if (!existsSync(resultsCsv)) return { status: "empty", f1: null, metrics: null, diff: null };
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
   if (!gt) return { status: "ok", f1: null, metrics: null, diff: null };
@@ -594,10 +597,13 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
                outcome: await scoreIter(iter0Dir, iter0Code, iter0Csv, run0) };
   const history = [{ iter: 0, f1: best.outcome.f1, status: best.outcome.status, improved: true }];
 
-  // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal (ground truth
-  // present and the query scored). Without it, iter_0's f1 is null — behave as single-shot.
-  const effectiveMaxIter = (best.outcome.f1 == null) ? 0 : maxIter;
-  if (best.outcome.f1 == null && maxIter > 0) {
+  // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal. "No signal"
+  // means iter_0 RAN OK but could not be scored (no ground truth) → single-shot. A crash or
+  // empty output WITH ground truth is NOT "no signal" — it must keep iterating (fix-first),
+  // matching shouldContinueSemdb, which returns "continue" when the last run is not "ok".
+  const noSignal = best.outcome.status === "ok" && best.outcome.f1 == null;
+  const effectiveMaxIter = noSignal ? 0 : maxIter;
+  if (noSignal && maxIter > 0) {
     console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
   }
 
@@ -698,6 +704,33 @@ block to the `report` object (locate where `report` is assembled):
               max_iterations: args.noRefine ? 0 : args.maxIterations,
               f1_history: history },
 ```
+
+TWO telemetry-source fixes are REQUIRED because the loop now runs the
+Code Generator and the compiled query in per-iteration `iter_<N>/` dirs, and
+promotes the BEST iteration:
+
+1. **Read the compiled-query meta from the best iter dir.** The compiled query
+   writes `compiled_<query>.meta.json` next to the code it ran — i.e. in
+   `iter_<bestIter>/`, not the run root. Change the existing `cqMeta` read to:
+   ```js
+   const cqMeta = await readJSON(resolve(runDir, `iter_${bestIter}`, `compiled_${query}.meta.json`));
+   ```
+   (Falls through to the `?.` guards already in the telemetry code if absent.)
+2. **Sum the Code Generator cost across ALL iterations, not just iter_0.**
+   `record("code_generator", ...)` pushes one phase entry PER iteration, so
+   `phases.find(p => p.phase === "code_generator")` undercounts (returns iter_0
+   only). Replace that single-phase lookup with a sum over every codegen phase:
+   ```js
+   const cgPhases = phases.filter((p) => p.phase === "code_generator");
+   const cg = {
+     duration_ms: cgPhases.reduce((s, p) => s + (p.duration_ms || 0), 0),
+     cost_usd:    cgPhases.reduce((s, p) => s + (p.cost_usd || 0), 0),
+     llm_calls:   cgPhases.reduce((s, p) => s + (p.llm_calls || 0), 0),
+     tokens: cgPhases.reduce((t, p) => ({ input: (t.input || 0) + (p.tokens?.input || 0),
+                                          output: (t.output || 0) + (p.tokens?.output || 0) }), {}),
+   };
+   ```
+   Use this `cg` everywhere the old single `cg` phase object was used.
 
 ORDER MATTERS: `report` must be written to `telePath` BEFORE the finalize scoring,
 so `evaluate.py` can merge the metrics into telemetry.json and the metrics-print
