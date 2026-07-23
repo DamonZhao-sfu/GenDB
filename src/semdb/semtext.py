@@ -110,7 +110,6 @@ class TextPatch:
 
 import csv as _csv
 import json as _json
-import os as _os
 import sys as _sys
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
@@ -150,7 +149,12 @@ def run_extraction(driver, schema, table_path, out_path, *, model, endpoint=None
         try:
             patch = TextPatch(r.get(tcol, "") if tcol else "", ctx)
             fields = driver.extract(patch) or {}
-            rec = dict(fields)
+            # Enforce the attrs contract on the success path too: every schema attribute
+            # must be present (type-appropriate default when the driver omitted it), so a
+            # partial extract can't produce a record compiled_<q>.py would KeyError on.
+            rec = {a["name"]: fields.get(a["name"],
+                       ([] if "array" in a.get("type", "") or a.get("multi") else "none"))
+                   for a in schema.get("attributes", [])}
             primary = schema.get("attributes", [{}])[0].get("name")
             val = rec.get(primary)
             rec["conf"] = 0.0 if val in (None, "none", "", []) else 1.0
