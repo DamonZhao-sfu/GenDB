@@ -41,6 +41,10 @@ import { defaults, getAgentModel, getAgentEffort } from "./semdb.config.mjs";
 import { BENCHMARKS, SUPPORTED, tableDesc, tableFile } from "./benchmarks.mjs";
 import { config as schemaDesignerConfig } from "./agents/schema-designer/index.mjs";
 import { config as extractorConfig } from "./agents/extractor/index.mjs";
+import { config as vadarSignatureConfig } from "./agents/vadar-signature/index.mjs";
+import { config as vadarApiConfig } from "./agents/vadar-api/index.mjs";
+import { config as vadarProgramConfig } from "./agents/vadar-program/index.mjs";
+import { config as vadarSolverConfig } from "./agents/vadar-solver/index.mjs";
 
 /** SQL table-qualifier prefix for a benchmark (e.g. mmqa, cars_dataset). */
 function benchPrefix(bench) { return (BENCHMARKS[bench] && BENCHMARKS[bench].prefix) || bench; }
@@ -78,6 +82,10 @@ function parseArgs(argv) {
     predCols: "0,1",       // predicted columns to compare vs GT tuple order
     force: false,          // re-run corpus schema design + extraction even if cached
     dryRun: false,
+    imageOnly: false,      // run only queries whose corpus is an image table
+    direct: false,         // DIRECT mode: skip Schema Designer + extract/compile split;
+                           // VADAR 3 agents (Signature→API→Solver) write ONE end-to-end
+                           // solve_<q>.py that calls the local vision API and answers the query.
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -104,6 +112,8 @@ function parseArgs(argv) {
     else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
     else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
     else if (a === "--force") args.force = true;
+    else if (a === "--image-only") args.imageOnly = true;
+    else if (a === "--direct") args.direct = true;
     else if (a === "--dry-run") args.dryRun = true;
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
@@ -143,6 +153,36 @@ function parseArgs(argv) {
     else args.imageDir = resolve(args.dataDir, (b && b.imageRoot) || "images");
   }
   return args;
+}
+
+/**
+ * Improvement judge — correctness-first, then F1 (mirrors GenDB checkExecutionImprovement).
+ * `prev`/`next` are { status: "ok"|"crash"|"empty", f1: number|null }.
+ */
+export function checkSemdbImprovement(prev, next) {
+  const prevOk = prev && prev.status === "ok";
+  const nextOk = next && next.status === "ok";
+  if (prevOk && !nextOk) return false;     // regressed to a crash/empty
+  if (!prevOk && nextOk) return true;      // fixed a crash/empty
+  if (prevOk && nextOk) return (next.f1 ?? -1) > (prev.f1 ?? -1);
+  return false;                            // both broken → no improvement
+}
+
+/**
+ * Stop/continue gate (mirrors GenDB shouldContinue). `history` = [{ iter, f1, status, improved }].
+ */
+export function shouldContinueSemdb(history, iteration, maxIter, stallThreshold) {
+  if (iteration > maxIter) return { action: "stop", reason: "Max iterations reached" };
+  const last = history[history.length - 1];
+  if (last && last.status !== "ok") return { action: "continue", reason: "Fix runtime failure first" };
+  const bestF1 = history.reduce((m, h) => Math.max(m, h.f1 ?? -1), -1);
+  if (bestF1 >= 1.0) return { action: "stop", reason: "Perfect F1 reached" };
+  const thresh = stallThreshold || 2;
+  const recent = history.slice(-thresh);
+  if (recent.length >= thresh && recent.every((h) => !h.improved)) {
+    return { action: "stop", reason: `Stalled: ${thresh} non-improving iterations` };
+  }
+  return { action: "continue", reason: "Refinement potential remains" };
 }
 
 /** Load a SemBench query's SQL from the query folder, and its NL intent if present. */
@@ -495,22 +535,44 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   // Both cache per corpus (amortized across all its queries).
   const driverPath = resolve(corpusDir, `extract_${corpus.table}.py`);
   if (!existsSync(driverPath) || args.force) {          // agent artifact step (like schema design); runPhase handles --dry-run
-    record("extractor", await runPhase(extractorConfig, {
-      corpus_name: corpus.table,
-      schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
-      schema_path: schemaPath,
-      header: cols.join(", "),
-      modality,
-      id_col: idCol, text_col: textCol, image_col: imageCol,
-      image_dir: args.imageDir || "",
-      small_model: extractModel,
-      escalation_model: defaults.extraction.escalationImageModel,
-      corpus_manifest: corpus.path,
-      corpus_size: `(rows in ${basename(corpus.path)})`,
-      driver_path: driverPath,
-      attrs_path: attrsPath,
-      semextract_path: resolve(__dirname, "semextract.py"),
-    }, corpusDir, args));
+    if (isImage) {
+      // IMAGE corpora: strict VADAR 3-agent dynamic-API synthesis (arXiv 2502.06787).
+      // Signature -> API -> Program (each a codex/claude agent) compose the predefined
+      // vision API (vadar/predefined.py) into extract(image); the program calls
+      // vadar_engine.run over the corpus. All 3 share the corpus queries + schema.
+      const corpusSql = corpusQueries.map((p) => `-- ${p.query}\n${p.sql}`).join("\n\n");
+      const schemaJson = schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}";
+      const sigPath = resolve(corpusDir, "_vadar_signatures.txt");
+      const helpersPath = resolve(corpusDir, "_vadar_helpers.py");
+      const common = { corpus_name: corpus.table, semdb_dir: __dirname };
+      record("vadar_signature", await runPhase(vadarSignatureConfig, {
+        ...common, query_sql: corpusSql, schema_json: schemaJson, sig_path: sigPath,
+      }, corpusDir, args));
+      record("vadar_api", await runPhase(vadarApiConfig, {
+        ...common, sig_path: sigPath, helpers_path: helpersPath,
+      }, corpusDir, args));
+      record("vadar_program", await runPhase(vadarProgramConfig, {
+        ...common, schema_json: schemaJson, helpers_path: helpersPath, driver_path: driverPath,
+        header: cols.join(", "), id_col: idCol, image_col: imageCol,
+      }, corpusDir, args));
+    } else {
+      record("extractor", await runPhase(extractorConfig, {
+        corpus_name: corpus.table,
+        schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
+        schema_path: schemaPath,
+        header: cols.join(", "),
+        modality,
+        id_col: idCol, text_col: textCol, image_col: imageCol,
+        image_dir: args.imageDir || "",
+        small_model: extractModel,
+        escalation_model: defaults.extraction.escalationImageModel,
+        corpus_manifest: corpus.path,
+        corpus_size: `(rows in ${basename(corpus.path)})`,
+        driver_path: driverPath,
+        attrs_path: attrsPath,
+        semextract_path: resolve(__dirname, "semextract.py"),
+      }, corpusDir, args));
+    }
   } else if (existsSync(driverPath)) {
     console.log(`[SemDB] reuse cached corpus extractor driver: ${driverPath}`);
   }
@@ -534,7 +596,7 @@ async function ensureCorpus(args, corpus, corpusQueries) {
 
   const extMeta = await readJSON(attrsPath + ".meta.json");
   const sd = phases.filter((p) => p.phase === "schema_designer");
-  const ext = phases.filter((p) => p.phase === "extractor");
+  const ext = phases.filter((p) => p.phase === "extractor" || p.phase.startsWith("vadar_"));
   const corpusTelemetry = {
     corpus: corpus.table,
     modality,
@@ -684,12 +746,126 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   return report;
 }
 
+/** Pick the filename + absolute-path columns from an image-manifest header. */
+function pickImageCols(header) {
+  const cols = header.split(",").map((c) => c.trim());
+  const find = (res) => cols.find((c) => res.some((re) => re.test(c))) || "";
+  const filepath = find([/filepath/i, /image_path/i, /\buri\b/i, /\bpath\b/i]);
+  const filename = find([/filename/i, /\bfile\b/i, /\bimage\b/i]) || filepath;
+  return { filename, filepath };
+}
+
+/**
+ * DIRECT mode (per query): the strict VADAR 3 agents (Signature → API → Solver) write ONE
+ * end-to-end `solve_<q>.py` that composes the LOCAL vision API and answers the whole query
+ * (join/filter included) — NO Schema Designer, NO extract/attrs/compile split. Execute it,
+ * then score its result CSV exactly like the compiled path.
+ */
+async function runQueryDirect(args, planObj, csvPath) {
+  const { query, sql, nl, tables, corpus } = planObj;
+  const wallStart = Date.now();
+  const runDir = resolve(args.out, `${args.benchmark}-${query}`);
+  await mkdir(runDir, { recursive: true });
+  const solvePath = resolve(runDir, `solve_${query}.py`);
+  const resultsCsv = resolve(runDir, `${query}_results.csv`);
+  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
+
+  const phases = [];
+  const record = makeRecorder(args, phases);
+  console.log(`\n[SemDB] ---- ${query}  (DIRECT: 3-agent solver over ${corpus.table}) ----`);
+
+  // Describe every referenced table (header + path) for the solver.
+  const tableLines = [];
+  for (const t of tables) {
+    const kind = t.isImages ? "image manifest" : (t.modality || "table");
+    tableLines.push(`- ${t.table} (${kind}): path=${t.path}\n    columns: ${await headerOf(t.path)}`);
+  }
+  const imgHeader = await headerOf(corpus.path);
+  const { filename: imgFilenameCol, filepath: imgFilepathCol } = pickImageCols(imgHeader);
+  const imageDir = args.imageDir || (corpus.path ? resolve(dirname(corpus.path), "images") : "");
+
+  if (!existsSync(solvePath) || args.force) {
+    const sigPath = resolve(runDir, `_vadar_signatures_${query}.txt`);
+    const helpersPath = resolve(runDir, `_vadar_helpers_${query}.py`);
+    const common = { corpus_name: corpus.table, semdb_dir: __dirname };
+    record("vadar_signature", await runPhase(vadarSignatureConfig, {
+      ...common, query_sql: sql, schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
+      sig_path: sigPath,
+    }, runDir, args));
+    record("vadar_api", await runPhase(vadarApiConfig, {
+      ...common, sig_path: sigPath, helpers_path: helpersPath,
+    }, runDir, args));
+    record("vadar_solver", await runPhase(vadarSolverConfig, {
+      query_id: query, query_sql: sql, query_nl: nl || "(none)", semdb_dir: __dirname,
+      tables_doc: tableLines.join("\n"),
+      image_table: corpus.table, image_path: corpus.path,
+      image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
+      image_dir: imageDir, helpers_path: helpersPath, solve_path: solvePath,
+    }, runDir, args));
+  } else {
+    console.log(`[SemDB] reuse cached solver: ${solvePath}`);
+  }
+
+  if (args.dryRun) return null;
+
+  const dataDir = args.tableDir || args.dataDir;
+  if (doRun && existsSync(solvePath)) {
+    const clipModel = args.clipModel || defaults.extraction.clipModel;
+    const sArgs = [solvePath, resultsCsv, "--data-dir", dataDir,
+      ...(imageDir ? ["--image-dir", imageDir] : []),
+      "--clip-model", clipModel];
+    console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
+    const s = spawnSync("python3", sArgs, { stdio: "inherit" });
+    if (s.status !== 0) console.warn(`[SemDB] direct solver exited ${s.status}.`);
+  }
+
+  // Minimal telemetry (agent stages only — no extraction/compile split in DIRECT mode).
+  const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
+  const agentMs = phases.reduce((s, p) => s + p.duration_ms, 0);
+  const agentCalls = phases.reduce((s, p) => s + p.llm_calls, 0);
+  const agentCost = phases.reduce((s, p) => s + p.cost_usd, 0);
+  const report = {
+    query, corpus: corpus.table, provider: args.agentProvider, operator: "direct",
+    mode: "direct", wall_clock_ms: Date.now() - wallStart,
+    direct: { agent_stage_ms: agentMs, agent_calls: agentCalls,
+              agent_cost_usd: Number(agentCost.toFixed(4)) },
+    naive_llm_calls: planObj.plan.naive ?? null,
+    total_estimated_cost_usd: Number(agentCost.toFixed(4)),
+    ground_truth: gt ? { file: gt.file, count: gt.count } : null,
+    phases,
+  };
+  const telePath = resolve(runDir, "telemetry.json");
+  await writeFile(telePath, JSON.stringify(report, null, 2));
+
+  console.log(`\n[SemDB] === ${query} (DIRECT) ===`);
+  console.log(`[SemDB]   3-agent solver     ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  $${agentCost.toFixed(4)}`);
+
+  if (doRun && gt && existsSync(resultsCsv)) {
+    const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
+      "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
+      "--query", query, "--benchmark", args.benchmark, "--csv", csvPath,
+      ...(args.groundTruthDir ? ["--ground-truth-dir", args.groundTruthDir] : []),
+      ...(args.scaleFactor ? ["--sf", String(args.scaleFactor)] : [])];
+    const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
+    if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
+    const scored = await readJSON(telePath);
+    const m = scored?.metrics;
+    if (m) console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+  } else if (gt) {
+    console.log(`[SemDB]   (solver output not found — score later with evaluate.py --pred ${resultsCsv})`);
+  }
+  return report;
+}
+
 async function main() {
   const base = parseArgs(process.argv);
   setAgentProvider(base.agentProvider);
   const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
 
-  const queries = base.query ? [base.query] : await listQueries(base.queryDir);
+  // --query takes ONE id or a list (comma/space separated): --query q2,q4  OR  --query "q2 q4".
+  const queries = base.query
+    ? base.query.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean)
+    : await listQueries(base.queryDir);
   if (queries.length === 0) {
     console.error("[SemDB] no query given and no *.sql found in --query-dir.");
     process.exit(1);
@@ -731,14 +907,38 @@ async function main() {
     }
     return true;
   });
+  // --image-only: keep only queries whose chosen corpus is an image table.
+  const runPlans = base.imageOnly ? plans.filter((p) => p.isImage) : plans;
+  if (base.imageOnly) {
+    console.log(`[SemDB] --image-only: ${runPlans.length}/${plans.length} image quer${runPlans.length === 1 ? "y" : "ies"}`
+      + (runPlans.length ? `: ${runPlans.map((p) => p.query).join(", ")}` : ""));
+    if (!runPlans.length) { console.log("[SemDB] no image queries in this scenario — nothing to run."); return; }
+  }
   const corpora = new Map();
-  for (const p of plans) {
+  for (const p of runPlans) {
     const key = p.corpus.table;
     if (!corpora.has(key)) corpora.set(key, { corpus: p.corpus, queries: [] });
     corpora.get(key).queries.push(p);
   }
   console.log(`[SemDB] ${corpora.size} corpus/corpora: ${[...corpora.entries()].map(([k, v]) => `${k}(${v.queries.length})`).join(", ")}`);
 
+  // DIRECT mode: skip Schema Designer + extract/compile; the VADAR 3 agents write one
+  // end-to-end solver per query. Otherwise: Schema Designer + Extractor once per corpus.
+  const summary = [];
+  if (base.direct) {
+    console.log(`[SemDB] DIRECT mode: 3-agent solver per query (no schema design, no extract/compile split).`);
+    for (const p of runPlans) {
+      console.log(`\n[SemDB] ==================== ${p.query} ====================`);
+      try {
+        await runQueryDirect(base, p, csvPath);
+        const tele = await readJSON(resolve(base.out, `${base.benchmark}-${p.query}`, "telemetry.json"));
+        if (tele?.metrics) summary.push({ q: p.query, ...tele.metrics });
+      } catch (e) {
+        console.error(`[SemDB] [${p.query}] failed: ${e.message}`);
+        summary.push({ q: p.query, error: e.message });
+      }
+    }
+  } else {
   // 2) Schema Designer + Extractor ONCE per corpus (shared by its queries).
   const corpusArt = new Map();
   for (const [key, info] of corpora) {
@@ -747,8 +947,7 @@ async function main() {
   }
 
   // 3) Code Generator + execute + evaluate PER query.
-  const summary = [];
-  for (const p of plans) {
+  for (const p of runPlans) {
     console.log(`\n[SemDB] ==================== ${p.query} ====================`);
     const art = corpusArt.get(p.corpus.table);
     if (!art) { summary.push({ q: p.query, error: "corpus artifacts missing" }); continue; }
@@ -760,6 +959,7 @@ async function main() {
       console.error(`[SemDB] [${p.query}] failed: ${e.message}`);
       summary.push({ q: p.query, error: e.message });
     }
+  }
   }
 
   // 4) Workload summary.
@@ -777,7 +977,10 @@ async function main() {
   console.log(`[SemDB]   metrics CSV -> ${csvPath}`);
 }
 
-main().catch((err) => {
-  console.error("[SemDB] Fatal:", err.message);
-  process.exit(1);
-});
+// Only run when invoked directly (not when imported by tests).
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error("[SemDB] Fatal:", err.message);
+    process.exit(1);
+  });
+}

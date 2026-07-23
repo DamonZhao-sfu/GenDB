@@ -32,6 +32,11 @@ export const defaults = {
 
   agentTimeoutMs: 20 * 60 * 1000,
 
+  // --- Iterative refinement loop (GenDB-style) ---
+  maxRefineIterations: 5,     // per-query optimize→run→score iterations (0 = single-shot)
+  refineStallThreshold: 2,    // stop after this many consecutive non-improving iterations
+  refineSampleCap: 15,        // max FP and FN rows shown to the agent per iteration
+
   // --- Provider-specific settings for the three compiler agents ---
   providers: {
     claude: {
