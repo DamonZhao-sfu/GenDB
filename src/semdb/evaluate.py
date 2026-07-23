@@ -3,21 +3,33 @@
 evaluate.py — score a compiled SemDB query against SemBench ground truth and
 append one telemetry+metrics row to a CSV.
 
-Ground truth (e.g. .../raw_results/ground_truth/Q2a.json):
-    { "nl_question": "...", "modalities": ["table","image"],
-      "ground_truth": [ [0, "117d....png"], [5, "117d....png"], ... ] }
+Metric = a FAITHFUL replication of SemBench's mmqa evaluator
+(`SemBench/src/scenario/mmqa/evaluation/evaluate.py`). Every mmqa query uses the
+same membership-based precision/recall/F1 (`compute_metrics`), but the prediction
+container and per-column normalization differ PER QUERY:
 
-The `ground_truth` list is the set of expected result rows (each a tuple of the
-query's SELECT columns, e.g. [t.ID, i.uri]). We compare it to the compiled
-query's predicted rows and report set-based precision / recall / F1. Cells are
-normalized (filenames → basename, lowercased) so a full image path matches a
-bare filename.
+    q1  list of director        (.strip(' "').lower())
+    q2  set of (ID, image_id[, color])   image_id = basename, %2e -> "."
+    q3  list of title           (raw)
+    q4  list of (genre, movie)  (comma-split movies, lowercased)
+    q5  list of actor/_output   (lowercased, blanks skipped)
+    q6  list of Airlines        (raw, empty-safe)
+    q7  set of (Airlines, image_id)      image_id = basename, %2e -> "."
+
+Sub-lettered ids collapse to their numeric handler (q3a..q3g -> q3), exactly like
+SemBench (`int("3a"[:-1])`). Membership is whole-item exact match (list keeps
+duplicates → q1/q3/q4/q5/q6 recall can exceed 1.0; q2/q7 dedup via set). Double
+empty → F1 = 0.0 (NOT 1.0), matching `compute_metrics`.
+
+Prediction columns are read BY NAME (our compiled outputs already emit SemBench's
+column names: director / ID,uri / ID,uri,color / Airlines,uri), so `--pred-cols`
+is accepted for backward-compat but ignored.
 
 Usage
 -----
 Metrics + CSV row:
     python3 evaluate.py \
-        --pred runs/mmqa-q2a/q2a_results.csv --pred-cols 0,1 \
+        --pred runs/mmqa-q2a/q2a_results.csv \
         --ground-truth-dir /localhome/hza214/SemBench/files/mmqa/raw_results/ground_truth \
         --query q2a \
         --telemetry runs/mmqa-q2a/telemetry.json \
@@ -33,21 +45,173 @@ import json
 import os
 import re
 
-IMG_RE = re.compile(r"\.(png|jpe?g|gif|webp|bmp|tiff?)$", re.I)
+
+# ---------------------------------------------------------------------------
+# SemBench mmqa metric — faithful port of compute_metrics + per-query handlers.
+# ---------------------------------------------------------------------------
+
+def score(results, ground_truth):
+    """Port of mmqa `compute_metrics`: iterate `results` (list OR set), a hit is
+    membership in `ground_truth`. precision = tp/len(results); recall = tp/len(gt);
+    both-empty → 0.0. Returns the metric row (tp/fp/fn + P/R/F1)."""
+    tp = sum(1 for item in results if item in ground_truth)
+    fp = len(results) - tp
+    p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    r = tp / len(ground_truth) if len(ground_truth) > 0 else 0.0
+    f1 = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
+    return dict(gt_count=len(ground_truth), pred_count=len(results),
+                tp=tp, fp=fp, fn=len(ground_truth) - tp,
+                precision=round(p, 4), recall=round(r, 4), f1=round(f1, 4))
 
 
-def norm_cell(x):
-    s = str(x).strip()
-    if "/" in s or "\\" in s or IMG_RE.search(s):
-        s = os.path.basename(s.replace("\\", "/"))
-    return s.lower()
+def _isna(v):
+    """Mirror pandas' read_csv: a blank/missing cell reads as NaN. csv gives us '',
+    so treat None/empty/whitespace as NaN (used for the pd.isna skips in q4/q5)."""
+    return v is None or (isinstance(v, str) and v.strip() == "")
 
 
-def to_tuple(item, cols=None):
-    row = list(item) if isinstance(item, (list, tuple)) else [item]
-    if cols:
-        row = [row[i] for i in cols if i < len(row)]
-    return tuple(norm_cell(c) for c in row)
+def _basename_image_id(v):
+    """SemBench q2/q7: image_id = last path segment, with %2e decoded to '.'."""
+    return str(v).split("/")[-1].replace("%2e", ".")
+
+
+def _column_is_int(rows, col):
+    """Mirror pandas' per-column int64 inference: True iff EVERY value in `col`
+    parses as an int (so q2 IDs compare equal to the integer ground truth)."""
+    vals = [r.get(col) for r in rows]
+    return bool(vals) and all(re.fullmatch(r"-?\d+", (str(v).strip())) for v in vals)
+
+
+def eval_q1(rows, fields, gt):
+    results = [str(r.get("director", "")).strip(' "').lower() for r in rows]
+    gold = {g.strip().lower() for g in gt}
+    return score(results, gold)
+
+
+def eval_q2(rows, fields, gt):
+    id_is_int = _column_is_int(rows, "ID")
+    results = set()
+    for r in rows:
+        r = dict(r)
+        if "uri" in r:
+            r["image_id"] = r.pop("uri")          # BigQuery
+        if "filename" in r:
+            r["image_id"] = r.pop("filename")     # Palimpzest
+        image_id = _basename_image_id(r["image_id"])
+        rid = int(str(r["ID"]).strip()) if id_is_int else r["ID"]
+        ncols = len(r)
+        if ncols == 2:
+            results.add((rid, image_id))
+        elif ncols == 3:
+            results.add((rid, image_id, str(r["color"]).strip().lower()))
+        else:
+            raise ValueError(f"Unexpected number of columns: {ncols} in the results.")
+    gold = set(tuple(g) for g in gt)
+    return score(results, gold)
+
+
+def eval_q3(rows, fields, gt):
+    results = [r["title"] for r in rows]
+    return score(results, set(gt))
+
+
+def eval_q4(rows, fields, gt):
+    if not rows or "genre" not in (fields or []):
+        return score([], set())
+    results = []
+    for r in rows:
+        genre = r.get("genre")
+        if _isna(genre):
+            continue
+        genre = str(genre).strip().lower()
+        movies = r.get("movies_in_genre")
+        if _isna(movies):
+            continue
+        for movie in str(movies).split(","):
+            results.append((genre, movie.strip().lower()))
+    gold = set()
+    for genre, movies in gt.items():                # gt is a dict here
+        for m in movies:
+            gold.add((genre.strip().lower(), m.strip().lower()))
+    return score(results, gold)
+
+
+def eval_q5(rows, fields, gt):
+    results = []
+    for r in rows:
+        if "_output" in r:
+            value = r["_output"]
+        elif "actor" in r:
+            value = r["actor"]
+        else:
+            raise ValueError("Expected either '_output' or 'actor' column in the results.")
+        if _isna(value) or not isinstance(value, str):
+            continue
+        results.append(value.strip().lower())
+    gold = {g.strip().lower() for g in gt}
+    return score(results, gold)
+
+
+def eval_q6(rows, fields, gt):
+    if not rows or "Airlines" not in (fields or []):
+        results = []
+    else:
+        results = [r["Airlines"] for r in rows]
+    return score(results, set(gt))
+
+
+def eval_q7(rows, fields, gt):
+    results = set()
+    for r in rows:
+        r = dict(r)
+        if "uri" in r:
+            r["image_id"] = r.pop("uri")
+        if "filename" in r:
+            r["image_id"] = r.pop("filename")
+        image_id = _basename_image_id(r["image_id"])
+        results.add((r["Airlines"], image_id))
+    gold = set(tuple(g) for g in gt)
+    return score(results, gold)
+
+
+MMQA_HANDLERS = {1: eval_q1, 2: eval_q2, 3: eval_q3, 4: eval_q4,
+                 5: eval_q5, 6: eval_q6, 7: eval_q7}
+
+
+def handler_id(query):
+    """q3a -> 3, q10 -> 10 (SemBench: int(query_id[:-1]) when a letter trails)."""
+    m = re.match(r"(\d+)", str(query).lower().lstrip("q"))
+    if not m:
+        raise ValueError(f"cannot derive a numeric mmqa handler from query {query!r}")
+    return int(m.group(1))
+
+
+def load_pred_rows(path):
+    """Read the compiled output as (rows, fieldnames). rows = list of dict keyed by
+    column name — the shape SemBench's per-query handlers expect."""
+    if path.endswith(".json"):
+        data = json.load(open(path))
+        if data and not isinstance(data[0], dict):
+            raise ValueError(
+                "JSON predictions must be a list of OBJECTS with named columns — the mmqa "
+                "handlers read columns by name (e.g. 'director'/'Airlines'), not by position.")
+        rows = [dict(r) for r in data]
+        fields = list(rows[0].keys()) if rows else []
+        return rows, fields
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = [dict(r) for r in reader]
+        return rows, list(reader.fieldnames or [])
+
+
+def eval_mmqa(query, pred_path, gt_path):
+    """Dispatch to the mmqa per-query handler and return its metric row."""
+    hid = handler_id(query)
+    if hid not in MMQA_HANDLERS:
+        raise ValueError(f"no mmqa handler for query {query!r} (id {hid})")
+    rows, fields = load_pred_rows(pred_path)
+    gt = json.load(open(gt_path)).get("ground_truth")
+    return MMQA_HANDLERS[hid](rows, fields, gt)
 
 
 def resolve_gt_file(gt_dir, query):
@@ -61,36 +225,6 @@ def resolve_gt_file(gt_dir, query):
     return None
 
 
-def load_ground_truth(path, cols=None):
-    d = json.load(open(path))
-    gt = d.get("ground_truth", d) if isinstance(d, dict) else d
-    return set(to_tuple(x, cols) for x in gt)
-
-
-def load_pred(path, cols, no_header):
-    if path.endswith(".json"):
-        data = json.load(open(path))
-        out = set()
-        for r in data:
-            vals = list(r.values()) if isinstance(r, dict) else r
-            out.add(to_tuple(vals, cols))
-        return out
-    rows = list(csv.reader(open(path)))
-    if rows and not no_header:
-        rows = rows[1:]                      # our writers emit a header row
-    return set(to_tuple(r, cols) for r in rows if r)
-
-
-def prf(pred, gold):
-    tp = len(pred & gold)
-    fp = len(pred - gold)
-    fn = len(gold - pred)
-    p = tp / (tp + fp) if tp + fp else (1.0 if not gold else 0.0)
-    r = tp / (tp + fn) if tp + fn else 1.0
-    f1 = 2 * p * r / (p + r) if p + r else 0.0
-    return dict(tp=tp, fp=fp, fn=fn, precision=round(p, 4), recall=round(r, 4), f1=round(f1, 4))
-
-
 def model_of(tele, phase):
     for p in tele.get("phases", []):
         if p.get("phase") == phase:
@@ -99,62 +233,103 @@ def model_of(tele, phase):
 
 
 CSV_COLS = [
-    "query", "corpus", "provider", "operator", "codegen_model",
+    "query", "benchmark", "provider", "designer_model", "extractor_model", "codegen_model",
+    "wall_clock_ms", "agent_stage_ms", "code_execution_ms",
+    "total_estimated_cost_usd", "total_agent_tokens",
+    "agent_calls", "extraction_calls", "residual_calls", "total_llm_calls",
     "naive_llm_calls", "compiled_execution_calls", "call_reduction",
-    "schema_design_calls", "extraction_calls", "codegen_calls", "residual_calls",
-    "amortized_total_calls", "codegen_cost_usd", "total_estimated_cost_usd",
     "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
+    # non-F1 metric families (blank unless that metric applies)
+    "metric", "relative_error", "mape", "spearman", "kendall", "ari", "covered",
 ]
 
 
+def eval_scenario(benchmark, query, pred_path, gt_dir, sf):
+    """Score a non-mmqa scenario via scenario_metrics (faithful SemBench port;
+    needs pandas/sklearn/scipy → run evaluate.py under the sembench conda env)."""
+    import importlib
+    try:
+        sm = importlib.import_module("scenario_metrics")
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(
+            f"[eval] scenario '{benchmark}' needs scenario_metrics (pandas/sklearn/scipy). "
+            f"Run evaluate.py under the sembench conda env. ({e})")
+    r = sm.score(benchmark, query, pred_path, gt_dir, int(sf) if sf else None)
+    keep = ("precision", "recall", "f1", "tp", "fp", "fn", "gt_count", "pred_count",
+            "relative_error", "mape", "spearman", "kendall", "ari", "covered")
+    row = {"metric": r.get("metric", "")}
+    for k in keep:
+        if r.get(k) is not None:
+            row[k] = round(r[k], 4) if isinstance(r[k], float) else r[k]
+    return row, r
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Score a compiled query vs ground truth; append to CSV")
+    ap = argparse.ArgumentParser(description="Score a compiled mmqa query vs ground truth; append to CSV")
     ap.add_argument("--pred", help="compiled query output (.csv or .json). Omit for telemetry-only row.")
-    ap.add_argument("--pred-cols", help="comma-separated column indices to compare, in GT order (e.g. 0,1)")
-    ap.add_argument("--pred-no-header", action="store_true", help="pred CSV has no header row")
+    ap.add_argument("--pred-cols", help="(ignored) mmqa handlers read prediction columns by name")
     ap.add_argument("--ground-truth", help="ground-truth JSON file")
     ap.add_argument("--ground-truth-dir", help="ground-truth dir; resolves <query>.json")
-    ap.add_argument("--query", default="")
+    ap.add_argument("--query", default="", help="query id (mmqa q1..q7 sub-letters; else Q1..Qn)")
+    ap.add_argument("--benchmark", default="", help="scenario: mmqa (stdlib) | movie|cars|medical|animals|ecomm (scenario_metrics)")
+    ap.add_argument("--sf", default="", help="scale factor (cars/medical GT suffix resolution)")
     ap.add_argument("--telemetry", help="telemetry.json from the orchestrator")
     ap.add_argument("--csv", required=True, help="output CSV (row appended; header written if new)")
     args = ap.parse_args()
 
-    cols = [int(c) for c in args.pred_cols.split(",")] if args.pred_cols else None
     tele = json.load(open(args.telemetry)) if args.telemetry and os.path.exists(args.telemetry) else {}
     llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
 
-    pq = tele.get("per_query", {}) if isinstance(tele.get("per_query"), dict) else {}
     row = {c: "" for c in CSV_COLS}
     row.update(
         query=args.query or tele.get("query", ""),
-        corpus=tele.get("corpus", ""),
+        benchmark=args.benchmark or tele.get("benchmark", ""),
         provider=tele.get("provider", ""),
-        operator=tele.get("operator", ""),
+        designer_model=model_of(tele, "schema_designer"),
+        extractor_model=model_of(tele, "extractor"),
         codegen_model=model_of(tele, "code_generator"),
+        wall_clock_ms=tele.get("wall_clock_ms", ""),
+        agent_stage_ms=tele.get("agent_stage_ms", ""),
+        code_execution_ms=tele.get("code_execution_ms", ""),
+        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
+        total_agent_tokens=tele.get("total_agent_tokens", ""),
+        agent_calls=llm.get("agent_stage", ""),
+        extraction_calls=llm.get("extraction", ""),
+        residual_calls=llm.get("residual", ""),
+        total_llm_calls=llm.get("total", ""),
         naive_llm_calls=tele.get("naive_llm_calls", ""),
         compiled_execution_calls=tele.get("compiled_execution_calls", ""),
         call_reduction=tele.get("call_reduction", ""),
-        schema_design_calls=llm.get("schema_design", ""),
-        extraction_calls=llm.get("extraction", ""),
-        codegen_calls=llm.get("codegen", ""),
-        residual_calls=llm.get("residual", ""),
-        amortized_total_calls=llm.get("amortized_total", ""),
-        codegen_cost_usd=pq.get("codegen_cost_usd", ""),
-        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
     )
 
     gt_path = args.ground_truth or (
         resolve_gt_file(args.ground_truth_dir, args.query)
         if args.ground_truth_dir and args.query else None)
 
-    if args.pred and gt_path:
-        gold = load_ground_truth(gt_path, cols)
-        pred = load_pred(args.pred, cols, args.pred_no_header)
-        m = prf(pred, gold)
-        metrics = {"gt_count": len(gold), "pred_count": len(pred), **m}
+    bench = (args.benchmark or "").lower()
+    if args.pred and args.query and bench and bench != "mmqa":
+        # Non-mmqa scenario → faithful SemBench-parity scoring from the GT dir.
+        gt_dir = args.ground_truth_dir or (os.path.dirname(gt_path) if gt_path else None)
+        if not gt_dir:
+            print("[eval] need --ground-truth-dir for non-mmqa scoring; writing telemetry-only row.")
+        else:
+            metrics, raw = eval_scenario(bench, args.query, args.pred, gt_dir, args.sf)
+            row.update(**metrics)
+            head = " ".join(f"{k}={v}" for k, v in metrics.items() if k != "metric")
+            print(f"[eval] {bench}/{args.query} [{metrics.get('metric','')}]: {head}")
+            if raw.get("audio_only"):
+                print(f"[eval] NOTE: {args.query} is audio-only (unsupported extraction) — score is informational.")
+            if args.telemetry and os.path.exists(args.telemetry):
+                tele["metrics"] = metrics
+                tele["ground_truth_dir"] = gt_dir
+                json.dump(tele, open(args.telemetry, "w"), indent=2)
+                print(f"[eval] wrote metrics into {args.telemetry}")
+    elif args.pred and gt_path and args.query:
+        metrics = eval_mmqa(args.query, args.pred, gt_path)
         row.update(**metrics)
-        print(f"[eval] {args.query}: GT={len(gold)} pred={len(pred)}  "
-              f"P={m['precision']} R={m['recall']} F1={m['f1']}  (tp={m['tp']} fp={m['fp']} fn={m['fn']})")
+        print(f"[eval] {args.query}: GT={metrics['gt_count']} pred={metrics['pred_count']}  "
+              f"P={metrics['precision']} R={metrics['recall']} F1={metrics['f1']}  "
+              f"(tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']})")
         print(f"[eval] ground truth: {gt_path}")
         # Persist the metrics back into telemetry.json too (not just the CSV).
         if args.telemetry and os.path.exists(args.telemetry):
@@ -163,7 +338,7 @@ def main():
             json.dump(tele, open(args.telemetry, "w"), indent=2)
             print(f"[eval] wrote metrics into {args.telemetry}")
     elif args.pred or args.ground_truth or args.ground_truth_dir:
-        print("[eval] need BOTH --pred and a ground truth to compute metrics; writing telemetry-only row.")
+        print("[eval] need --pred, a ground truth, AND --query to compute metrics; writing telemetry-only row.")
     else:
         print("[eval] telemetry-only row (no --pred/ground truth).")
 

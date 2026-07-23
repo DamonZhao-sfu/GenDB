@@ -22,6 +22,7 @@ export const defaults = {
   // Extraction models — the SMALL models that read each row/image (NOT the
   // compiler agents). Independent of the agent provider above.
   extraction: {
+    clipModel: "openai/clip-vit-base-patch32",   // tier-② CLIP for non-VLM image extraction (semvision)
     smallImageModel: "HuggingFaceTB/SmolVLM-256M-Instruct",
     strongImageModel: "Qwen/Qwen3-VL-2B-Instruct",
     smallTextModel: "Qwen/Qwen2.5-0.5B-Instruct",
@@ -51,21 +52,21 @@ export const defaults = {
 
     codex: {
       // "codex 5.6 sol" → set this to the exact model id your Codex deployment
-      // exposes. Common ids: "gpt-5.6-codex", "gpt-5.6-codex-max", "gpt-5.6".
+      // exposes. Common ids: "gpt-5.6-sol", "gpt-5.6-sol-max", "gpt-5.6".
       // Change this one line to re-point every agent, or override per-agent below.
-      model: "gpt-5.6-codex",
+      model: "gpt-5.6-luna",
       agentModels: {
-        schema_designer: "gpt-5.6-codex",
-        extractor: "gpt-5.6-codex",
-        code_generator: "gpt-5.6-codex",
+        schema_designer: "gpt-5.6-luna",
+        extractor: "gpt-5.6-luna",
+        code_generator: "gpt-5.6-luna",
       },
       // Codex effort: "minimal" | "low" | "medium" | "high" | "xhigh"
       agentEffortLevels: {
-        schema_designer: "high",
+        schema_designer: "medium",
         extractor: "low",
         code_generator: "medium",
       },
-      escalationModel: "gpt-5.6-codex",
+      escalationModel: "gpt-5.6-luna",
     },
   },
 };

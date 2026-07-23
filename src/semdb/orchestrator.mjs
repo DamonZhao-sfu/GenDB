@@ -38,8 +38,15 @@ import {
   setAgentProvider,
 } from "../gendb/shared.mjs";
 import { defaults, getAgentModel, getAgentEffort } from "./semdb.config.mjs";
+import { BENCHMARKS, SUPPORTED, tableDesc, tableFile } from "./benchmarks.mjs";
 import { config as schemaDesignerConfig } from "./agents/schema-designer/index.mjs";
 import { config as extractorConfig } from "./agents/extractor/index.mjs";
+
+/** SQL table-qualifier prefix for a benchmark (e.g. mmqa, cars_dataset). */
+function benchPrefix(bench) { return (BENCHMARKS[bench] && BENCHMARKS[bench].prefix) || bench; }
+function prefixRe(bench, tail) {
+  return new RegExp(String.raw`\b${benchPrefix(bench)}\.(\w+)` + (tail || ""), "gi");
+}
 import { config as codeGeneratorConfig } from "./agents/code-generator/index.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -47,8 +54,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 function parseArgs(argv) {
   const args = {
     query: null,
-    benchmark: defaults.benchmark,
+    benchmark: null,     // inferred from --query-dir/--data-dir path if not given
     querySource: defaults.querySource,
+    scaleFactor: null,   // sf_<N> data subdir (null = flat data/)
     sembenchDir: null,   // repo root; query-dir/data-dir derived from it if given
     queryDir: null,      // .../files/<b>/query/<dialect>
     dataDir: null,       // .../files/<b>/data/<sf>
@@ -63,6 +71,7 @@ function parseArgs(argv) {
     noRun: false,          // disable auto-run
     endpoint: null,        // vLLM/OpenAI base URL for extraction (+ residual)
     apiKey: "EMPTY",
+    concurrency: 8,        // in-flight extract.py --endpoint requests (vLLM batches server-side)
     extractModel: null,    // small VLM/LLM id (default: config extraction.small*Model)
     theta: null,
     predCols: "0,1",       // predicted columns to compare vs GT tuple order
@@ -76,6 +85,7 @@ function parseArgs(argv) {
     else if (a === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
     else if (a === "--model" && argv[i + 1]) args.modelOverride = argv[++i];
     else if (a === "--query-source" && argv[i + 1]) args.querySource = argv[++i];
+    else if (a === "--sf" && argv[i + 1]) args.scaleFactor = argv[++i];
     else if (a === "--sembench-dir" && argv[i + 1]) args.sembenchDir = resolve(argv[++i]);
     else if (a === "--query-dir" && argv[i + 1]) args.queryDir = resolve(argv[++i]);
     else if (a === "--data-dir" && argv[i + 1]) args.dataDir = resolve(argv[++i]);
@@ -87,19 +97,49 @@ function parseArgs(argv) {
     else if (a === "--no-run") args.noRun = true;
     else if (a === "--endpoint" && argv[i + 1]) args.endpoint = argv[++i];
     else if (a === "--api-key" && argv[i + 1]) args.apiKey = argv[++i];
+    else if (a === "--concurrency" && argv[i + 1]) args.concurrency = parseInt(argv[++i], 10);
     else if (a === "--extract-model" && argv[i + 1]) args.extractModel = argv[++i];
     else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
     else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
     else if (a === "--force") args.force = true;
     else if (a === "--dry-run") args.dryRun = true;
   }
-  // Derive query/data dirs from the repo root when only --sembench-dir is given.
+  // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
+  // `--data-dir .../files/cars/data/sf_9836` works WITHOUT --benchmark/--sf.
+  const infer = (p) => {
+    const m = p && p.match(/\/files\/([^/]+)(?:\/|$)/);
+    return m && SUPPORTED.includes(m[1]) ? m[1] : null;
+  };
+  if (!args.benchmark) args.benchmark = infer(args.queryDir) || infer(args.dataDir) || defaults.benchmark;
+  if (!args.sembenchDir) {
+    const src = args.dataDir || args.queryDir || "";
+    const k = src.indexOf("/files/");
+    if (k > 0) args.sembenchDir = src.slice(0, k);
+  }
+  if (!args.scaleFactor && args.dataDir) {
+    const m = basename(args.dataDir).match(/^sf_(.+)$/);
+    if (m) args.scaleFactor = m[1];
+  }
+  const b = BENCHMARKS[args.benchmark];
+  // Derive dirs from the sembench root + benchmark config when not given explicitly.
   if (args.sembenchDir) {
     const base = resolve(args.sembenchDir, "files", args.benchmark);
-    args.queryDir = args.queryDir || resolve(base, "query", args.querySource);
-    args.dataDir = args.dataDir || resolve(base, "data");
+    args.queryDir = args.queryDir || resolve(base, b ? b.queryDir : `query/${args.querySource}`);
+    if (!args.dataDir) {
+      args.dataDir = (b && b.dataLayout === "sf" && args.scaleFactor)
+        ? resolve(base, "data", `sf_${args.scaleFactor}`)
+        : resolve(base, "data");
+    }
+    if (!args.groundTruthDir && b) args.groundTruthDir = resolve(base, b.gtDir);
   }
-  if (args.dataDir && !args.imageDir) args.imageDir = resolve(args.dataDir, "images");
+  // Image root varies by scenario (imageBase): under <dataDir> ("sf"), at the
+  // sembench root for repo-relative path columns ("root"), or absolute ("absolute").
+  if (args.dataDir && !args.imageDir) {
+    const ib = b ? b.imageBase : "sf";
+    if (ib === "absolute") args.imageDir = null;                 // path column is absolute
+    else if (ib === "root") args.imageDir = args.sembenchDir || null;
+    else args.imageDir = resolve(args.dataDir, (b && b.imageRoot) || "images");
+  }
   return args;
 }
 
@@ -152,37 +192,49 @@ async function readTableHeaders(dataDir) {
 }
 
 /** Resolve a SemBench ground-truth file (Q2a.json for query q2a) + its row count. */
-async function resolveGroundTruth(gtDir, query) {
+async function resolveGroundTruth(gtDir, query, sf) {
   if (!gtDir || !query) return null;
   const n = query.replace(/^[qQ]/, "");
-  const candidates = [`${query}.json`, `Q${n}.json`, `q${n}.json`,
-    `${query.toUpperCase()}.json`, `${query[0].toUpperCase()}${query.slice(1)}.json`];
-  for (const name of candidates) {
+  const caps = [`${query}`, `Q${n}`, `q${n}`, query.toUpperCase(),
+    `${query[0].toUpperCase()}${query.slice(1)}`];
+  // JSON (mmqa) first, then CSV (every other scenario), incl. scale-suffixed CSV.
+  const json = caps.map((c) => `${c}.json`);
+  const csv = caps.flatMap((c) => sf ? [`${c}_${sf}.csv`, `${c}.csv`] : [`${c}.csv`]);
+  for (const name of [...json, ...csv]) {
     const p = resolve(gtDir, name);
-    if (existsSync(p)) {
+    if (!existsSync(p)) continue;
+    if (name.endsWith(".json")) {
       const gt = await readJSON(p);
       const rows = Array.isArray(gt?.ground_truth) ? gt.ground_truth.length
         : (Array.isArray(gt) ? gt.length : null);
-      return { file: p, count: rows, question: gt?.nl_question || null };
+      return { file: p, count: rows, format: "json", question: gt?.nl_question || null };
     }
+    return { file: p, count: await countRows(p), format: "csv", question: null };
   }
   return null;
 }
 
-/** Which SemBench table(s) does this query touch? Best-effort from the SQL. */
-function tablesInSql(sql, dataDir) {
-  const names = [...sql.matchAll(/mmqa\.(\w+)/g)].map((m) => m[1]);
+/** Which SemBench table(s) does this query touch? Config-driven from the SQL. */
+function tablesInSql(sql, args) {
+  const { benchmark: bench, scaleFactor: sf } = args;
+  const dataDir = args.tableDir || args.dataDir;   // materialized CSVs for parquet benchmarks
+  const names = [...sql.matchAll(prefixRe(bench))].map((m) => m[1]);
   const uniq = [...new Set(names)];
   return uniq.map((t) => {
-    const csv = dataDir ? resolve(dataDir, `${t}.csv`) : `${t}.csv`;
-    return { table: t, path: csv, isImages: /image/i.test(t) };
+    const d = tableDesc(bench, t);
+    const file = d ? tableFile(d, sf) : `${t}.csv`;
+    const path = (dataDir && file) ? resolve(dataDir, file) : (file || "");
+    const modality = (d && d.modality) || (/image/i.test(t) ? "image" : "text");
+    return { table: t, path, modality,
+             isImages: modality === "image", isAudio: modality === "audio",
+             col: (d && d.col) || null, key: (d && d.key) || null };
   });
 }
 
-/** alias → table map from FROM/JOIN clauses (mmqa.table alias / mmqa.table AS alias). */
-function aliasMap(sql) {
+/** alias → table map from FROM/JOIN clauses (<prefix>.table [AS] alias). */
+function aliasMap(sql, bench) {
   const m = {};
-  for (const x of sql.matchAll(/mmqa\.(\w+)\s+(?:AS\s+)?(\w+)/gi)) m[x[2]] = x[1];
+  for (const x of sql.matchAll(prefixRe(bench, String.raw`\s+(?:AS\s+)?(\w+)`))) m[x[2]] = x[1];
   return m;
 }
 
@@ -195,8 +247,8 @@ function semanticArgs(sql) {
 }
 
 /** Tables whose alias is referenced inside the semantic predicate. */
-function tablesInPredicate(sql) {
-  const amap = aliasMap(sql);
+function tablesInPredicate(sql, bench) {
+  const amap = aliasMap(sql, bench);
   const arg = semanticArgs(sql);
   const used = Object.keys(amap)
     .filter((al) => new RegExp(`\\b${al}\\.`).test(arg))
@@ -215,11 +267,17 @@ async function headerOf(path) {
  *   sem_filter / sem_map (one table):       |table|
  * Row counts read from the CSVs.
  */
-async function computeNaive(sql, dataDir) {
-  let tabs = tablesInPredicate(sql);
-  if (tabs.length === 0) tabs = [...new Set(Object.values(aliasMap(sql)))];
+async function computeNaive(sql, args) {
+  const { benchmark: bench, scaleFactor: sf } = args;
+  const dataDir = args.tableDir || args.dataDir;
+  let tabs = tablesInPredicate(sql, bench);
+  if (tabs.length === 0) tabs = [...new Set(Object.values(aliasMap(sql, bench)))];
   const counts = {};
-  for (const t of tabs) counts[t] = dataDir ? await countRows(resolve(dataDir, `${t}.csv`)) : null;
+  for (const t of tabs) {
+    const d = tableDesc(bench, t);
+    const file = d ? tableFile(d, sf) : `${t}.csv`;
+    counts[t] = (dataDir && file) ? await countRows(resolve(dataDir, file)) : null;
+  }
   if (tabs.length >= 2 && Object.values(counts).every((c) => c != null)) {
     const naive = Object.values(counts).reduce((a, b) => a * b, 1);
     return { type: "join", naive, tables: tabs, counts };
@@ -229,21 +287,19 @@ async function computeNaive(sql, dataDir) {
 }
 
 /**
- * Choose the "corpus" table to extract from: the image table if any, else the
- * predicate-referenced table that has a text-like column (text/description/...).
+ * Choose the "corpus" table to extract from, using the config modality: prefer an
+ * IMAGE table referenced in the predicate, then a TEXT one. AUDIO-only queries have
+ * no supported corpus — the caller detects `modality === "audio"` and skips them.
  */
-async function chooseCorpus(sql, tables, dataDir) {
-  const img = tables.find((t) => t.isImages);
-  if (img) return img;
-  const used = tablesInPredicate(sql);
-  const TEXT = /(^|,)\s*(text|description|overview|body|content|synopsis|plot)\s*(,|$)/i;
-  for (const t of used) {
-    const path = dataDir ? resolve(dataDir, `${t}.csv`) : `${t}.csv`;
-    if (TEXT.test(await headerOf(path))) return { table: t, path, isImages: false };
-  }
-  // fallback: any table with a text column, else the last table.
-  for (const t of tables) if (TEXT.test(await headerOf(t.path))) return t;
-  return tables[tables.length - 1] || { table: "corpus", path: "" };
+async function chooseCorpus(sql, tables, args) {
+  const used = new Set(tablesInPredicate(sql, args.benchmark));
+  const inPred = tables.filter((t) => used.has(t.table));
+  const pick = (cands) =>
+    cands.find((t) => t.modality === "image") ||
+    cands.find((t) => t.modality === "text") || null;
+  return pick(inPred) || pick(tables) ||
+    tables.find((t) => t.modality === "audio") ||   // audio-only → caller skips
+    tables[tables.length - 1] || { table: "corpus", path: "", modality: "text", isImages: false };
 }
 
 /** List query ids (<name>.sql → <name>) in a query dir, sorted. */
@@ -301,15 +357,20 @@ function agentModelsLine(args) {
   return `designer=${m("schema_designer")}, extractor=${m("extractor")}, codegen=${m("code_generator")}`;
 }
 
-/** Guess corpus columns + the small model for extraction. */
+/** Corpus columns + the small model for extraction. Prefer the benchmark config's
+ *  extract column / key; fall back to header heuristics for unknown tables. */
 async function corpusCols(corpus, args) {
   let cols = [];
   try { cols = (await headerOf(corpus.path)).split(",").map((c) => c.trim()); } catch { /* unreadable */ }
   const isImage = corpus.isImages;
+  const key = corpus.key || cols[0] || (isImage ? "uri" : "id");
+  const textCol = (!isImage && corpus.col) || cols.find((c) => /text|description|overview|body|content|summary|symptoms|review|complaint|plot|display/i.test(c)) || cols[cols.length - 1] || "text";
+  const imageCol = (isImage && corpus.col) || cols.find((c) => /image|uri|path|file|ref/i.test(c)) || cols[0] || "uri";
   return {
-    idCol: cols[0] || (isImage ? "uri" : "id"),
-    textCol: cols.find((c) => /text|description|overview|body|content/i.test(c)) || cols[cols.length - 1] || "text",
-    imageCol: cols.find((c) => /image|uri|path|file/i.test(c)) || cols[0] || "uri",
+    cols,
+    idCol: key,
+    textCol,
+    imageCol,
     extractModel: args.extractModel || (isImage ? defaults.extraction.smallImageModel : defaults.extraction.smallTextModel),
   };
 }
@@ -319,12 +380,15 @@ async function corpusCols(corpus, args) {
 // ---------------------------------------------------------------------------
 async function planQuery(args, query) {
   const { sql, nl } = await loadQuery({ ...args, query });
-  const tables = tablesInSql(sql, args.dataDir);
-  const corpus = await chooseCorpus(sql, tables, args.dataDir);
-  const structured = tables.find((t) => !t.isImages && t.path !== corpus.path)
-    || tables.find((t) => !t.isImages) || corpus;
-  const plan = await computeNaive(sql, args.dataDir);
-  return { query, sql, nl, tables, corpus, structured, isImage: !!corpus.isImages, plan };
+  const tables = tablesInSql(sql, args);
+  const corpus = await chooseCorpus(sql, tables, args);
+  // structured side = a non-corpus, non-image/audio (relational) table if any
+  const structured = tables.find((t) => t.modality === "structured" && t.path !== corpus.path)
+    || tables.find((t) => !t.isImages && !t.isAudio && t.path !== corpus.path)
+    || tables.find((t) => t.path !== corpus.path) || corpus;
+  const plan = await computeNaive(sql, args);
+  return { query, sql, nl, tables, corpus, structured,
+           isImage: corpus.modality === "image", isAudio: corpus.modality === "audio", plan };
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +401,7 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   const attrsPath = resolve(corpusDir, `${corpus.table}_attrs.json`);
   const isImage = corpus.isImages;
   const modality = isImage ? "image" : "text";
-  const { idCol, textCol, imageCol, extractModel } = await corpusCols(corpus, args);
+  const { cols, idCol, textCol, imageCol, extractModel } = await corpusCols(corpus, args);
   const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
 
   const phases = [];
@@ -372,13 +436,42 @@ async function ensureCorpus(args, corpus, corpusQueries) {
     console.log(`[SemDB] corpus ${corpus.table} not decomposable: ${schema.rationale}`);
   }
 
-  // Phase B — Extractor ONCE (deterministic extract.py). Skip if attrs cached.
-  if (doRun && (!existsSync(attrsPath) || args.force)) {
-    const exArgs = [resolve(__dirname, "extract.py"), "--schema", schemaPath, "--table", corpus.path,
-      "--modality", modality, "--id-col", idCol,
-      ...(isImage ? ["--image-col", imageCol, "--image-dir", args.imageDir] : ["--text-col", textCol]),
-      "--model", extractModel, "--out", attrsPath,
-      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey] : []),
+  // Phase B — Extractor ONCE, in two steps mirroring Phase C (Code Generator):
+  //   1. GENERATE a thin per-corpus driver (agent) -> extract_<corpus>.py that
+  //      implements the semextract ExtractDriver hooks (column mapping, prompt +
+  //      context columns, preprocessing) and calls semextract.run(...).
+  //   2. EXECUTE it (orchestrator) on the full corpus -> attrs + <attrs>.meta.json.
+  // Both cache per corpus (amortized across all its queries).
+  const driverPath = resolve(corpusDir, `extract_${corpus.table}.py`);
+  if (!existsSync(driverPath) || args.force) {          // agent artifact step (like schema design); runPhase handles --dry-run
+    record("extractor", await runPhase(extractorConfig, {
+      corpus_name: corpus.table,
+      schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
+      schema_path: schemaPath,
+      header: cols.join(", "),
+      modality,
+      id_col: idCol, text_col: textCol, image_col: imageCol,
+      image_dir: args.imageDir || "",
+      small_model: extractModel,
+      escalation_model: defaults.extraction.escalationImageModel,
+      corpus_manifest: corpus.path,
+      corpus_size: `(rows in ${basename(corpus.path)})`,
+      driver_path: driverPath,
+      attrs_path: attrsPath,
+      semextract_path: resolve(__dirname, "semextract.py"),
+    }, corpusDir, args));
+  } else if (existsSync(driverPath)) {
+    console.log(`[SemDB] reuse cached corpus extractor driver: ${driverPath}`);
+  }
+  if (doRun && !args.dryRun && existsSync(driverPath) && (!existsSync(attrsPath) || args.force)) {
+    // IMAGE corpora extract locally via semvision (tiered CV+CLIP proxies) — the model
+    // is the CLIP id and NO vLLM endpoint is needed. TEXT corpora keep the endpoint path.
+    const imageModel = args.extractModel || defaults.extraction.clipModel;
+    const exArgs = [driverPath, corpus.path, attrsPath, "--schema", schemaPath,
+      "--model", (isImage ? imageModel : extractModel),
+      ...(isImage ? ["--image-dir", args.imageDir] : []),
+      ...(!isImage && args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey,
+                           "--concurrency", String(args.concurrency)] : []),
       ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
     console.log(`\n[SemDB] Extracting corpus ${corpus.table} (once): python3 ${exArgs.join(" ")}`);
     const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
@@ -389,6 +482,7 @@ async function ensureCorpus(args, corpus, corpusQueries) {
 
   const extMeta = await readJSON(attrsPath + ".meta.json");
   const sd = phases.filter((p) => p.phase === "schema_designer");
+  const ext = phases.filter((p) => p.phase === "extractor");
   const corpusTelemetry = {
     corpus: corpus.table,
     modality,
@@ -399,6 +493,11 @@ async function ensureCorpus(args, corpus, corpusQueries) {
       calls: sd.reduce((s, p) => s + p.llm_calls, 0),
       cost_usd: sd.reduce((s, p) => s + p.cost_usd, 0),
       model: agentModelsLine(args),
+    },
+    extractor_codegen: {
+      ms: ext.reduce((s, p) => s + p.duration_ms, 0),
+      calls: ext.reduce((s, p) => s + p.llm_calls, 0),
+      cost_usd: ext.reduce((s, p) => s + p.cost_usd, 0),
     },
     extraction: {
       sec: extMeta?.elapsed_sec ?? null,
@@ -467,7 +566,7 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   const amortizedTotal = cg.llm_calls + residualCalls + (schemaCalls + extractionCalls) / K;
   const codegenCost = cg.cost_usd;
   const amortizedCost = codegenCost + (corpusTelemetry.schema_design.cost_usd || 0) / K;
-  const gt = await resolveGroundTruth(args.groundTruthDir, query);
+  const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
 
   const report = {
     query, corpus: corpus.table, provider: args.agentProvider, operator: plan.type,
@@ -516,7 +615,9 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   if (doRun && gt && existsSync(resultsCsv)) {
     const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
       "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
-      "--query", query, "--csv", csvPath];
+      "--query", query, "--benchmark", args.benchmark, "--csv", csvPath,
+      ...(args.groundTruthDir ? ["--ground-truth-dir", args.groundTruthDir] : []),
+      ...(args.scaleFactor ? ["--sf", String(args.scaleFactor)] : [])];
     const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
     if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
     const scored = await readJSON(telePath);
@@ -544,12 +645,40 @@ async function main() {
   console.log(`[SemDB] provider=${base.agentProvider} models: ${agentModelsLine(base)}`);
   console.log(`[SemDB] processing ${queries.length} quer${queries.length === 1 ? "y" : "ies"}: ${queries.join(", ")}`);
 
+  // 0) PARQUET benchmarks (ecomm): materialize tables + image manifest to CSV ONCE,
+  //    then resolve table files from that dir (images stay in <dataDir>/images).
+  base.tableDir = base.dataDir;
+  const bcfg = BENCHMARKS[base.benchmark];
+  if (bcfg && bcfg.parquet && base.dataDir && !base.dryRun) {
+    const matDir = resolve(base.out, "_materialized", `${base.benchmark}_sf${base.scaleFactor || "flat"}`);
+    const mArgs = [resolve(__dirname, "materialize.py"), base.benchmark, base.dataDir, matDir,
+      ...(base.force ? ["--force"] : [])];
+    console.log(`[SemDB] materializing parquet → CSV: python3 ${mArgs.join(" ")}`);
+    const mp = spawnSync("python3", mArgs, { stdio: "inherit" });
+    if (mp.status !== 0) console.warn(`[SemDB] materialize.py exited ${mp.status} (needs pandas — run under gendb/sembench env).`);
+    else base.tableDir = matDir;
+  }
+
   // 1) Plan every query and group by corpus (the extract-side table).
-  const plans = [];
+  const allPlans = [];
   for (const q of queries) {
-    try { plans.push(await planQuery(base, q)); }
+    try { allPlans.push(await planQuery(base, q)); }
     catch (e) { console.error(`[SemDB] [${q}] plan failed: ${e.message}`); }
   }
+  // Skip queries we can't run: audio corpora, or a corpus whose table file didn't
+  // resolve (usually a wrong/missing --benchmark so the SQL prefix matched nothing).
+  const plans = allPlans.filter((p) => {
+    if (p.isAudio || p.corpus.modality === "audio") {
+      console.warn(`[SemDB] [${p.query}] SKIP: audio-modality corpus '${p.corpus.table}' is not supported.`);
+      return false;
+    }
+    if (!p.corpus.path || !existsSync(p.corpus.path)) {
+      console.warn(`[SemDB] [${p.query}] SKIP: corpus table not found ('${p.corpus.table}' → '${p.corpus.path || "<empty>"}'). `
+        + `Check --benchmark (got '${base.benchmark}') and --sf so the SQL prefix '${benchPrefix(base.benchmark)}.' matches.`);
+      return false;
+    }
+    return true;
+  });
   const corpora = new Map();
   for (const p of plans) {
     const key = p.corpus.table;
