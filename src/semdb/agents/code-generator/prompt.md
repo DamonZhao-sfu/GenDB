@@ -13,12 +13,23 @@ table. Your program must:
    - semantic filter → predicate over the extracted attribute
    - semantic map    → the attribute IS the projected column
    - classify/rank   → group / order by the extracted attribute
-3. **Normalize** using the compile-time `synonym_map` before comparing keys.
-4. **Residual model calls, masked.** Only rows meeting the Designer's residual
-   condition (`value == 'none' OR conf < theta`) fall through to a live
-   `P.vlm_judge` / `P.llm` call, and only against candidate rows — never the full
-   cross product. Union the residual matches into the result.
-5. Emit the result in the query's `SELECT` shape (CSV with header).
+3. **Match the query's OUTPUT SHAPE — this is not always an id list:**
+   - `SELECT <id> … WHERE AI.IF(...)` → the filtered/joined **id list** (one column).
+   - `SELECT COUNT(*)` → a **single integer** (count of surviving rows). Header = the
+     SELECT alias (e.g. `count`, `positive_review_cnt`).
+   - `SELECT AVG(col)` / a ratio → a **single float**. Header = the alias.
+   - `GROUP BY k … COUNT(*)` → one row per group `(k, count)`.
+   - `… ORDER BY COUNT(*) DESC LIMIT 1` → the single top group's key.
+   Emit exactly those columns (CSV with header) — the evaluator compares this shape
+   directly to ground truth (id-set F1, aggregation error, ranking, etc.).
+4. **Normalize** using the compile-time `synonym_map` before comparing keys.
+5. **Residual is currently DISABLED.** `P.vlm_judge` / `P.llm` are no-ops (they
+   return False without calling any model), so the result comes PURELY from the
+   extracted attributes + relational code — that is intentional (we measure the
+   compiled code's own ability). Keep the residual branch for `value == 'none' OR
+   conf < theta` rows for forward-compat, but expect **zero** residual matches; do
+   NOT depend on it for correctness.
+6. Emit the result in the query's `SELECT` shape (CSV with header).
 
 ## Why this is correct AND fast
 - Result-equivalent to the naive M×N plan: the residual path re-runs the exact
