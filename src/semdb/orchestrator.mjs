@@ -950,19 +950,31 @@ async function runQueryDirect(args, planObj, csvPath) {
     const kind = t.isImages ? "image manifest" : (t.modality || "table");
     tableLines.push(`- ${t.table} (${kind}): path=${t.path}\n    columns: ${await headerOf(t.path)}`);
   }
-  const imgHeader = await headerOf(corpus.path);
-  const { filename: imgFilenameCol, filepath: imgFilepathCol } = pickImageCols(imgHeader);
-  const imageDir = args.imageDir || (corpus.path ? resolve(dirname(corpus.path), "images") : "");
+  const isImage = corpus.isImage || corpus.modality === "image";
+  let imgFilenameCol = "", imgFilepathCol = "", imageDir = "";
+  if (isImage) {
+    const imgHeader = await headerOf(corpus.path);
+    ({ filename: imgFilenameCol, filepath: imgFilepathCol } = pickImageCols(imgHeader));
+    imageDir = args.imageDir || (corpus.path ? resolve(dirname(corpus.path), "images") : "");
+  }
 
   const codeBasename = `solve_${query}.py`;
   const clipModel = args.clipModel || defaults.extraction.clipModel;
   const dataDir = args.tableDir || args.dataDir;
   const telePath = resolve(runDir, "telemetry.json");
 
+  const textModel = args.extractModel || defaults.extraction.smallTextModel;
+  const sysPrompts = isImage
+    ? {}
+    : { sig: vadarSignatureConfig.promptPathText, api: vadarApiConfig.promptPathText, solver: vadarSolverConfig.promptPathText };
+
   const runSolver = (iterDir, iterCode, iterCsv) => {
     if (!(doRun && existsSync(iterCode))) return { status: "empty", stderr: "" };
-    const sArgs = [iterCode, iterCsv, "--data-dir", dataDir,
-      ...(imageDir ? ["--image-dir", imageDir] : []), "--clip-model", clipModel];
+    const sArgs = isImage
+      ? [iterCode, iterCsv, "--data-dir", dataDir, ...(imageDir ? ["--image-dir", imageDir] : []),
+         "--clip-model", clipModel]
+      : [iterCode, iterCsv, "--data-dir", dataDir,
+         "--endpoint", args.endpoint || "", "--model", textModel, "--api-key", args.apiKey];
     console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
     const s = spawnSync("python3", sArgs, { stdio: ["inherit", "inherit", "pipe"] });
     const stderr = (s.stderr || "").toString();
@@ -970,37 +982,42 @@ async function runQueryDirect(args, planObj, csvPath) {
     return { status: "ok", stderr };
   };
 
+  // Solver template vars differ by modality: image gets manifest cols, text does not.
+  const solverVars = (iterCode, querySql, helpersPath) => isImage
+    ? { query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
+        tables_doc: tableLines.join("\n"),
+        image_table: corpus.table, image_path: corpus.path,
+        image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
+        image_dir: imageDir, helpers_path: helpersPath, solve_path: iterCode }
+    : { query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
+        tables_doc: tableLines.join("\n"), helpers_path: helpersPath, solve_path: iterCode };
+
   // The 3 agents (Signature → API → Solver) generate iter_0's solve_<q>.py.
   const gen3Agents = async (iterDir, iterCode, querySql) => {
     const sigPath = resolve(iterDir, `_vadar_signatures_${query}.txt`);
     const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
     const common = { corpus_name: corpus.table, semdb_dir: __dirname };
     record("vadar_signature", await runPhase(vadarSignatureConfig, {
-      ...common, query_sql: querySql, schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
+      ...common, query_sql: querySql,
+      schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
       sig_path: sigPath,
-    }, iterDir, args));
+    }, iterDir, args, { systemPromptPath: sysPrompts.sig }));
     record("vadar_api", await runPhase(vadarApiConfig, {
       ...common, sig_path: sigPath, helpers_path: helpersPath,
-    }, iterDir, args));
-    record("vadar_solver", await runPhase(vadarSolverConfig, {
-      query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
-      tables_doc: tableLines.join("\n"),
-      image_table: corpus.table, image_path: corpus.path,
-      image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
-      image_dir: imageDir, helpers_path: helpersPath, solve_path: iterCode,
-    }, iterDir, args));
+    }, iterDir, args, { systemPromptPath: sysPrompts.api }));
+    record("vadar_solver", await runPhase(vadarSolverConfig,
+      solverVars(iterCode, querySql, helpersPath),
+      iterDir, args, { systemPromptPath: sysPrompts.solver }));
   };
 
-  // Refinement iterations re-invoke ONLY the Solver, editing the seeded code with feedback.
   const regenSolver = async (iterDir, iterCode, feedback) => {
+    // Helpers were generated ONCE into iter_0 (refineLoop seeds only code forward) — read
+    // from iter_0, not the current iterDir which has no helpers file.
     const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
-    record("vadar_solver", await runPhase(vadarSolverConfig, {
-      query_id: query, query_sql: sql + "\n\n" + feedback, query_nl: nl || "(none)", semdb_dir: __dirname,
-      tables_doc: tableLines.join("\n"),
-      image_table: corpus.table, image_path: corpus.path,
-      image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
-      image_dir: imageDir, helpers_path: existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)", solve_path: iterCode,
-    }, iterDir, args));
+    const vars = solverVars(iterCode, sql + "\n\n" + feedback,
+      existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)");
+    record("vadar_solver", await runPhase(vadarSolverConfig, vars, iterDir, args,
+      { systemPromptPath: sysPrompts.solver }));
   };
 
   const genFirst = async (iterDir, iterCode, iterCsv) => {
