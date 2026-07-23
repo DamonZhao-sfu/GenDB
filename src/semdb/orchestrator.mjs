@@ -330,7 +330,11 @@ async function resolveLabelsFrom(schema, args) {
   for (const a of schema.attributes || []) {
     const lf = a.extractor && a.extractor.labels_from;
     if (!lf || (a.extractor.labels && a.extractor.labels.length)) continue;
-    const [tbl, col] = String(lf).split(".");
+    // Accept "table.column" OR a prefixed "<benchmark>.table.column" (as the SQL writes
+    // it): the LAST segment is the column, the one before it is the table.
+    const parts = String(lf).split(".");
+    const col = parts.pop();
+    const tbl = parts.pop();
     const d = tableDesc(args.benchmark, tbl);
     const file = d ? tableFile(d, args.scaleFactor) : `${tbl}.csv`;
     const vals = await distinctValues(resolve(tableDir, file), col);
