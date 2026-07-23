@@ -4,7 +4,7 @@
 
 **Goal:** Add a GenDB-style iterative refinement loop (max 5 iterations) around every per-query SemDB code generator, and extend `--direct` so text-only SemBench queries compile into an end-to-end `solve_<q>.py` that does semantic inference in code by composing a predefined text API.
 
-**Architecture:** `evaluate.py` gains `--emit-diff` to surface the concrete false-positive/false-negative rows that cost precision/recall. `orchestrator.mjs` gains a `refineLoop` helper (shared by the compiled path, image-DIRECT, and text-DIRECT) that re-invokes the same generating agent with a feedback block, re-runs, re-scores, and keeps the change only if F1 improves (else rolls back), stopping on F1==1.0 / 2 non-improving / max 5. Text DIRECT adds `vadar/predefined_text.py` + `semtext.py` (the text analogs of `predefined.py` + `semvision.py`) and modality-aware system prompts for the existing VADAR 3 agents.
+**Architecture:** `evaluate.py` gains `--emit-diff` to surface the concrete false-positive/false-negative rows that cost precision/recall. `orchestrator.mjs` gains a `refineLoop` helper (shared by the compiled path, image-DIRECT, and text-DIRECT) that re-invokes the same generating agent with a feedback block, re-runs, re-scores, and keeps the change only if F1 improves (else rolls back), stopping on F1==1.0 / 2 non-improving / max 5. Text DIRECT adds `vadar/predefined_text.py` + `semtext.py` (the text analogs of `predefined.py` + `semvision.py`) and modality-aware system prompts for the existing VADAR 3 agents. In the SchemaDesigner→Extractor→CodeGenerator (compiled) mode, the loop already iterates `compiled_<q>.py`; the text **Extractor** is additionally moved to compose the same `predefined_text` API through a new `semtext.run_extraction` engine (the text analog of how the image Extractor composes the vision API via `vadar_engine.run`), so offline text extraction and text DIRECT share one inference surface.
 
 **Tech Stack:** Node.js ESM (`orchestrator.mjs`, agent `index.mjs`), Python 3.10+ stdlib (`evaluate.py`, `semtext.py`, `predefined_text.py`), pytest for Python tests, OpenAI-compatible endpoint via `semextract.gen_endpoint`.
 
@@ -33,6 +33,7 @@
 - `src/semdb/tests/test_evaluate_emit_diff.py`
 - `src/semdb/tests/test_semtext_fake_endpoint.py`
 - `src/semdb/tests/test_predefined_text.py`
+- `src/semdb/tests/test_semtext_run_extraction.py` — the offline text-extraction engine (compiled-mode feature 2).
 - `src/semdb/tests/test_refine_pure.mjs` — node assertions for the pure loop-control functions.
 
 **Modified**
@@ -40,6 +41,10 @@
 - `src/semdb/semdb.config.mjs` — add `maxRefineIterations`, `refineStallThreshold`, `refineSampleCap` to `defaults`.
 - `src/semdb/orchestrator.mjs` — `parseArgs` (`--max-iterations`, `--no-refine`); `runPhase` (`systemPromptPath` override); `shouldContinueSemdb`, `checkSemdbImprovement`, `renderFeedback`, `refineLoop`; wire into `runQueryCodegen`, `runQueryDirect` (image + text branches); text routing.
 - `src/semdb/agents/vadar-signature/index.mjs`, `.../vadar-api/index.mjs`, `.../vadar-solver/index.mjs` — add `promptPathText`.
+- `src/semdb/semtext.py` — add `run_extraction(...)` (offline corpus extraction engine composing `predefined_text`; matches `semextract.run`'s attrs+meta output) and make `METER` increment thread-safe. (compiled-mode feature 2)
+- `src/semdb/agents/extractor/prompt.md`, `.../extractor/user-prompt.md` — the TEXT driver composes `predefined_text` over `semtext.TextPatch` and calls `semtext.run_extraction` (the text analog of the image driver's `vadar_engine.run`). (compiled-mode feature 2)
+
+> **Compiled-mode coverage of the two features.** Feature 1 (the refine loop) already iterates `compiled_<q>.py` — Task 4. Feature 2 (in-code text semantic inference) is added to the compiled path by moving the offline **text Extractor** onto `predefined_text` via `semtext.run_extraction` (Tasks 10–11); inference stays offline/amortized, so `compiled_<q>.py` remains pure relational and the loop needs no change.
 
 ---
 
@@ -1453,7 +1458,322 @@ git commit -m "feat(semdb): route text corpora through DIRECT mode (text solver 
 
 ---
 
-## Task 10: End-to-end verification + regression
+## Task 10: `semtext.run_extraction` — offline text-extraction engine (compiled mode)
+
+**Files:**
+- Modify: `src/semdb/semtext.py`
+- Test: `src/semdb/tests/test_semtext_run_extraction.py`
+
+**Interfaces:**
+- Consumes: `TextPatch`, `get_ctx`, `METER`, `semextract.gen_endpoint` (via `TextPatch`).
+- Produces: `run_extraction(driver, schema, table_path, out_path, *, model, endpoint=None, api_key="EMPTY", concurrency=8, theta=None, text_col=None, limit=0, timeout=120) -> dict`. `driver` has `map_columns(header) -> {"id", "text", "context"}` and `extract(patch) -> {field: value}`. Writes `out_path` (JSON list of `{**fields, "conf", <id_col>}`) + `out_path + ".meta.json"` (same keys as `semextract.run`'s meta: `rows, extracted, none, llm_calls, elapsed_sec, ...`). Returns the meta dict.
+
+The output contract MUST match `semextract.run` so `compiled_<q>.py` and the corpus telemetry read the attrs + meta unchanged: attrs is a JSON list of per-row records, each record has every `schema.attributes[].name` key, a `conf` float, and the id column; meta has at least `rows`, `llm_calls`, `elapsed_sec`.
+
+- [ ] **Step 1: Make `METER` increment thread-safe**
+
+`run_extraction` dispatches rows concurrently (endpoint calls are HTTP/thread-safe), so `METER.calls += 1` inside `_ask` races. Add a lock. In `src/semdb/semtext.py`, change `_Meter` and the increment in `_ask`:
+
+```python
+import threading
+
+class _Meter:
+    def __init__(self) -> None:
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.calls = 0
+
+    def incr(self) -> None:
+        with self._lock:
+            self.calls += 1
+```
+
+In `_ask`, replace `METER.calls += 1` with `METER.incr()`.
+
+- [ ] **Step 2: Write the failing test**
+
+```python
+# src/semdb/tests/test_semtext_run_extraction.py
+import json, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import semtext
+
+
+def _fake_gen(monkeypatch):
+    import semextract
+    def fake(cfg, json_schema, prompt, modality, image_path=None, text=None):
+        # classify → return the label that appears in the text; else first option.
+        return json.dumps({"value": "positive" if "great" in (text or "") else "negative"})
+    monkeypatch.setattr(semextract, "gen_endpoint", fake)
+
+
+class _Driver:
+    def map_columns(self, header):
+        return {"id": "id", "text": "review", "context": []}
+    def extract(self, patch):
+        return {"sentiment": patch.classify(["positive", "negative"])}
+
+
+def test_run_extraction_writes_attrs_and_meta(tmp_path, monkeypatch):
+    _fake_gen(monkeypatch)
+    semtext.METER.reset()
+    table = tmp_path / "reviews.csv"
+    table.write_text("id,review\n1,a great film\n2,a dull film\n")
+    schema = {"attributes": [{"name": "sentiment", "type": "string"}]}
+    out = tmp_path / "attrs.json"
+    meta = semtext.run_extraction(_Driver(), schema, str(table), str(out),
+                                  model="m", endpoint="http://x/v1", concurrency=2)
+    recs = json.load(open(out))
+    assert {r["id"]: r["sentiment"] for r in recs} == {"1": "positive", "2": "negative"}
+    assert all("conf" in r for r in recs)
+    m = json.load(open(str(out) + ".meta.json"))
+    assert m["rows"] == 2 and m["llm_calls"] == meta["llm_calls"] == 2
+```
+
+- [ ] **Step 3: Run test to verify it fails**
+
+Run: `cd src/semdb && python3 -m pytest tests/test_semtext_run_extraction.py -v`
+Expected: FAIL — `AttributeError: module 'semtext' has no attribute 'run_extraction'`.
+
+- [ ] **Step 4: Implement `run_extraction`**
+
+Append to `src/semdb/semtext.py`:
+
+```python
+import csv as _csv
+import json as _json
+import os as _os
+import sys as _sys
+import time as _time
+from concurrent.futures import ThreadPoolExecutor
+
+
+def _none_record(schema, id_col, id_val):
+    rec = {a["name"]: ([] if "array" in a.get("type", "") or a.get("multi") else "none")
+           for a in schema.get("attributes", [])}
+    rec["conf"] = 0.0
+    rec[id_col] = id_val
+    return rec
+
+
+def run_extraction(driver, schema, table_path, out_path, *, model, endpoint=None,
+                   api_key="EMPTY", concurrency=8, theta=None, text_col=None,
+                   limit=0, timeout=120):
+    """Offline TEXT extraction engine (text analog of semextract.run / vadar_engine.run).
+    For each corpus row it builds a TextPatch and calls driver.extract(patch), which
+    composes predefined_text primitives. Writes attrs JSON + <out>.meta.json with the
+    SAME contract as semextract.run. Returns the meta dict. Aborts (exit 3) without
+    writing out_path if most rows error, so the orchestrator re-runs rather than caching
+    a broken corpus."""
+    ctx = get_ctx(model, endpoint or "", api_key, timeout)
+    rows = list(_csv.DictReader(open(table_path)))
+    if limit:
+        rows = rows[:limit]
+    cols = driver.map_columns(list(rows[0].keys()) if rows else [])
+    id_col = cols["id"]
+    tcol = text_col or cols.get("text")
+    METER.reset()
+    t_start = _time.time()
+    attrs = [None] * len(rows)
+    n_none = n_error = 0
+
+    def process_row(i, r):
+        id_val = r[id_col]
+        try:
+            patch = TextPatch(r.get(tcol, "") if tcol else "", ctx)
+            fields = driver.extract(patch) or {}
+            rec = dict(fields)
+            primary = schema.get("attributes", [{}])[0].get("name")
+            val = rec.get(primary)
+            rec["conf"] = 0.0 if val in (None, "none", "", []) else 1.0
+            rec[id_col] = id_val
+            return {"i": i, "rec": rec, "error": None}
+        except Exception as e:  # noqa: BLE001 — one bad row must not kill the batch
+            return {"i": i, "rec": _none_record(schema, id_col, id_val), "error": str(e)}
+
+    def tally(res):
+        nonlocal n_none, n_error
+        attrs[res["i"]] = res["rec"]
+        if res["error"]:
+            n_error += 1
+            print(f"[semtext] {res['i']+1}/{len(rows)} ERROR: {res['error']}")
+        elif res["rec"].get("conf", 0.0) == 0.0:
+            n_none += 1
+
+    workers = max(1, concurrency)
+    if workers > 1 and endpoint:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for res in ex.map(process_row, range(len(rows)), rows):
+                tally(res)
+    else:
+        for i, r in enumerate(rows):
+            tally(process_row(i, r))
+
+    attrs = [a for a in attrs if a is not None]
+    elapsed = _time.time() - t_start
+    if len(rows) > 0 and n_error >= max(1, len(rows) // 2):
+        _sys.stderr.write(f"[semtext] ABORT: {n_error}/{len(rows)} rows errored — likely a "
+                          f"bad endpoint/model/creds. Not writing {out_path}.\n")
+        _sys.exit(3)
+
+    _json.dump(attrs, open(out_path, "w"), indent=2)
+    meta = {
+        "model": model, "endpoint": endpoint, "modality": "text",
+        "rows": len(attrs), "extracted": len(attrs) - n_none, "none": n_none,
+        "errors": n_error, "llm_calls": METER.calls, "theta": theta,
+        "elapsed_sec": round(elapsed, 2),
+        "sec_per_row": round(elapsed / max(1, len(attrs)), 3),
+        "concurrency": workers,
+    }
+    _json.dump(meta, open(out_path + ".meta.json", "w"), indent=2)
+    print(f"[semtext] wrote {len(attrs)} rows -> {out_path} ({elapsed:.1f}s, "
+          f"{meta['llm_calls']} llm calls, {n_none} none)")
+    return meta
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `cd src/semdb && python3 -m pytest tests/test_semtext_run_extraction.py tests/test_semtext_fake_endpoint.py -v`
+Expected: PASS (the new test + the Task 6 tests still green after the METER lock change).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/semdb/semtext.py src/semdb/tests/test_semtext_run_extraction.py
+git commit -m "feat(semdb): semtext.run_extraction offline text-extraction engine (compiled-mode text inference)"
+```
+
+---
+
+## Task 11: Text Extractor composes `predefined_text`
+
+**Files:**
+- Modify: `src/semdb/agents/extractor/prompt.md`
+- Modify: `src/semdb/agents/extractor/user-prompt.md`
+
+**Interfaces:**
+- Consumes: `semtext.run_extraction`, `vadar/predefined_text.py`.
+- Produces: for a TEXT corpus, the generated `extract_<corpus>.py` composes `predefined_text` over `semtext.TextPatch` and calls `semtext.run_extraction` (instead of `semextract.run`). The orchestrator's extraction invocation is UNCHANGED (same positional `table out` + `--schema --model --endpoint --api-key --concurrency --theta` flags).
+
+> No orchestrator or `ensureCorpus` change: the text-extraction invocation already passes `--endpoint --api-key --concurrency --model` for text corpora (see `orchestrator.mjs` `ensureCorpus`), and `run_extraction` accepts exactly those. Only the generated driver's body changes.
+
+- [ ] **Step 1: Update `agents/extractor/prompt.md` — add the TEXT composition path**
+
+The prompt currently says (near the end of the Image section) "TEXT corpora still use `semextract.run`." Replace that sentence and add a TEXT section mirroring the IMAGE one. Find:
+
+```
+`--model` is the CLIP id; NO `--endpoint`. TEXT corpora still use `semextract.run`.
+(Reference compositions + engine: `src/semdb/vadar_run.py`, `src/semdb/vadar_engine.py`.)
+```
+
+Replace with:
+
+```
+`--model` is the CLIP id; NO `--endpoint`.
+(Reference compositions + engine: `src/semdb/vadar_run.py`, `src/semdb/vadar_engine.py`.)
+
+## Text corpora — compose the predefined TEXT API (in-code semantic inference)
+When the corpus modality is TEXT, do NOT hand-roll endpoint/JSON plumbing. You WRITE a
+`Driver.extract(patch) -> {field: value, ...}` that composes the predefined TEXT API
+(`judge / classify / extract / generate / score` from `vadar/predefined_text.py`, backed
+by `semtext.TextPatch`) — the text analog of the image `Driver.extract(patch)` that
+composes ImagePatch. Pick the lightest primitive per schema attribute:
+
+- boolean AI.IF predicate → `judge(patch, "<yes/no question>")`
+- a value from a CLOSED value space (enum / DB column) → `classify(patch, LABELS)`
+- one named attribute → `extract(patch, "<field>")`
+- a soft/relevance score → `score(patch, "<short phrase>")`
+
+Value-space lists come from the schema's `labels` (already filled from `labels_from`).
+The returned value IS the field value (joins/filters downstream). Emit exactly this shape
+(the orchestrator runs it with `<table> <attrs> --schema S --model M --endpoint U --api-key K
+--concurrency N`):
+
+```python
+import sys, os, json, argparse
+sys.path.insert(0, "<dir containing semtext.py>")   # given to you (semdb_dir)
+import semtext
+from vadar.predefined_text import judge, classify, extract, score
+
+LABELS = [...]                      # e.g. from schema.attributes[].labels
+
+class Driver:
+    def map_columns(self, header):
+        return {"id": "<id col>", "text": "<text col>", "context": ["<extra cols>"]}
+    def extract(self, patch):
+        # ONE entry per schema attribute, composing predefined_text over `patch`.
+        return {"sentiment": classify(patch, LABELS)}
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("table"); ap.add_argument("out")
+    ap.add_argument("--schema", required=True); ap.add_argument("--model", required=True)
+    ap.add_argument("--endpoint"); ap.add_argument("--api-key", default="EMPTY")
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--image-dir"); ap.add_argument("--theta")   # accepted, ignored
+    a = ap.parse_args()
+    semtext.run_extraction(Driver(), json.load(open(a.schema)), a.table, a.out,
+                           model=a.model, endpoint=a.endpoint, api_key=a.api_key,
+                           concurrency=a.concurrency, theta=a.theta)
+```
+`--model` is the endpoint LLM id; `--endpoint` is required for text. Accept `--image-dir`
+and ignore it. (Reference API: `src/semdb/vadar/predefined_text.py`, engine: `semtext.run_extraction`.)
+```
+
+- [ ] **Step 2: Update `agents/extractor/user-prompt.md` — route text to the new engine**
+
+Find the Output section:
+
+```
+- If Modality is `image`, target `semvision.run` (tiered non-VLM proxies driven by each
+  attribute's `extractor` spec); `--model` is the CLIP model id, no `--endpoint` needed.
+  If Modality is `text`, target `semextract.run` as before.
+```
+
+Replace with:
+
+```
+- If Modality is `image`, target `vadar_engine.run` (tiered non-VLM proxies driven by each
+  attribute's `extractor` spec); `--model` is the CLIP model id, no `--endpoint` needed.
+  If Modality is `text`, compose the predefined TEXT API (`judge/classify/extract/score`
+  from `vadar/predefined_text.py`) in `Driver.extract(patch)` and call
+  `semtext.run_extraction(...)`; `--model` is the endpoint LLM id and `--endpoint` is required.
+```
+
+And in the "Engine to import" section, add a text bullet after the `semextract.run` line:
+
+```
+- For TEXT corpora import `semtext` instead: `semtext.run_extraction(driver, schema,
+  table_path, out_path, *, model, endpoint, api_key="EMPTY", concurrency=8, theta=None)`.
+  `driver` implements `map_columns(header)` and `extract(patch) -> {field: value}` composing
+  `vadar.predefined_text` over the `semtext.TextPatch` it is handed. The engine owns
+  concurrency / meta / checkpoint / abort — do not re-implement them.
+```
+
+- [ ] **Step 3: Dry-run the extractor prompt for a text corpus**
+
+Run:
+```bash
+cd src/semdb && node orchestrator.mjs --query q3a --benchmark movie \
+  --query-dir /localhome/hza214/SemBench/files/movie/query/bigquery \
+  --data-dir /localhome/hza214/SemBench/files/movie/data/<sf> \
+  --dry-run 2>&1 | grep -i "predefined_text\|run_extraction\|TextPatch" | head
+```
+Expected: the rendered Extractor prompt mentions `predefined_text` / `run_extraction` / `TextPatch`. (Substitute an existing `movie/data/sf_*` for `<sf>`.)
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/semdb/agents/extractor/prompt.md src/semdb/agents/extractor/user-prompt.md
+git commit -m "feat(semdb): text Extractor composes predefined_text via semtext.run_extraction"
+```
+
+---
+
+## Task 12: End-to-end verification + regression
 
 **Files:** none (verification only). If a defect is found, fix it in the owning task's files and re-commit.
 
@@ -1464,7 +1784,7 @@ Expected: a JSON model list. If `NO ENDPOINT`, start vLLM per CLAUDE.md before S
 
 - [ ] **Step 2: Run the full Python test suite (no regressions)**
 
-Run: `cd src/semdb && source $HOME/anaconda3/etc/profile.d/conda.sh && conda activate sembench && python3 -m pytest tests/test_evaluate_emit_diff.py tests/test_semtext_fake_endpoint.py tests/test_predefined_text.py -v`
+Run: `cd src/semdb && source $HOME/anaconda3/etc/profile.d/conda.sh && conda activate sembench && python3 -m pytest tests/test_evaluate_emit_diff.py tests/test_semtext_fake_endpoint.py tests/test_predefined_text.py tests/test_semtext_run_extraction.py -v`
 Expected: all PASS.
 
 - [ ] **Step 3: Text DIRECT end-to-end on movie with ground truth + refinement**
@@ -1511,7 +1831,24 @@ cd src/semdb && node orchestrator.mjs --query q2a \
 ```
 Expected: corpus schema/extract run once, compiled_q2a.py generated + refined (≤2 iters), a `mmqa q2a` row appended, telemetry has `refine`.
 
-- [ ] **Step 6: Final commit (if any fixes were made) + summary**
+- [ ] **Step 6: Compiled-mode TEXT extraction composes `predefined_text` (feature 2 in compiled mode)**
+
+Run (needs the endpoint from Step 1):
+```bash
+cd src/semdb && source $HOME/anaconda3/etc/profile.d/conda.sh && conda activate sembench && \
+node orchestrator.mjs --query q3a --benchmark movie \
+  --query-dir /localhome/hza214/SemBench/files/movie/query/bigquery \
+  --data-dir /localhome/hza214/SemBench/files/movie/data/<sf> \
+  --ground-truth-dir /localhome/hza214/SemBench/files/movie/raw_results/ground_truth \
+  --endpoint http://localhost:8000/v1 --extract-model Qwen/Qwen2.5-0.5B-Instruct \
+  --max-iterations 2 --force 2>&1 | tail -40
+```
+Expected:
+- the generated `runs/_corpus/reviews/extract_reviews.py` imports `semtext` and `vadar.predefined_text` (verify: `grep -l predefined_text runs/_corpus/reviews/extract_reviews.py`);
+- `runs/_corpus/reviews/reviews_attrs.json` + `.meta.json` produced (meta has `llm_calls`);
+- `compiled_q3a.py` generated + refined (≤2 iters), a `movie q3a` row appended, telemetry has `refine`.
+
+- [ ] **Step 7: Final commit (if any fixes were made) + summary**
 
 ```bash
 git add -A && git commit -m "test(semdb): verify iterative refinement + text DIRECT end-to-end"
@@ -1533,9 +1870,13 @@ git add -A && git commit -m "test(semdb): verify iterative refinement + text DIR
 - §2.3 modality-aware 3-agent routing → Tasks 8 (prompts + promptPathText), 9 (branch). ✓
 - §2.4 text solver contract → Task 8 (solver prompt skeleton). ✓
 - §2.5 loop over text solver → Task 9 (uses `refineLoop`). ✓
+- Compiled-mode feature 1 (loop over `compiled_<q>.py`) → Task 4. ✓
+- Compiled-mode feature 2 (in-code text inference = text Extractor composes `predefined_text`) → Tasks 10 (`semtext.run_extraction`), 11 (Extractor prompt). ✓
 
-**Placeholder scan:** Task 4 contains an intentionally-flagged "fiddly" first draft followed by the clean contract to adopt; the implementer uses the clean `genFirst/regen/scoreIter` version. All other steps carry complete code. The `[ ... ]` inside generated *solver skeletons* are template markers the agent fills at run time, not plan placeholders.
+**Placeholder scan:** All steps carry complete code. The `[ ... ]` / `[...]` inside generated *solver and driver skeletons* (Tasks 8, 11) are template markers the agent fills at run time, not plan placeholders. No "TBD/TODO" or "similar to Task N" references remain.
 
-**Type consistency:** `checkSemdbImprovement({status,f1})` and `shouldContinueSemdb(history,...)` signatures are identical across Tasks 2, 4, 5, 9. `refineLoop` closures use the uniform `(iterDir, iterCode, iterCsv[, feedback])` signature in Tasks 4, 5, 9. `scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPath, csvPath, finalize)` is defined once (Task 4) and reused (Tasks 5, 9). `runPhase(..., opts)` optional 5th arg added in Task 3, used in Tasks 8/9. `semtext.get_ctx`/`TextPatch`/`METER` names match across Tasks 6, 8. `predefined_text` free-function names match Tasks 7, 8.
+**Type consistency:** `checkSemdbImprovement({status,f1})` and `shouldContinueSemdb(history,...)` signatures are identical across Tasks 2, 4, 5, 9. `refineLoop` closures use the uniform contract — `genFirst(iterDir,iterCode,iterCsv)` / `regen(iterDir,iterCode,iterCsv,feedback)` return `{status,stderr}`, `scoreIter(iterDir,iterCode,iterCsv,run)` returns the scored outcome — in Tasks 4, 5, 9. `scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPath, csvPath, finalize)` is defined once (Task 4) and reused (Tasks 5, 9), reading metrics from the diff JSON. `runPhase(..., opts)` optional 5th arg added in Task 3, used in Tasks 8/9. `semtext.get_ctx`/`TextPatch`/`METER`/`run_extraction` names match across Tasks 6, 8, 10, 11. `predefined_text` free-function names match Tasks 7, 8, 11. `run_extraction`'s attrs+meta output matches `semextract.run` (Task 10) so `compiled_<q>.py` reads it unchanged. The `gen3Agents(iterDir, iterCode, querySql)` signature is consistent between Tasks 5 and 9.
+
+**Compiled-mode consistency note:** feature 2 keeps `compiled_<q>.py` pure relational (inference stays offline in the Extractor), so the Task 4 loop needs no change — the "unified feedback tunes residual inference" option reduces to Task 4 as-is because there is no in-code residual under the chosen Extractor-composes design.
 
 **Known follow-ups (out of scope, noted):** model escalation to a stronger model on repeated failure (GenDB has it; SemDB reuses the same agent) can be added later; scenario `--emit-diff` for non-membership metrics falls back to sampled raw rows.
