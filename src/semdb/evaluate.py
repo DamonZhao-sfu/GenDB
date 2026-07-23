@@ -85,7 +85,7 @@ def _column_is_int(rows, col):
 def eval_q1(rows, fields, gt):
     results = [str(r.get("director", "")).strip(' "').lower() for r in rows]
     gold = {g.strip().lower() for g in gt}
-    return score(results, gold)
+    return results, gold
 
 
 def eval_q2(rows, fields, gt):
@@ -107,17 +107,17 @@ def eval_q2(rows, fields, gt):
         else:
             raise ValueError(f"Unexpected number of columns: {ncols} in the results.")
     gold = set(tuple(g) for g in gt)
-    return score(results, gold)
+    return results, gold
 
 
 def eval_q3(rows, fields, gt):
     results = [r["title"] for r in rows]
-    return score(results, set(gt))
+    return results, set(gt)
 
 
 def eval_q4(rows, fields, gt):
     if not rows or "genre" not in (fields or []):
-        return score([], set())
+        return [], set()
     results = []
     for r in rows:
         genre = r.get("genre")
@@ -133,7 +133,7 @@ def eval_q4(rows, fields, gt):
     for genre, movies in gt.items():                # gt is a dict here
         for m in movies:
             gold.add((genre.strip().lower(), m.strip().lower()))
-    return score(results, gold)
+    return results, gold
 
 
 def eval_q5(rows, fields, gt):
@@ -149,7 +149,7 @@ def eval_q5(rows, fields, gt):
             continue
         results.append(value.strip().lower())
     gold = {g.strip().lower() for g in gt}
-    return score(results, gold)
+    return results, gold
 
 
 def eval_q6(rows, fields, gt):
@@ -157,7 +157,7 @@ def eval_q6(rows, fields, gt):
         results = []
     else:
         results = [r["Airlines"] for r in rows]
-    return score(results, set(gt))
+    return results, set(gt)
 
 
 def eval_q7(rows, fields, gt):
@@ -171,11 +171,41 @@ def eval_q7(rows, fields, gt):
         image_id = _basename_image_id(r["image_id"])
         results.add((r["Airlines"], image_id))
     gold = set(tuple(g) for g in gt)
-    return score(results, gold)
+    return results, gold
 
 
 MMQA_HANDLERS = {1: eval_q1, 2: eval_q2, 3: eval_q3, 4: eval_q4,
                  5: eval_q5, 6: eval_q6, 7: eval_q7}
+
+
+def score_pair(results, gold):
+    """Metric row from a normalized (results, gold) pair — same as score()."""
+    return score(results, gold)
+
+
+def diff_pair(results, gold, cap):
+    """Concrete FP/FN items behind the P/R/F1. FP = predicted items not in gold;
+    FN = gold items not predicted. Both capped at `cap` (order-stable, de-duplicated
+    for FP over a list so a repeated wrong item is shown once). Renders each item as
+    a JSON-safe value (tuples -> lists)."""
+    def _jsonable(x):
+        return list(x) if isinstance(x, tuple) else x
+    seen = set()
+    fp = []
+    for item in results:
+        if item in gold or item in seen:
+            continue
+        seen.add(item)
+        fp.append(item)
+    pred_set = set(results)
+    fn = [g for g in gold if g not in pred_set]
+    return {
+        "false_positives": [_jsonable(x) for x in fp[:cap]],
+        "false_negatives": [_jsonable(x) for x in fn[:cap]],
+        "fp_total": len(fp),
+        "fn_total": len(fn),
+        "sampled": len(fp) > cap or len(fn) > cap,
+    }
 
 
 def handler_id(query):
@@ -211,7 +241,19 @@ def eval_mmqa(query, pred_path, gt_path):
         raise ValueError(f"no mmqa handler for query {query!r} (id {hid})")
     rows, fields = load_pred_rows(pred_path)
     gt = json.load(open(gt_path)).get("ground_truth")
-    return MMQA_HANDLERS[hid](rows, fields, gt)
+    results, gold = MMQA_HANDLERS[hid](rows, fields, gt)
+    return score_pair(results, gold)
+
+
+def eval_mmqa_diff(query, pred_path, gt_path, cap):
+    """Same dispatch as eval_mmqa, but return the FP/FN diff instead of the metric row."""
+    hid = handler_id(query)
+    if hid not in MMQA_HANDLERS:
+        raise ValueError(f"no mmqa handler for query {query!r} (id {hid})")
+    rows, fields = load_pred_rows(pred_path)
+    gt = json.load(open(gt_path)).get("ground_truth")
+    results, gold = MMQA_HANDLERS[hid](rows, fields, gt)
+    return diff_pair(results, gold, cap)
 
 
 def resolve_gt_file(gt_dir, query):
@@ -264,6 +306,45 @@ def eval_scenario(benchmark, query, pred_path, gt_dir, sf):
     return row, r
 
 
+def _scenario_diff(pred_path, gt_dir, bench, query, sf, cap):
+    """Generic id-set FP/FN for a non-mmqa scenario. Reads the predicted CSV and the
+    scenario GT CSV, diffs their shared id column ("id" if present, else the first
+    column). For non-membership metrics (aggregation/ranking) the id sets may be
+    trivial — then fp/fn are empty and pred_sample/gt_sample carry a few raw rows so
+    the agent still sees the shape. Faithful scoring stays in scenario_metrics."""
+    import csv as _csv, importlib, re as _re
+    sm = importlib.import_module("scenario_metrics")
+    qid = int(_re.match(r"(\d+)", query.lstrip("qQ")).group(1))     # q3a -> 3
+    gt_path = str(sm._gt_path(bench, qid, gt_dir, int(sf) if sf else None))
+
+    def _rows(p):
+        try:
+            with open(p, newline="") as f:
+                return list(_csv.DictReader(f))
+        except FileNotFoundError:
+            return []
+
+    pred_rows, gt_rows = _rows(pred_path), _rows(gt_path)
+    def _idcol(rows):
+        if not rows:
+            return None
+        keys = list(rows[0].keys())
+        return "id" if "id" in keys else keys[0]
+    pc, gc = _idcol(pred_rows), _idcol(gt_rows)
+    if pc and gc:
+        pred_ids = [str(r[pc]).strip() for r in pred_rows]
+        gt_ids = {str(r[gc]).strip() for r in gt_rows}
+        pred_set = set(pred_ids)
+        fp = [i for i in dict.fromkeys(pred_ids) if i not in gt_ids]
+        fn = [i for i in (str(r[gc]).strip() for r in gt_rows) if i not in pred_set]
+        return {"false_positives": fp[:cap], "false_negatives": fn[:cap],
+                "fp_total": len(fp), "fn_total": len(fn),
+                "sampled": len(fp) > cap or len(fn) > cap}
+    return {"false_positives": [], "false_negatives": [], "fp_total": 0, "fn_total": 0,
+            "sampled": False, "note": "no shared id column",
+            "pred_sample": pred_rows[:cap], "gt_sample": gt_rows[:cap]}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Score a compiled mmqa query vs ground truth; append to CSV")
     ap.add_argument("--pred", help="compiled query output (.csv or .json). Omit for telemetry-only row.")
@@ -275,6 +356,8 @@ def main():
     ap.add_argument("--sf", default="", help="scale factor (cars/medical GT suffix resolution)")
     ap.add_argument("--telemetry", help="telemetry.json from the orchestrator")
     ap.add_argument("--csv", required=True, help="output CSV (row appended; header written if new)")
+    ap.add_argument("--emit-diff", help="also write FP/FN sample rows JSON to this path")
+    ap.add_argument("--diff-cap", type=int, default=15, help="max FP and FN samples to emit")
     args = ap.parse_args()
 
     tele = json.load(open(args.telemetry)) if args.telemetry and os.path.exists(args.telemetry) else {}
@@ -315,6 +398,13 @@ def main():
         else:
             metrics, raw = eval_scenario(bench, args.query, args.pred, gt_dir, args.sf)
             row.update(**metrics)
+            if args.emit_diff:
+                diff = _scenario_diff(args.pred, gt_dir, bench, args.query, args.sf, args.diff_cap)
+                diff["query"] = args.query
+                diff.update(f1=metrics.get("f1"), precision=metrics.get("precision"),
+                            recall=metrics.get("recall"))
+                json.dump(diff, open(args.emit_diff, "w"), indent=2)
+                print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
             head = " ".join(f"{k}={v}" for k, v in metrics.items() if k != "metric")
             print(f"[eval] {bench}/{args.query} [{metrics.get('metric','')}]: {head}")
             if raw.get("audio_only"):
@@ -331,6 +421,14 @@ def main():
               f"P={metrics['precision']} R={metrics['recall']} F1={metrics['f1']}  "
               f"(tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']})")
         print(f"[eval] ground truth: {gt_path}")
+        if args.emit_diff:
+            diff = eval_mmqa_diff(args.query, args.pred, gt_path, args.diff_cap)
+            diff["query"] = args.query
+            diff.update(f1=metrics["f1"], precision=metrics["precision"],
+                        recall=metrics["recall"], tp=metrics["tp"],
+                        fp=metrics["fp"], fn=metrics["fn"])
+            json.dump(diff, open(args.emit_diff, "w"), indent=2)
+            print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
         # Persist the metrics back into telemetry.json too (not just the CSV).
         if args.telemetry and os.path.exists(args.telemetry):
             tele["metrics"] = metrics
