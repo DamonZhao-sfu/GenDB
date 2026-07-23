@@ -54,29 +54,42 @@ class ImagePatch:
         try:
             import easyocr
             if "ocr" not in self.ctx:
-                self.ctx["ocr"] = easyocr.Reader(["en"], gpu=False, verbose=False)
+                try:
+                    import torch
+                    gpu = torch.cuda.is_available()
+                except Exception:
+                    gpu = False
+                self.ctx["ocr"] = easyocr.Reader(["en"], gpu=gpu, verbose=False)
             return " ".join(self.ctx["ocr"].readtext(self.image_path, detail=0))
         except Exception:
             return ""
 
-    def best_ocr_match(self, options, cutoff=0.3):
-        """Read the image text (OCR) and match it to the closest VALUE in a value
-        space. Wins over `classify` for wordmark logos (airline names) where CLIP over
-        a large value space fails but the printed name is legible."""
+    _GENERIC_TOKENS = {"air", "airlines", "airways", "airline", "aviation", "co", "ltd",
+                       "the", "of", "and", "group", "international"}
+
+    def best_ocr_match(self, options, cutoff=0.6, min_len=3):
+        """Read the image text (OCR) and match it to the closest VALUE in a value space
+        — the field. Wins over `classify` for wordmark logos (airline names). Strict, to
+        avoid false positives on non-logo images: requires a strong fuzzy match OR that
+        the option's DISTINCTIVE (non-generic) tokens actually appear in the OCR text."""
         import difflib
-        text = self.read_text().lower()
+        text = self.read_text().lower().strip()
+        if len(text) < min_len:
+            return "none"
         by_lower = {o.lower(): o for o in options}
         m = difflib.get_close_matches(text, list(by_lower), n=1, cutoff=cutoff)
         if m:
             return by_lower[m[0]]
-        toks = set(text.split())                       # token-overlap fallback
+        toks = set(text.split())
         best, best_s = "none", 0.0
         for o in options:
-            ot = set(o.lower().split())
-            s = (len(toks & ot) / len(ot)) if ot else 0.0
-            if s > best_s:
-                best, best_s = o, s
-        return best if best_s >= 0.5 else "none"
+            distinctive = [w for w in o.lower().split() if w not in self._GENERIC_TOKENS]
+            if not distinctive:
+                continue
+            hit = sum(1 for w in distinctive if w in toks) / len(distinctive)
+            if hit >= 0.6 and hit > best_s:            # its distinctive name must be read
+                best, best_s = o, hit
+        return best
 
     def crop(self, left, lower, right, upper):
         return ImagePatch(self.image_path, self.ctx, box=(left, lower, right, upper))

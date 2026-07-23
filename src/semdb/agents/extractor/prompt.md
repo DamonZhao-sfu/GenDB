@@ -52,19 +52,23 @@ a **systemic-failure guard** (exits non-zero without writing the output when mos
 calls error), a crash-safe `.partial` checkpoint, and the `<out>.meta.json`
 sidecar. Never write your own HTTP/threading/JSON-parsing/checkpoint code.
 
-## Image corpora use semvision (tiered proxies), NOT a VLM
-When the corpus modality is IMAGE, generate a driver over `semvision` (not semextract).
-`semvision.run()` reads each attribute's `extractor` spec (from schema.json) and runs
-the assigned proxy — pure-CV colors, CLIP zero-shot category/brand — so NO generative
-VLM is called. Provide `map_columns(header)` and `preprocess(row, cols)` (resolve the
-image with `semextract.resolve_image_path(row[cols['image']], self.image_dir)`), then:
+## Image corpora — you are the PROGRAM agent (generated-code extraction, VADAR-style)
+When the corpus modality is IMAGE, do NOT call a VLM. You WRITE a Python function
+`extract(patch) -> {field: value, ...}` that composes the `ImagePatch` base API (CLIP /
+CV / OCR / detector / domain — see the ImagePatch API prompt you are given). The Schema
+Designer already chose, per field, the method + value space (the SIGNATURE stage); you
+COMPOSE the primitives (the PROGRAM stage). Pick the lightest composition per field:
 
-    import semvision
-    semvision.run(driver, schema, args.table, args.out,
-                  image_dir=args.image_dir, clip_model=args.model)
+- small/visual value space or category enum → `patch.classify(values, template)`
+- LARGE value space of legible wordmark names (airlines) → `patch.best_ocr_match(values)`
+- colors → `patch.dominant_colors()`; compose (gate then classify) when one won't do.
 
-`--model` is the CLIP model id for tier `clip` (e.g. openai/clip-vit-base-patch32); no
-`--endpoint` is needed for image corpora. TEXT corpora keep using `semextract.run`.
+Value-space lists come from the schema's `labels` (already filled from `labels_from`,
+the DB value space). The returned label IS the field value (joins/filters downstream).
+Emit a module: the value-space constants, `def extract(patch): ...`, and a `main()` that
+runs the engine over the corpus (`from imagepatch import ImagePatch`; the engine loads
+CLIP once, wraps each image, execs `extract`, writes the attribute table). TEXT corpora
+still use `semextract.run`. (Reference end-to-end: `src/semdb/vadar_run.py`.)
 
 ## Rules
 - Map columns from the ACTUAL header you are given; pick the id/text/image columns
