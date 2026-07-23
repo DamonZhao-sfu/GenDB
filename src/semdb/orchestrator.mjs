@@ -954,40 +954,75 @@ async function runQueryDirect(args, planObj, csvPath) {
   const { filename: imgFilenameCol, filepath: imgFilepathCol } = pickImageCols(imgHeader);
   const imageDir = args.imageDir || (corpus.path ? resolve(dirname(corpus.path), "images") : "");
 
-  if (!existsSync(solvePath) || args.force) {
-    const sigPath = resolve(runDir, `_vadar_signatures_${query}.txt`);
-    const helpersPath = resolve(runDir, `_vadar_helpers_${query}.py`);
+  const codeBasename = `solve_${query}.py`;
+  const clipModel = args.clipModel || defaults.extraction.clipModel;
+  const dataDir = args.tableDir || args.dataDir;
+  const telePath = resolve(runDir, "telemetry.json");
+
+  const runSolver = (iterDir, iterCode, iterCsv) => {
+    if (!(doRun && existsSync(iterCode))) return { status: "empty", stderr: "" };
+    const sArgs = [iterCode, iterCsv, "--data-dir", dataDir,
+      ...(imageDir ? ["--image-dir", imageDir] : []), "--clip-model", clipModel];
+    console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
+    const s = spawnSync("python3", sArgs, { stdio: ["inherit", "inherit", "pipe"] });
+    const stderr = (s.stderr || "").toString();
+    if (s.status !== 0) { console.warn(`[SemDB] direct solver exited ${s.status}.`); return { status: "crash", stderr }; }
+    return { status: "ok", stderr };
+  };
+
+  // The 3 agents (Signature → API → Solver) generate iter_0's solve_<q>.py.
+  const gen3Agents = async (iterDir, iterCode, querySql) => {
+    const sigPath = resolve(iterDir, `_vadar_signatures_${query}.txt`);
+    const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
     const common = { corpus_name: corpus.table, semdb_dir: __dirname };
     record("vadar_signature", await runPhase(vadarSignatureConfig, {
-      ...common, query_sql: sql, schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
+      ...common, query_sql: querySql, schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
       sig_path: sigPath,
-    }, runDir, args));
+    }, iterDir, args));
     record("vadar_api", await runPhase(vadarApiConfig, {
       ...common, sig_path: sigPath, helpers_path: helpersPath,
-    }, runDir, args));
+    }, iterDir, args));
     record("vadar_solver", await runPhase(vadarSolverConfig, {
-      query_id: query, query_sql: sql, query_nl: nl || "(none)", semdb_dir: __dirname,
+      query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
       tables_doc: tableLines.join("\n"),
       image_table: corpus.table, image_path: corpus.path,
       image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
-      image_dir: imageDir, helpers_path: helpersPath, solve_path: solvePath,
-    }, runDir, args));
-  } else {
-    console.log(`[SemDB] reuse cached solver: ${solvePath}`);
-  }
+      image_dir: imageDir, helpers_path: helpersPath, solve_path: iterCode,
+    }, iterDir, args));
+  };
 
-  if (args.dryRun) return null;
+  // Refinement iterations re-invoke ONLY the Solver, editing the seeded code with feedback.
+  const regenSolver = async (iterDir, iterCode, feedback) => {
+    const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
+    record("vadar_solver", await runPhase(vadarSolverConfig, {
+      query_id: query, query_sql: sql + "\n\n" + feedback, query_nl: nl || "(none)", semdb_dir: __dirname,
+      tables_doc: tableLines.join("\n"),
+      image_table: corpus.table, image_path: corpus.path,
+      image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
+      image_dir: imageDir, helpers_path: existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)", solve_path: iterCode,
+    }, iterDir, args));
+  };
 
-  const dataDir = args.tableDir || args.dataDir;
-  if (doRun && existsSync(solvePath)) {
-    const clipModel = args.clipModel || defaults.extraction.clipModel;
-    const sArgs = [solvePath, resultsCsv, "--data-dir", dataDir,
-      ...(imageDir ? ["--image-dir", imageDir] : []),
-      "--clip-model", clipModel];
-    console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
-    const s = spawnSync("python3", sArgs, { stdio: "inherit" });
-    if (s.status !== 0) console.warn(`[SemDB] direct solver exited ${s.status}.`);
-  }
+  const genFirst = async (iterDir, iterCode, iterCsv) => {
+    await gen3Agents(iterDir, iterCode, sql);
+    return runSolver(iterDir, iterCode, iterCsv);
+  };
+  const regen = async (iterDir, iterCode, iterCsv, feedback) => {
+    await regenSolver(iterDir, iterCode, feedback);
+    return runSolver(iterDir, iterCode, iterCsv);
+  };
+  const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
+    const diffPath = resolve(iterDir, "diff.json");
+    const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
+    const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
+    return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+  };
+
+  if (args.dryRun) { await gen3Agents(runDir, solvePath, sql); return null; }
+
+  const { bestIter, bestF1, history } = await refineLoop({
+    args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter,
+  });
 
   // Minimal telemetry (agent stages only — no extraction/compile split in DIRECT mode).
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
@@ -1002,25 +1037,32 @@ async function runQueryDirect(args, planObj, csvPath) {
     naive_llm_calls: planObj.plan.naive ?? null,
     total_estimated_cost_usd: Number(agentCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
+    refine: { iterations: history.length - 1, best_iteration: bestIter,
+              max_iterations: args.noRefine ? 0 : args.maxIterations,
+              f1_history: history },
     phases,
   };
-  const telePath = resolve(runDir, "telemetry.json");
   await writeFile(telePath, JSON.stringify(report, null, 2));
 
   console.log(`\n[SemDB] === ${query} (DIRECT) ===`);
   console.log(`[SemDB]   3-agent solver     ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  $${agentCost.toFixed(4)}`);
 
+  // (3) finalize: score the promoted best CSV → merge metrics into telemetry + append results.csv row
+  if (doRun) {
+    const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
+    if (gt && existsSync(resultsCsv)) {
+      await scoreWithDiff(args, query, planObj, telePath, resultsCsv, resolve(runDir, "diff.json"), csvPath, true);
+    }
+  }
+
+  // --- Score against ground truth + append CSV (re-read telePath, merged by finalize above) ---
   if (doRun && gt && existsSync(resultsCsv)) {
-    const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
-      "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
-      "--query", query, "--benchmark", args.benchmark, "--csv", csvPath,
-      ...(args.groundTruthDir ? ["--ground-truth-dir", args.groundTruthDir] : []),
-      ...(args.scaleFactor ? ["--sf", String(args.scaleFactor)] : [])];
-    const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
-    if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
     const scored = await readJSON(telePath);
     const m = scored?.metrics;
-    if (m) console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+    if (m) {
+      console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+      console.log(`[SemDB]   saved -> ${telePath} and ${csvPath}`);
+    }
   } else if (gt) {
     console.log(`[SemDB]   (solver output not found — score later with evaluate.py --pred ${resultsCsv})`);
   }
