@@ -86,6 +86,8 @@ function parseArgs(argv) {
     direct: false,         // DIRECT mode: skip Schema Designer + extract/compile split;
                            // VADAR 3 agents (Signature→API→Solver) write ONE end-to-end
                            // solve_<q>.py that calls the local vision API and answers the query.
+    maxIterations: defaults.maxRefineIterations,
+    noRefine: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -115,6 +117,8 @@ function parseArgs(argv) {
     else if (a === "--image-only") args.imageOnly = true;
     else if (a === "--direct") args.direct = true;
     else if (a === "--dry-run") args.dryRun = true;
+    else if (a === "--max-iterations" && argv[i + 1]) args.maxIterations = parseInt(argv[++i], 10);
+    else if (a === "--no-refine") args.noRefine = true;
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
   // `--data-dir .../files/cars/data/sf_9836` works WITHOUT --benchmark/--sf.
@@ -396,8 +400,9 @@ async function listQueries(dir) {
     .map((f) => f.replace(/\.sql$/i, "")).sort();
 }
 
-async function runPhase(agentConfig, vars, runDir, args) {
-  const systemPrompt = await readFile(agentConfig.promptPath, "utf-8");
+async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
+  const systemPromptPath = opts.systemPromptPath || agentConfig.promptPath;
+  const systemPrompt = await readFile(systemPromptPath, "utf-8");
   const template = await readFile(agentConfig.userPromptPath, "utf-8");
   const userPrompt = renderTemplate(template, vars);
 
@@ -420,6 +425,41 @@ async function runPhase(agentConfig, vars, runDir, args) {
   });
   if (result.error) throw new Error(`${agentConfig.name} failed: ${result.error}`);
   return result;
+}
+
+/** Render the per-iteration feedback block appended to a generating agent's prompt.
+ *  Runtime failures short-circuit to a fix-first block; otherwise metrics + FP/FN. */
+function renderFeedback(prev) {
+  const histLines = (prev.history || [])
+    .map((h) => `  iter ${h.iter}: F1=${h.f1 == null ? "n/a" : h.f1} ${h.status.toUpperCase()}${h.improved ? " (improved)" : ""}`)
+    .join("\n");
+  if (prev.status !== "ok") {
+    return [
+      "\n## LAST RUN FAILED — FIX THIS FIRST",
+      `The program ${prev.status === "empty" ? "produced no output rows" : "crashed"}.`,
+      "```",
+      (prev.stderrTail || "(no stderr captured)"),
+      "```",
+      "Diagnose and fix the error before any accuracy work.",
+      histLines ? `\n## HISTORY\n${histLines}` : "",
+    ].join("\n");
+  }
+  const m = prev.metrics || {};
+  const d = prev.diff || {};
+  const fmt = (rows) => (rows && rows.length)
+    ? rows.map((r) => `  - ${typeof r === "object" ? JSON.stringify(r) : r}`).join("\n")
+    : "  (none)";
+  return [
+    `\n## LAST RUN — F1=${prev.f1} (P=${m.precision} R=${m.recall}, tp=${m.tp} fp=${m.fp} fn=${m.fn})`,
+    `## FALSE POSITIVES (predicted, but wrong) — ${d.fp_total ?? 0} total, showing ${(d.false_positives || []).length}:`,
+    fmt(d.false_positives),
+    `## FALSE NEGATIVES (missed) — ${d.fn_total ?? 0} total, showing ${(d.false_negatives || []).length}:`,
+    fmt(d.false_negatives),
+    histLines ? `## HISTORY\n${histLines}` : "",
+    "Diagnose WHY these are wrong and revise the code. Common causes: wrong threshold,",
+    "wrong label/value mapping, over-broad predicate, wrong join key, CLIP/LLM prompt",
+    "too long or off-target. Edit the existing program in place.",
+  ].join("\n");
 }
 
 /** Build a phase-telemetry recorder bound to a phases[] array. */
