@@ -65,10 +65,40 @@ COMPOSE the primitives (the PROGRAM stage). Pick the lightest composition per fi
 
 Value-space lists come from the schema's `labels` (already filled from `labels_from`,
 the DB value space). The returned label IS the field value (joins/filters downstream).
-Emit a module: the value-space constants, `def extract(patch): ...`, and a `main()` that
-runs the engine over the corpus (`from imagepatch import ImagePatch`; the engine loads
-CLIP once, wraps each image, execs `extract`, writes the attribute table). TEXT corpora
-still use `semextract.run`. (Reference end-to-end: `src/semdb/vadar_run.py`.)
+
+FIRST read the ImagePatch API spec: `src/semdb/imagepatch_prompt.md`. Then emit exactly
+this module shape (the orchestrator runs it with `<table> <attrs> --schema S --model M
+--image-dir D`):
+
+```python
+import sys, os, json, argparse
+sys.path.insert(0, "<dir containing vadar_engine.py>")   # given to you
+import vadar_engine
+
+# value-space constants pulled from schema.attributes[].labels (the DB value space):
+TRACKS = [...]                      # e.g. from labels_from mmqa.ap_warrior.Track
+
+class Driver:
+    def __init__(self): self.image_dir = None
+    def map_columns(self, header):
+        return {"id": "<id col>", "image": "<image col>", "text": None, "context": []}
+    def extract(self, patch):
+        # ONE entry per schema attribute, composing patch.* (classify / best_ocr_match /
+        # dominant_colors / verify_property). Return the field VALUES.
+        return {"racetrack": patch.classify(TRACKS, "the logo of {}")}
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("table"); ap.add_argument("out")
+    ap.add_argument("--schema", required=True); ap.add_argument("--model", required=True)
+    ap.add_argument("--image-dir"); ap.add_argument("--theta")   # --theta accepted, ignored
+    a = ap.parse_args()
+    d = Driver(); d.image_dir = a.image_dir
+    vadar_engine.run(d, json.load(open(a.schema)), a.table, a.out,
+                     model=a.model, image_dir=a.image_dir)
+```
+`--model` is the CLIP id; NO `--endpoint`. TEXT corpora still use `semextract.run`.
+(Reference compositions + engine: `src/semdb/vadar_run.py`, `src/semdb/vadar_engine.py`.)
 
 ## Rules
 - Map columns from the ACTUAL header you are given; pick the id/text/image columns

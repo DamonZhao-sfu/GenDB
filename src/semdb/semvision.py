@@ -64,11 +64,18 @@ def _rgb_to_hsv(arr):
 
 
 def cv_dominant_colors(img_path, palette=None, min_frac=0.04, size=96,
-                       sat_thresh=0.20, val_lo=0.12):
+                       sat_thresh=0.20, val_lo=0.12, center_frac=1.0):
     """Return (colors ≥ min_frac of pixels, confidence). Chromatic pixels (saturation
     ≥ sat_thresh) map to a color by HSV HUE (so pale accents keep their hue); the rest
-    bucket to black/gray/silver/white by lightness. Deterministic → conf 1.0."""
-    im = Image.open(img_path).convert("RGB").resize((size, size))
+    bucket to black/gray/silver/white by lightness. `center_frac`<1 crops to the central
+    region first (excludes a product photo's white background). Deterministic → conf 1.0."""
+    im = Image.open(img_path).convert("RGB")
+    if center_frac < 1.0:
+        w, h = im.size
+        cw, ch = int(w * center_frac), int(h * center_frac)
+        l, t = (w - cw) // 2, (h - ch) // 2
+        im = im.crop((l, t, l + cw, t + ch))
+    im = im.resize((size, size))
     arr = np.asarray(im, dtype=np.float32) / 255.0
     h, s, v = _rgb_to_hsv(arr)
     n = h.size

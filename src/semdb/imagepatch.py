@@ -44,9 +44,9 @@ class ImagePatch:
         return semvision.clip_match(self.image_path, template.format(text), self.ctx["encoder"])
 
     # --- CV: colors present (incl. pale accents) ----------------------------
-    def dominant_colors(self, min_frac=0.06):
+    def dominant_colors(self, min_frac=0.06, center_frac=1.0):
         colors, _ = semvision.cv_dominant_colors(self.image_path, self.ctx.get("palette"),
-                                                 min_frac=min_frac)
+                                                 min_frac=min_frac, center_frac=center_frac)
         return colors
 
     # --- OCR (printed text; stylized logos are unreliable — prefer classify) -
