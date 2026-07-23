@@ -9,7 +9,7 @@ class FakeEncoder:
         self._img = np.asarray(img_vec, np.float32); self._img /= np.linalg.norm(self._img)
         self._txt = {k: (np.asarray(v, np.float32) / np.linalg.norm(v)) for k, v in text_vecs.items()}
     def encode_image(self, _path): return self._img
-    def encode_text(self, labels): return np.stack([self._txt[l] for l in labels])
+    def encode_text(self, labels, template="a photo of {}"): return np.stack([self._txt[l] for l in labels])
 
 
 def test_clip_classify_picks_nearest_label():

@@ -89,7 +89,13 @@ answers the predicate — do NOT default to a generative VLM:
   → `{"tier":"clip","method":"classify","labels":[<enum values>]}`
 - a MULTI-label closed set (all colors present, multiple attributes)
   → `{"tier":"clip","method":"multilabel","labels":[...],"params":{"thresh":0.5}}`
-- logo→brand identity / open-ish nameable → `{"tier":"clip","method":"match","params":{"text":"<brand or concept>"}}`
+- **logo / entity that JOINS a named table** (mmqa q2a racetrack, q7 airline: the
+  predicate matches the image to a value in a structured column) — extract the NAME as a
+  real field via CLIP classify over that column's value space:
+  `{"tier":"clip","method":"classify","labels_from":"<structured_table>.<name_col>","params":{"template":"the logo of {}"}}`
+  The orchestrator fills `labels` with the column's distinct values; CLIP returns the
+  matching NAME (a field), which the compiled query hash-joins to the table.
+- open-ish nameable with NO table/enum → `{"tier":"clip","method":"match","params":{"text":"<concept>"}}`
 - object / species PRESENCE or COUNT (e.g. "contains a zebra", COCO objects)
   → `{"tier":"detector","classes":["zebra",...],"params":{"min_conf":0.25}}` (YOLO)
 - chest X-ray abnormality / other pretrained domain classifier
@@ -99,6 +105,14 @@ answers the predicate — do NOT default to a generative VLM:
 Prefer a `detector` for species/object presence when the class is common (COCO: zebra,
 elephant, …); fall back to `clip` classify for rarer classes (monkey, impala). Use
 `domain` for medical images where a pretrained classifier exists (chest X-ray).
+
+**Structured field vs predicate — the key rule.** A real FIELD (a value that gets
+selected, joined, or grouped) must be extracted with `classify`/`detector`/`domain`/
+`cv` — these return the actual VALUE (the label / colors / detected class). Only use
+`match` for a pure yes/no predicate where no value is needed. The field's VALUE SPACE
+comes from the DB + query: an enum column → literal `labels`; a JOIN on a named column
+→ `labels_from:"table.column"` (the orchestrator fills it). Never leave a field as a
+bare similarity score.
 
 Decompose conjunctions: "sports shoe that is yellow and silver" → a product_type
 attribute (clip classify) + a colors attribute (cv dominant_colors, so BOTH colors are

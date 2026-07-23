@@ -105,18 +105,22 @@ def _softmax(x, temp=0.01):
     return e / e.sum()
 
 
-def clip_classify(img_path, labels, encoder):
+def clip_classify(img_path, labels, encoder, template="a photo of {}"):
+    """Zero-shot classify into `labels` (the field's VALUE SPACE — an enum or a
+    structured column's values). Returns (the winning VALUE, prob). `template`
+    frames the text prompt (e.g. 'the logo of {}' for logos) but the returned value
+    is the raw label, so this yields a real structured FIELD value, not a score."""
     iv = encoder.encode_image(img_path)          # [D], normalized
-    tv = encoder.encode_text(list(labels))       # [L,D], normalized
+    tv = encoder.encode_text(list(labels), template)  # [L,D], normalized
     sims = tv @ iv                               # [L] cosine
     probs = _softmax(sims)
     j = int(np.argmax(probs))
     return labels[j], float(probs[j])
 
 
-def clip_multilabel(img_path, labels, encoder, thresh=0.5):
+def clip_multilabel(img_path, labels, encoder, thresh=0.5, template="a photo of {}"):
     iv = encoder.encode_image(img_path)
-    tv = encoder.encode_text(list(labels))
+    tv = encoder.encode_text(list(labels), template)
     sims = tv @ iv                               # cosine in [-1,1]
     probs = 1.0 / (1.0 + np.exp(-(sims - 0.2) / 0.05))   # sigmoid centered ~0.2 cos
     chosen = [l for l, p in zip(labels, probs) if p >= thresh]
@@ -168,8 +172,8 @@ class ClipEncoder:
             v = self.model.visual_projection(out.pooler_output)
         return self._norm(v)[0]
 
-    def encode_text(self, labels):
-        prompts = [f"a photo of {l.replace('_', ' ')}" for l in labels]
+    def encode_text(self, labels, template="a photo of {}"):
+        prompts = [template.format(str(l).replace('_', ' ')) for l in labels]
         inp = self.proc(text=prompts, return_tensors="pt", padding=True).to(self.device)
         with self.torch.no_grad():
             out = self.model.text_model(input_ids=inp["input_ids"],
@@ -273,10 +277,11 @@ def _run_attr(image_path, attr, ctx):
         return (colors if is_list else (colors[0] if colors else "none")), s
     if tier == "clip":
         enc = ctx["encoder"]
+        template = params.get("template", "a photo of {}")
         if method == "classify":
-            return clip_classify(image_path, spec["labels"], enc)
+            return clip_classify(image_path, spec["labels"], enc, template)
         if method == "multilabel":
-            return clip_multilabel(image_path, spec["labels"], enc, params.get("thresh", 0.5))
+            return clip_multilabel(image_path, spec["labels"], enc, params.get("thresh", 0.5), template)
         if method == "match":
             score = clip_match(image_path, params["text"], enc)
             thr = params.get("threshold")

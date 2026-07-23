@@ -304,6 +304,46 @@ async function chooseCorpus(sql, tables, args) {
     tables[tables.length - 1] || { table: "corpus", path: "", modality: "text", isImages: false };
 }
 
+/** Distinct non-empty values of a CSV column — the value space for CLIP classify. */
+async function distinctValues(path, column) {
+  try {
+    const lines = (await readFile(path, "utf-8")).split(/\r?\n/).filter((l) => l.length);
+    if (!lines.length) return [];
+    const idx = lines[0].split(",").map((c) => c.trim()).indexOf(column);
+    if (idx < 0) return [];
+    const vals = new Set();
+    for (const line of lines.slice(1)) {
+      const cell = (line.split(",")[idx] || "").trim();
+      if (cell) vals.add(cell);
+    }
+    return [...vals].sort();
+  } catch { return []; }
+}
+
+/** Fill each attribute's `labels` from its `labels_from: "table.column"` — the DB
+ *  value space — so CLIP classify returns a real structured FIELD value, not a score.
+ *  For a logo↔named-table join (mmqa q2a/q7), labels_from points at the structured
+ *  side's name column. Mutates `schema`; returns true if it changed anything. */
+async function resolveLabelsFrom(schema, args) {
+  let changed = false;
+  const tableDir = args.tableDir || args.dataDir;
+  for (const a of schema.attributes || []) {
+    const lf = a.extractor && a.extractor.labels_from;
+    if (!lf || (a.extractor.labels && a.extractor.labels.length)) continue;
+    const [tbl, col] = String(lf).split(".");
+    const d = tableDesc(args.benchmark, tbl);
+    const file = d ? tableFile(d, args.scaleFactor) : `${tbl}.csv`;
+    const vals = await distinctValues(resolve(tableDir, file), col);
+    if (vals.length) {
+      a.extractor.labels = vals; changed = true;
+      console.log(`[SemDB] labels_from ${lf}: ${vals.length} value(s) -> attr '${a.name}'`);
+    } else {
+      console.warn(`[SemDB] labels_from ${lf}: no values at ${resolve(tableDir, file)}`);
+    }
+  }
+  return changed;
+}
+
 /** List query ids (<name>.sql → <name>) in a query dir, sorted. */
 async function listQueries(dir) {
   if (!dir) return [];
@@ -434,6 +474,11 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   }
 
   const schema = args.dryRun ? null : await readJSON(schemaPath);
+  // Bake the DB value space into any `labels_from` attribute (structured field
+  // extraction: CLIP classify over a column's distinct values → a real field value).
+  if (schema && !args.dryRun && await resolveLabelsFrom(schema, args)) {
+    await writeFile(schemaPath, JSON.stringify(schema, null, 2));
+  }
   if (schema && schema.decomposable === false) {
     console.log(`[SemDB] corpus ${corpus.table} not decomposable: ${schema.rationale}`);
   }
