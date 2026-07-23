@@ -667,6 +667,7 @@ async function ensureCorpus(args, corpus, corpusQueries) {
  *  Returns { status, f1, metrics, diff, stderrTail }. status: "ok"|"empty" (crash is
  *  detected by the caller from the run step). Only writes results.csv when finalize. */
 async function scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPath, csvPath, finalize) {
+  if (args.dryRun) return { status: "ok", f1: null, metrics: null, diff: null };
   if (!existsSync(resultsCsv)) return { status: "empty", f1: null, metrics: null, diff: null };
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
   if (!gt) return { status: "ok", f1: null, metrics: null, diff: null };
@@ -716,8 +717,15 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
 
   // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal (ground truth
   // present and the query scored). Without it, iter_0's f1 is null — behave as single-shot.
-  const effectiveMaxIter = (best.outcome.f1 == null) ? 0 : maxIter;
-  if (best.outcome.f1 == null && maxIter > 0) {
+  // Single-shot ONLY when there is genuinely no F1 signal: iter_0 RAN OK but could not be
+  // scored (no ground truth). A crash/empty WITH ground truth keeps iterating (fix-first),
+  // matching shouldContinueSemdb, which returns "continue" when the last run is not "ok".
+  // --dry-run never actually executes iter_0 (genFirst/runCompiled are no-ops), so its
+  // status is "empty" rather than "ok" — treat that as no-signal too, otherwise the loop
+  // would try to seed iter_1 from a compiled_<query>.py that dry-run never wrote.
+  const noSignal = args.dryRun || (best.outcome.status === "ok" && best.outcome.f1 == null);
+  const effectiveMaxIter = noSignal ? 0 : maxIter;
+  if (noSignal && maxIter > 0) {
     console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
   }
 
@@ -817,8 +825,17 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   if (args.dryRun) return null;
 
   // --- Per-query telemetry (codegen + residual) + shared corpus (amortized) ---
-  const cg = phases.find((p) => p.phase === "code_generator") || { duration_ms: 0, cost_usd: 0, llm_calls: 0, tokens: {} };
-  const cqMeta = await readJSON(resolve(runDir, `compiled_${query}.meta.json`));
+  // record("code_generator", ...) pushes one phase per iteration; sum across all of them
+  // rather than taking only the first (iter_0) via .find, which would undercount cost.
+  const cgPhases = phases.filter((p) => p.phase === "code_generator");
+  const cg = {
+    duration_ms: cgPhases.reduce((s, p) => s + (p.duration_ms || 0), 0),
+    cost_usd:    cgPhases.reduce((s, p) => s + (p.cost_usd || 0), 0),
+    llm_calls:   cgPhases.reduce((s, p) => s + (p.llm_calls || 0), 0),
+    tokens: cgPhases.reduce((t, p) => ({ input: (t.input || 0) + (p.tokens?.input || 0),
+                                         output: (t.output || 0) + (p.tokens?.output || 0) }), {}),
+  };
+  const cqMeta = await readJSON(resolve(runDir, `iter_${bestIter}`, `compiled_${query}.meta.json`));
   const residualCalls = cqMeta?.residual_calls || 0;
   const N = await countRows(corpus.path);
   const extractionCalls = corpusTelemetry.extraction.calls ?? (N ?? 0);
