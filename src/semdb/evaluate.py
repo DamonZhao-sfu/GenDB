@@ -399,12 +399,16 @@ def main():
             metrics, raw = eval_scenario(bench, args.query, args.pred, gt_dir, args.sf)
             row.update(**metrics)
             if args.emit_diff:
-                diff = _scenario_diff(args.pred, gt_dir, bench, args.query, args.sf, args.diff_cap)
-                diff["query"] = args.query
-                diff.update(f1=metrics.get("f1"), precision=metrics.get("precision"),
-                            recall=metrics.get("recall"))
-                json.dump(diff, open(args.emit_diff, "w"), indent=2)
-                print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
+                # A diff-generation failure must NOT prevent metric persistence / the CSV row.
+                try:
+                    diff = _scenario_diff(args.pred, gt_dir, bench, args.query, args.sf, args.diff_cap)
+                    diff["query"] = args.query
+                    diff.update(f1=metrics.get("f1"), precision=metrics.get("precision"),
+                                recall=metrics.get("recall"))
+                    json.dump(diff, open(args.emit_diff, "w"), indent=2)
+                    print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[eval] WARN: --emit-diff failed ({e}); metrics still written.")
             head = " ".join(f"{k}={v}" for k, v in metrics.items() if k != "metric")
             print(f"[eval] {bench}/{args.query} [{metrics.get('metric','')}]: {head}")
             if raw.get("audio_only"):
@@ -422,13 +426,17 @@ def main():
               f"(tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']})")
         print(f"[eval] ground truth: {gt_path}")
         if args.emit_diff:
-            diff = eval_mmqa_diff(args.query, args.pred, gt_path, args.diff_cap)
-            diff["query"] = args.query
-            diff.update(f1=metrics["f1"], precision=metrics["precision"],
-                        recall=metrics["recall"], tp=metrics["tp"],
-                        fp=metrics["fp"], fn=metrics["fn"])
-            json.dump(diff, open(args.emit_diff, "w"), indent=2)
-            print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
+            # A diff-generation failure must NOT prevent metric persistence / the CSV row.
+            try:
+                diff = eval_mmqa_diff(args.query, args.pred, gt_path, args.diff_cap)
+                diff["query"] = args.query
+                diff.update(f1=metrics["f1"], precision=metrics["precision"],
+                            recall=metrics["recall"], tp=metrics["tp"],
+                            fp=metrics["fp"], fn=metrics["fn"])
+                json.dump(diff, open(args.emit_diff, "w"), indent=2)
+                print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[eval] WARN: --emit-diff failed ({e}); metrics still written.")
         # Persist the metrics back into telemetry.json too (not just the CSV).
         if args.telemetry and os.path.exists(args.telemetry):
             tele["metrics"] = metrics
