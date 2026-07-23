@@ -72,7 +72,8 @@ function parseArgs(argv) {
     endpoint: null,        // vLLM/OpenAI base URL for extraction (+ residual)
     apiKey: "EMPTY",
     concurrency: 8,        // in-flight extract.py --endpoint requests (vLLM batches server-side)
-    extractModel: null,    // small VLM/LLM id (default: config extraction.small*Model)
+    extractModel: null,    // small VLM/LLM id for TEXT corpora (config extraction.small*Model)
+    clipModel: null,       // CLIP id for IMAGE corpora (config extraction.clipModel)
     theta: null,
     predCols: "0,1",       // predicted columns to compare vs GT tuple order
     force: false,          // re-run corpus schema design + extraction even if cached
@@ -99,6 +100,7 @@ function parseArgs(argv) {
     else if (a === "--api-key" && argv[i + 1]) args.apiKey = argv[++i];
     else if (a === "--concurrency" && argv[i + 1]) args.concurrency = parseInt(argv[++i], 10);
     else if (a === "--extract-model" && argv[i + 1]) args.extractModel = argv[++i];
+    else if (a === "--clip-model" && argv[i + 1]) args.clipModel = argv[++i];
     else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
     else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
     else if (a === "--force") args.force = true;
@@ -465,8 +467,9 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   }
   if (doRun && !args.dryRun && existsSync(driverPath) && (!existsSync(attrsPath) || args.force)) {
     // IMAGE corpora extract locally via semvision (tiered CV+CLIP proxies) — the model
-    // is the CLIP id and NO vLLM endpoint is needed. TEXT corpora keep the endpoint path.
-    const imageModel = args.extractModel || defaults.extraction.clipModel;
+    // is a CLIP id (NOT the VLM --extract-model) and NO vLLM endpoint is needed. TEXT
+    // corpora keep the endpoint path with the VLM --extract-model.
+    const imageModel = args.clipModel || defaults.extraction.clipModel;
     const exArgs = [driverPath, corpus.path, attrsPath, "--schema", schemaPath,
       "--model", (isImage ? imageModel : extractModel),
       ...(isImage ? ["--image-dir", args.imageDir] : []),
