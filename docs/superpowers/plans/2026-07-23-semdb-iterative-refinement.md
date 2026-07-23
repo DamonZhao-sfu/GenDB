@@ -594,7 +594,14 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
                outcome: await scoreIter(iter0Dir, iter0Code, iter0Csv, run0) };
   const history = [{ iter: 0, f1: best.outcome.f1, status: best.outcome.status, improved: true }];
 
-  for (let iteration = 1; iteration <= maxIter; iteration++) {
+  // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal (ground truth
+  // present and the query scored). Without it, iter_0's f1 is null — behave as single-shot.
+  const effectiveMaxIter = (best.outcome.f1 == null) ? 0 : maxIter;
+  if (best.outcome.f1 == null && maxIter > 0) {
+    console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
+  }
+
+  for (let iteration = 1; iteration <= effectiveMaxIter; iteration++) {
     const decision = shouldContinueSemdb(history, iteration, maxIter, defaults.refineStallThreshold);
     console.log(`[SemDB] [${query}] --- refine ${iteration}/${maxIter} --- ${decision.action}: ${decision.reason}`);
     if (decision.action === "stop") break;
