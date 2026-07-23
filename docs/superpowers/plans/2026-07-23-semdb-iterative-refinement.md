@@ -831,8 +831,10 @@ Replace the block from `if (!existsSync(solvePath) || args.force) { ... }` throu
   };
 
   // Refinement iterations re-invoke ONLY the Solver, editing the seeded code with feedback.
+  // Helpers were generated ONCE into iter_0 (refineLoop seeds only the code forward), so read
+  // them from iter_0 — NOT from the current iterDir (which has no helpers file).
   const regenSolver = async (iterDir, iterCode, feedback) => {
-    const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
+    const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
     record("vadar_solver", await runPhase(vadarSolverConfig, {
       query_id: query, query_sql: sql + "\n\n" + feedback, query_nl: nl || "(none)", semdb_dir: __dirname,
       tables_doc: tableLines.join("\n"),
@@ -1463,7 +1465,9 @@ modality-aware versions (everything else in the closure block is unchanged):
   };
 
   const regenSolver = async (iterDir, iterCode, feedback) => {
-    const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
+    // Helpers were generated ONCE into iter_0 (refineLoop seeds only code forward) — read
+    // from iter_0, not the current iterDir which has no helpers file.
+    const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
     const vars = solverVars(iterCode, sql + "\n\n" + feedback,
       existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)");
     record("vadar_solver", await runPhase(vadarSolverConfig, vars, iterDir, args,
