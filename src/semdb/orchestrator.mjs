@@ -993,7 +993,7 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   // Refinement iterations re-invoke ONLY the Solver, editing the seeded code with feedback.
   const regenSolver = async (iterDir, iterCode, feedback) => {
-    const helpersPath = resolve(iterDir, `_vadar_helpers_${query}.py`);
+    const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
     record("vadar_solver", await runPhase(vadarSolverConfig, {
       query_id: query, query_sql: sql + "\n\n" + feedback, query_nl: nl || "(none)", semdb_dir: __dirname,
       tables_doc: tableLines.join("\n"),
