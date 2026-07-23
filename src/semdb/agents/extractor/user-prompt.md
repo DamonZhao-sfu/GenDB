@@ -24,6 +24,11 @@ those.
 - Public API: `semextract.run(driver, schema, table_path, out_path, *, modality,
   model, endpoint=None, api_key="EMPTY", concurrency=8, theta=None, image_dir=None,
   limit=0, max_new_tokens=128, timeout=120, prompt_style="json")`.
+- For TEXT corpora import `semtext` instead: `semtext.run_extraction(driver, schema,
+  table_path, out_path, *, model, endpoint, api_key="EMPTY", concurrency=8, theta=None)`.
+  `driver` implements `map_columns(header)` and `extract(patch) -> {field: value}` composing
+  `vadar.predefined_text` over the `semtext.TextPatch` it is handed. The engine owns
+  concurrency / meta / checkpoint / abort — do not re-implement them.
 - Helpers you may reuse: `semextract.build_prompt(schema, "json")` and
   `semextract.resolve_image_path(uri, image_dir)`.
 - Driver hooks to implement: `map_columns(header)`, `preprocess(row, cols)`,
@@ -38,9 +43,11 @@ Accept `--image-dir` even for text (ignore it there). Bake `modality="{{modality
 into the `semextract.run(...)` call.
 
 ## Output
-- If Modality is `image`, target `semvision.run` (tiered non-VLM proxies driven by each
+- If Modality is `image`, target `vadar_engine.run` (tiered non-VLM proxies driven by each
   attribute's `extractor` spec); `--model` is the CLIP model id, no `--endpoint` needed.
-  If Modality is `text`, target `semextract.run` as before.
+  If Modality is `text`, compose the predefined TEXT API (`judge/classify/extract/score`
+  from `vadar/predefined_text.py`) in `Driver.extract(patch)` and call
+  `semtext.run_extraction(...)`; `--model` is the endpoint LLM id and `--endpoint` is required.
 - Write the driver to: {{driver_path}}
 - Do NOT run the full corpus. You MAY smoke-test with `--limit 2` if an endpoint is
   reachable; otherwise just verify `python3 {{driver_path}} --help` works and the

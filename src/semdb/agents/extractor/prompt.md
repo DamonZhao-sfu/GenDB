@@ -97,8 +97,55 @@ if __name__ == "__main__":
     vadar_engine.run(d, json.load(open(a.schema)), a.table, a.out,
                      model=a.model, image_dir=a.image_dir)
 ```
-`--model` is the CLIP id; NO `--endpoint`. TEXT corpora still use `semextract.run`.
+`--model` is the CLIP id; NO `--endpoint`.
 (Reference compositions + engine: `src/semdb/vadar_run.py`, `src/semdb/vadar_engine.py`.)
+
+## Text corpora — compose the predefined TEXT API (in-code semantic inference)
+When the corpus modality is TEXT, do NOT hand-roll endpoint/JSON plumbing. You WRITE a
+`Driver.extract(patch) -> {field: value, ...}` that composes the predefined TEXT API
+(`judge / classify / extract / generate / score` from `vadar/predefined_text.py`, backed
+by `semtext.TextPatch`) — the text analog of the image `Driver.extract(patch)` that
+composes ImagePatch. Pick the lightest primitive per schema attribute:
+
+- boolean AI.IF predicate → `judge(patch, "<yes/no question>")`
+- a value from a CLOSED value space (enum / DB column) → `classify(patch, LABELS)`
+- one named attribute → `extract(patch, "<field>")`
+- a soft/relevance score → `score(patch, "<short phrase>")`
+
+Value-space lists come from the schema's `labels` (already filled from `labels_from`).
+The returned value IS the field value (joins/filters downstream). Emit exactly this shape
+(the orchestrator runs it with `<table> <attrs> --schema S --model M --endpoint U --api-key K
+--concurrency N`):
+
+```python
+import sys, os, json, argparse
+sys.path.insert(0, "<dir containing semtext.py>")   # given to you (semdb_dir)
+import semtext
+from vadar.predefined_text import judge, classify, extract, score
+
+LABELS = [...]                      # e.g. from schema.attributes[].labels
+
+class Driver:
+    def map_columns(self, header):
+        return {"id": "<id col>", "text": "<text col>", "context": ["<extra cols>"]}
+    def extract(self, patch):
+        # ONE entry per schema attribute, composing predefined_text over `patch`.
+        return {"sentiment": classify(patch, LABELS)}
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("table"); ap.add_argument("out")
+    ap.add_argument("--schema", required=True); ap.add_argument("--model", required=True)
+    ap.add_argument("--endpoint"); ap.add_argument("--api-key", default="EMPTY")
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--image-dir"); ap.add_argument("--theta")   # accepted, ignored
+    a = ap.parse_args()
+    semtext.run_extraction(Driver(), json.load(open(a.schema)), a.table, a.out,
+                           model=a.model, endpoint=a.endpoint, api_key=a.api_key,
+                           concurrency=a.concurrency, theta=a.theta)
+```
+`--model` is the endpoint LLM id; `--endpoint` is required for text. Accept `--image-dir`
+and ignore it. (Reference API: `src/semdb/vadar/predefined_text.py`, engine: `semtext.run_extraction`.)
 
 ## Rules
 - Map columns from the ACTUAL header you are given; pick the id/text/image columns
