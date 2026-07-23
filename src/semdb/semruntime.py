@@ -2,75 +2,45 @@
 semruntime.py — runtime helpers that compiled SemDB queries import for the
 RESIDUAL path (the rows the cheap relational plan was unsure about).
 
-`vlm_judge` sends the ORIGINAL semantic predicate to a vLLM / OpenAI-compatible
-endpoint and returns a boolean. It works for both modalities: pass image_path for
-a VLM judge (q2a/q7 logo), omit it for a text-only judge (q3/q5/q6). Every call is
-counted in METER so the compiled query can report residual_calls.
+RESIDUAL FALLBACK IS CURRENTLY DISABLED. `vlm_judge` / `llm_judge` are no-ops that
+return False without calling any model — so a compiled query's result comes PURELY
+from the extracted attributes + relational code. This is deliberate: we want to
+measure the generated code's own ability, not a live-model crutch. Rows the plan
+was unsure about are simply left unmatched and counted in `METER.skipped`.
+
+To re-enable the live residual judge later, restore the endpoint-backed body (see
+git history) — the call sites in generated code do not need to change.
 
 Example (inside a generated compiled_<q>.py):
     from semruntime import vlm_judge, METER
-    if vlm_judge(
-            f"Determine if the image shows the logo of {airline}. Answer YES or NO.",
-            endpoint=args.endpoint, model=args.model, api_key=args.api_key,
-            image_path=image_file):
-        pairs.append((airline, uri))
+    if vlm_judge(f"Determine if the image shows the logo of {airline}.",
+                 endpoint=args.endpoint, model=args.model, api_key=args.api_key,
+                 image_path=image_file):
+        pairs.append((airline, uri))     # never taken while disabled
     ...
-    residual_calls = METER.judge_calls
+    residual_calls = METER.judge_calls   # stays 0; METER.skipped counts the unsure rows
 """
-
-import base64
-import json
-import os
-import urllib.request
 
 
 class _Meter:
     def __init__(self):
-        self.judge_calls = 0
+        self.judge_calls = 0     # real live-model residual calls (0 while disabled)
+        self.skipped = 0         # rows that WOULD have gone to the residual judge
 
 
 METER = _Meter()
 
 
-def _data_url(path):
-    ext = (os.path.splitext(path)[1].lstrip(".") or "png").lower()
-    mime = "jpeg" if ext in ("jpg", "jpeg") else ext
-    with open(path, "rb") as f:
-        return f"data:image/{mime};base64," + base64.b64encode(f.read()).decode()
+def vlm_judge(prompt, endpoint=None, model=None, api_key="EMPTY", image_path=None, timeout=120):
+    """DISABLED residual judge: never calls a model, always returns False, requires
+    no endpoint. Counts the row in METER.skipped so the compiled query can report how
+    many unsure rows were left unresolved. Signature kept stable so generated code is
+    unchanged."""
+    METER.skipped += 1
+    return False
 
 
-def vlm_judge(prompt, endpoint, model, api_key="EMPTY", image_path=None, timeout=120):
-    """Send the semantic yes/no predicate to the endpoint. Returns True/False.
-
-    `prompt` is the original AI.IF question (e.g. "does this image show the logo
-    of Southwest Airlines?"). image_path adds the image for a VLM judge; omit it
-    for a text predicate. Requires an OpenAI-compatible server (vLLM)."""
-    if not endpoint:
-        raise RuntimeError(
-            "vlm_judge needs an --endpoint (vLLM/OpenAI server). Without one the "
-            "residual path cannot re-check unsure rows — pass --endpoint to the "
-            "compiled query (the orchestrator forwards it).")
-    METER.judge_calls += 1
-    content = [{"type": "text", "text": prompt.rstrip() + "\nAnswer strictly YES or NO."}]
-    if image_path:
-        content.append({"type": "image_url", "image_url": {"url": _data_url(image_path)}})
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 4,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        endpoint.rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        out = json.loads(resp.read())
-    text = out["choices"][0]["message"]["content"].strip().lower()
-    return text.startswith("y") or "yes" in text[:6]
-
-
-# Text-only alias for readability in generated code.
-def llm_judge(prompt, endpoint, model, api_key="EMPTY", timeout=120):
-    return vlm_judge(prompt, endpoint, model, api_key=api_key, image_path=None, timeout=timeout)
+def llm_judge(prompt, endpoint=None, model=None, api_key="EMPTY", timeout=120):
+    """Text-only alias — also disabled."""
+    METER.skipped += 1
+    return False
