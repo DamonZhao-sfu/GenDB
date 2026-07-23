@@ -601,10 +601,12 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
   // means iter_0 RAN OK but could not be scored (no ground truth) → single-shot. A crash or
   // empty output WITH ground truth is NOT "no signal" — it must keep iterating (fix-first),
   // matching shouldContinueSemdb, which returns "continue" when the last run is not "ok".
-  const noSignal = best.outcome.status === "ok" && best.outcome.f1 == null;
+  // args.dryRun is included: in dry-run the closures are no-ops so iter_0 status is "empty"
+  // (never "ok"); without this the loop would advance to iter 1 and crash seeding code.
+  const noSignal = args.dryRun || (best.outcome.status === "ok" && best.outcome.f1 == null);
   const effectiveMaxIter = noSignal ? 0 : maxIter;
   if (noSignal && maxIter > 0) {
-    console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
+    console.log(`[SemDB] [${query}] no F1 signal — single-shot, skipping refinement.`);
   }
 
   for (let iteration = 1; iteration <= effectiveMaxIter; iteration++) {
