@@ -663,6 +663,97 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   return { corpusDir, schemaPath, attrsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
 }
 
+/** Run evaluate.py (with --emit-diff) for one iteration and read the outcome back.
+ *  Returns { status, f1, metrics, diff, stderrTail }. status: "ok"|"empty" (crash is
+ *  detected by the caller from the run step). Only writes results.csv when finalize. */
+async function scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPath, csvPath, finalize) {
+  if (!existsSync(resultsCsv)) return { status: "empty", f1: null, metrics: null, diff: null };
+  const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
+  if (!gt) return { status: "ok", f1: null, metrics: null, diff: null };
+  const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
+    "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
+    "--query", query, "--benchmark", args.benchmark,
+    "--emit-diff", diffPath, "--diff-cap", String(defaults.refineSampleCap),
+    ...(finalize ? ["--csv", csvPath] : ["--csv", resolve(dirname(diffPath), "_scratch_results.csv")]),
+    ...(args.groundTruthDir ? ["--ground-truth-dir", args.groundTruthDir] : []),
+    ...(args.scaleFactor ? ["--sf", String(args.scaleFactor)] : [])];
+  const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
+  if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
+  // Read metrics from the DIFF json (it carries f1/precision/recall/tp/fp/fn), NOT from
+  // telePath: during iterations telemetry.json does not exist yet, so evaluate.py can't
+  // persist metrics into it. The diff file is always written when there is ground truth.
+  const diff = await readJSON(diffPath);
+  if (!diff) return { status: "ok", f1: null, metrics: null, diff: null };
+  const metrics = {
+    f1: diff.f1 ?? null, precision: diff.precision ?? null, recall: diff.recall ?? null,
+    tp: diff.tp ?? null, fp: diff.fp ?? diff.fp_total ?? null, fn: diff.fn ?? diff.fn_total ?? null,
+  };
+  return { status: "ok", f1: metrics.f1, metrics, diff };
+}
+
+/**
+ * GenDB-style per-query refinement loop. iter_0 = genFirst(); iters 1..maxIter =
+ * regen(feedback) → keep-or-rollback. Best code wins; the best iteration's results
+ * CSV is copied back to `resultsCsv`. No-op (single shot) when maxIter is 0.
+ *
+ * Closure contract (each generates code AND runs it, returning the RUN outcome;
+ * scoreIter then scores that run — no shared mutable state between them):
+ *   genFirst(iterDir, iterCode, iterCsv) -> { status: "ok"|"crash"|"empty", stderr }
+ *   regen(iterDir, iterCode, iterCsv, feedback) -> { status, stderr }
+ *   scoreIter(iterDir, iterCode, iterCsv, runOutcome) -> { status, f1, metrics, diff, stderrTail }
+ */
+async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter }) {
+  const maxIter = args.noRefine ? 0 : (args.maxIterations ?? defaults.maxRefineIterations);
+  const iter0Dir = resolve(runDir, "iter_0");
+  await mkdir(iter0Dir, { recursive: true });
+  const iter0Code = resolve(iter0Dir, codeBasename);
+  const iter0Csv = resolve(iter0Dir, basename(resultsCsv));
+
+  const run0 = await genFirst(iter0Dir, iter0Code, iter0Csv);
+  let best = { iter: 0, dir: iter0Dir, code: iter0Code, csv: iter0Csv,
+               outcome: await scoreIter(iter0Dir, iter0Code, iter0Csv, run0) };
+  const history = [{ iter: 0, f1: best.outcome.f1, status: best.outcome.status, improved: true }];
+
+  // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal (ground truth
+  // present and the query scored). Without it, iter_0's f1 is null — behave as single-shot.
+  const effectiveMaxIter = (best.outcome.f1 == null) ? 0 : maxIter;
+  if (best.outcome.f1 == null && maxIter > 0) {
+    console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
+  }
+
+  for (let iteration = 1; iteration <= effectiveMaxIter; iteration++) {
+    const decision = shouldContinueSemdb(history, iteration, maxIter, defaults.refineStallThreshold);
+    console.log(`[SemDB] [${query}] --- refine ${iteration}/${maxIter} --- ${decision.action}: ${decision.reason}`);
+    if (decision.action === "stop") break;
+
+    const itDir = resolve(runDir, `iter_${iteration}`);
+    await mkdir(itDir, { recursive: true });
+    const itCode = resolve(itDir, codeBasename);
+    const itCsv = resolve(itDir, basename(resultsCsv));
+    // seed from the best code so far
+    await writeFile(itCode, await readFile(best.code, "utf-8"));
+
+    const feedback = renderFeedback({
+      status: best.outcome.status, f1: best.outcome.f1, metrics: best.outcome.metrics,
+      diff: best.outcome.diff, stderrTail: best.outcome.stderrTail, history,
+    });
+    const run = await regen(itDir, itCode, itCsv, feedback);
+    const outcome = await scoreIter(itDir, itCode, itCsv, run);
+    const improved = checkSemdbImprovement(best.outcome, outcome);
+    history.push({ iter: iteration, f1: outcome.f1, status: outcome.status, improved });
+    if (improved) {
+      console.log(`[SemDB] [${query}] iter ${iteration} improved (F1 ${best.outcome.f1} → ${outcome.f1}). Keeping.`);
+      best = { iter: iteration, dir: itDir, code: itCode, csv: itCsv, outcome };
+    } else {
+      console.log(`[SemDB] [${query}] iter ${iteration} did not improve. Rolling back.`);
+    }
+  }
+  // Promote the best iteration's artifacts to the run root.
+  if (existsSync(best.code)) await writeFile(resolve(runDir, codeBasename), await readFile(best.code, "utf-8"));
+  if (existsSync(best.csv)) await writeFile(resultsCsv, await readFile(best.csv, "utf-8"));
+  return { bestIter: best.iter, bestF1: best.outcome.f1, stopReason: history, history };
+}
+
 // ---------------------------------------------------------------------------
 // Per-query Phase C + execute + evaluate (reuses the corpus schema + attrs).
 // ---------------------------------------------------------------------------
@@ -671,7 +762,6 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   const wallStart = Date.now();
   const runDir = resolve(args.out, `${args.benchmark}-${query}`);
   await mkdir(runDir, { recursive: true });
-  const codePath = resolve(runDir, `compiled_${query}.py`);
   const resultsCsv = resolve(runDir, `${query}_results.csv`);
   const { schemaPath, attrsPath, schema, corpusTelemetry, extractModel } = art;
   const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
@@ -681,28 +771,48 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
 
   console.log(`\n[SemDB] ---- ${query}  (corpus ${corpus.table}, ${plan.type}) ----`);
 
-  // Phase C — Code Generator (per query; reuses the corpus schema + attrs).
-  record("code_generator", await runPhase(codeGeneratorConfig, {
-    query_id: query,
-    query_sql: sql,
+  const codeBasename = `compiled_${query}.py`;
+  const telePath = resolve(runDir, "telemetry.json");
+
+  const cgVars = (iterCode, querySql) => ({
+    query_id: query, query_sql: querySql,
     schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
-    attrs_path: attrsPath,
-    attrs_columns: "(schema attributes + conf)",
+    attrs_path: attrsPath, attrs_columns: "(schema attributes + conf)",
     structured_path: structured.path || "(structured table path)",
     structured_columns: "(see table headers)",
-    code_path: codePath,
-    code_basename: `compiled_${query}.py`,
-  }, runDir, args));
+    code_path: iterCode, code_basename: codeBasename,
+  });
 
-  if (doRun && existsSync(codePath) && existsSync(attrsPath)) {
-    const cqArgs = [codePath, structured.path, attrsPath, resultsCsv,
+  const runCompiled = (iterDir, iterCode, iterCsv) => {
+    if (!(doRun && existsSync(iterCode) && existsSync(attrsPath))) return { status: "empty", stderr: "" };
+    const cqArgs = [iterCode, structured.path, attrsPath, iterCsv,
       ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
     console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
-    const cq = spawnSync("python3", cqArgs, { stdio: "inherit" });
-    if (cq.status !== 0) console.warn(`[SemDB] compiled query exited ${cq.status} — check its CLI signature.`);
-  } else if (doRun) {
-    console.warn(`[SemDB] skipping compiled query — missing ${existsSync(codePath) ? attrsPath : codePath}`);
-  }
+    const cq = spawnSync("python3", cqArgs, { stdio: ["inherit", "inherit", "pipe"] });
+    const stderr = (cq.stderr || "").toString();
+    if (cq.status !== 0) { console.warn(`[SemDB] compiled query exited ${cq.status}.`); return { status: "crash", stderr }; }
+    return { status: "ok", stderr };
+  };
+
+  const genFirst = async (iterDir, iterCode, iterCsv) => {
+    record("code_generator", await runPhase(codeGeneratorConfig, cgVars(iterCode, sql), iterDir, args));
+    return runCompiled(iterDir, iterCode, iterCsv);
+  };
+  const regen = async (iterDir, iterCode, iterCsv, feedback) => {
+    record("code_generator", await runPhase(codeGeneratorConfig, cgVars(iterCode, sql + "\n\n" + feedback), iterDir, args));
+    return runCompiled(iterDir, iterCode, iterCsv);
+  };
+  const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
+    const diffPath = resolve(iterDir, "diff.json");
+    const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
+    const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
+    return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+  };
+
+  const { bestIter, bestF1, history } = await refineLoop({
+    args, query, runDir, codeBasename, resultsCsv,
+    genFirst, regen, scoreIter,
+  });
 
   if (args.dryRun) return null;
 
@@ -749,9 +859,11 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
     call_reduction: reduction,
     total_estimated_cost_usd: Number(amortizedCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
+    refine: { iterations: history.length - 1, best_iteration: bestIter,
+              max_iterations: args.noRefine ? 0 : args.maxIterations,
+              f1_history: history },
     phases,
   };
-  const telePath = resolve(runDir, "telemetry.json");
   await writeFile(telePath, JSON.stringify(report, null, 2));
 
   // --- Summary print ---
@@ -765,15 +877,16 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
   console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"} [${plan.type}] ${naiveExpr}`);
   console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls} (extraction ${extractionCalls} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
 
-  // --- Score against ground truth + append CSV ---
+  // (3) finalize: score the promoted best CSV → merge metrics into telemetry + append results.csv row
+  if (doRun) {
+    const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
+    if (gt && existsSync(resultsCsv)) {
+      await scoreWithDiff(args, query, planObj, telePath, resultsCsv, resolve(runDir, "diff.json"), csvPath, true);
+    }
+  }
+
+  // --- Score against ground truth + append CSV (re-read telePath, merged by finalize above) ---
   if (doRun && gt && existsSync(resultsCsv)) {
-    const evArgs = [resolve(__dirname, "evaluate.py"), "--telemetry", telePath,
-      "--ground-truth", gt.file, "--pred", resultsCsv, "--pred-cols", args.predCols,
-      "--query", query, "--benchmark", args.benchmark, "--csv", csvPath,
-      ...(args.groundTruthDir ? ["--ground-truth-dir", args.groundTruthDir] : []),
-      ...(args.scaleFactor ? ["--sf", String(args.scaleFactor)] : [])];
-    const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
-    if (ev.status !== 0) console.warn(`[SemDB] evaluate.py exited ${ev.status}.`);
     const scored = await readJSON(telePath);
     const m = scored?.metrics;
     if (m) {
