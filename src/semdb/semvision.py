@@ -179,6 +179,85 @@ class ClipEncoder:
 
 
 # ---------------------------------------------------------------------------
+# ③ Detectors (YOLO) — object/species presence & counting
+# ---------------------------------------------------------------------------
+
+def detect(img_path, classes, detector, min_conf=0.25):
+    """`detector.detect(img_path, min_conf) -> list[(class_name, conf)]`.
+    Returns (present classes ⊆ `classes`, max confidence, per-class counts)."""
+    conf_by, count_by = {}, {}
+    for name, c in detector.detect(img_path, min_conf):
+        if name in classes:
+            conf_by[name] = max(conf_by.get(name, 0.0), c)
+            count_by[name] = count_by.get(name, 0) + 1
+    found = [c for c in classes if c in conf_by]
+    return found, (max(conf_by.values()) if conf_by else 0.0), count_by
+
+
+_DETECTOR_CACHE = {}
+
+
+def get_detector(model_id="yolov8n.pt"):
+    if model_id not in _DETECTOR_CACHE:
+        _DETECTOR_CACHE[model_id] = YoloDetector(model_id)
+    return _DETECTOR_CACHE[model_id]
+
+
+class YoloDetector:
+    def __init__(self, model_id="yolov8n.pt"):
+        from ultralytics import YOLO
+        self.model = YOLO(model_id)
+
+    def detect(self, img_path, min_conf=0.25):
+        res = self.model.predict(img_path, verbose=False, conf=min_conf)[0]
+        names = res.names
+        return [(names[int(b.cls)], float(b.conf)) for b in res.boxes]
+
+
+# ---------------------------------------------------------------------------
+# ③ Domain classifiers (chest X-ray) — pathology probabilities
+# ---------------------------------------------------------------------------
+
+def domain_classify(img_path, model, positive_labels, threshold=0.5):
+    """`model.probs(img_path) -> dict[label->prob]`. Returns (yes/no, score) where
+    score = max prob over `positive_labels` (the 'sick/abnormal' pathologies)."""
+    p = model.probs(img_path)
+    score = max((p.get(l, 0.0) for l in positive_labels), default=0.0)
+    return ("yes" if score >= threshold else "no"), float(score)
+
+
+_DOMAIN_CACHE = {}
+
+
+def get_domain_model(model_id):
+    """model_id like 'torchxrayvision:densenet121-res224-all'."""
+    if model_id not in _DOMAIN_CACHE:
+        kind, _, name = model_id.partition(":")
+        if kind == "torchxrayvision":
+            _DOMAIN_CACHE[model_id] = XrayClassifier(name or "densenet121-res224-all")
+        else:
+            raise ValueError(f"unknown domain model {model_id!r}")
+    return _DOMAIN_CACHE[model_id]
+
+
+class XrayClassifier:
+    def __init__(self, weights="densenet121-res224-all"):
+        import torch
+        import torchxrayvision as xrv  # pip install torchxrayvision
+        self.torch, self.xrv = torch, xrv
+        self.model = xrv.models.DenseNet(weights=weights).eval()
+
+    def probs(self, img_path):
+        img = np.asarray(Image.open(img_path).convert("L"), dtype=np.float32)
+        img = self.xrv.datasets.normalize(img, 255)          # → [-1024, 1024]
+        img = self.xrv.datasets.XRayCenterCrop()(img[None, ...])
+        t = self.torch.from_numpy(img)[None, ...]            # [1,1,H,W]
+        with self.torch.no_grad():
+            out = self.model(t)[0]
+        return {p: float(v) for p, v in zip(self.model.pathologies, out) if p}
+
+
+# ---------------------------------------------------------------------------
 # Per-attribute dispatch
 # ---------------------------------------------------------------------------
 
@@ -202,7 +281,18 @@ def _run_attr(image_path, attr, ctx):
             score = clip_match(image_path, params["text"], enc)
             thr = params.get("threshold")
             return (("yes" if score >= thr else "no") if thr is not None else score), score
-    # unknown / vlm / dino / detector / domain (not yet implemented) → residual miss
+    if tier == "detector":
+        found, s, _counts = detect(image_path, spec["classes"], ctx["detector"],
+                                   min_conf=params.get("min_conf", 0.25))
+        if is_list:
+            return found, s
+        return ("yes" if found else "no"), s     # single-class presence
+    if tier == "domain":
+        model = ctx["domain"][spec["model"]]
+        return domain_classify(image_path, model,
+                               spec.get("labels") or spec.get("positive") or [],
+                               params.get("threshold", 0.5))
+    # unknown / vlm / dino / distilled (not implemented) → residual miss
     return ([] if is_list else "none"), 0.0
 
 
@@ -234,6 +324,12 @@ def validate_extractor_spec(attr):
         errs.append(f"'{attr.get('name')}' clip match needs params.text")
     if tier == "cv" and spec.get("method") != "dominant_colors":
         errs.append(f"'{attr.get('name')}' cv only supports method 'dominant_colors'")
+    if tier == "detector" and not spec.get("classes"):
+        errs.append(f"'{attr.get('name')}' detector needs 'classes'")
+    if tier == "domain" and not spec.get("model"):
+        errs.append(f"'{attr.get('name')}' domain needs 'model' (e.g. torchxrayvision:densenet121-res224-all)")
+    if tier == "domain" and not (spec.get("labels") or spec.get("positive")):
+        errs.append(f"'{attr.get('name')}' domain needs 'labels'/'positive' pathologies")
     return errs
 
 
@@ -241,12 +337,13 @@ def validate_extractor_spec(attr):
 # Engine
 # ---------------------------------------------------------------------------
 
-def _uses_clip(schema):
-    return any((a.get("extractor") or {}).get("tier") == "clip" for a in schema.get("attributes", []))
+def _tiers_used(schema):
+    return {(a.get("extractor") or {}).get("tier") for a in schema.get("attributes", [])}
 
 
 def run(driver, schema, table_path, out_path, *, image_dir=None,
-        clip_model="openai/clip-vit-base-patch32", limit=0, palette=None):
+        clip_model="openai/clip-vit-base-patch32", detector_model="yolov8n.pt",
+        limit=0, palette=None):
     import semextract  # reuse resolve_image_path + _none_record
     t0 = time.time()
     rows = list(csv.DictReader(open(table_path)))
@@ -254,7 +351,15 @@ def run(driver, schema, table_path, out_path, *, image_dir=None,
         rows = rows[:limit]
     cols = driver.map_columns(list(rows[0].keys()) if rows else [])
     id_col = cols["id"]
-    ctx = {"encoder": get_encoder(clip_model) if _uses_clip(schema) else None, "palette": palette}
+    tiers = _tiers_used(schema)
+    ctx = {"encoder": get_encoder(clip_model) if "clip" in tiers else None,
+           "palette": palette,
+           "detector": get_detector(detector_model) if "detector" in tiers else None,
+           "domain": {}}
+    for a in schema.get("attributes", []):
+        sp = a.get("extractor") or {}
+        if sp.get("tier") == "domain" and sp.get("model") and sp["model"] not in ctx["domain"]:
+            ctx["domain"][sp["model"]] = get_domain_model(sp["model"])
     if hasattr(driver, "image_dir") and driver.image_dir is None:
         driver.image_dir = image_dir
 
