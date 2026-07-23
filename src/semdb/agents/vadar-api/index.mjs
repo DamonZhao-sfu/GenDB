@@ -6,6 +6,7 @@ export const config = {
   promptPath: resolve(__dirname, "prompt.md"),
   promptPathText: resolve(__dirname, "prompt-text.md"),
   userPromptPath: resolve(__dirname, "user-prompt.md"),
+  userPromptPathText: resolve(__dirname, "user-prompt-text.md"),
   allowedTools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
   model: "sonnet",
 };

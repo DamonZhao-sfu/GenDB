@@ -402,8 +402,9 @@ async function listQueries(dir) {
 
 async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
   const systemPromptPath = opts.systemPromptPath || agentConfig.promptPath;
+  const userPromptPath = opts.userPromptPath || agentConfig.userPromptPath;
   const systemPrompt = await readFile(systemPromptPath, "utf-8");
-  const template = await readFile(agentConfig.userPromptPath, "utf-8");
+  const template = await readFile(userPromptPath, "utf-8");
   const userPrompt = renderTemplate(template, vars);
 
   if (args.dryRun) {
@@ -964,9 +965,15 @@ async function runQueryDirect(args, planObj, csvPath) {
   const telePath = resolve(runDir, "telemetry.json");
 
   const textModel = args.extractModel || defaults.extraction.smallTextModel;
+  // Text corpora select BOTH the text system prompt AND the text user prompt (the shared
+  // user prompts are image-specific and would otherwise make the text solver emit image
+  // code). Image corpora leave both undefined → runPhase falls back to the image prompts.
   const sysPrompts = isImage
     ? {}
     : { sig: vadarSignatureConfig.promptPathText, api: vadarApiConfig.promptPathText, solver: vadarSolverConfig.promptPathText };
+  const userPrompts = isImage
+    ? {}
+    : { sig: vadarSignatureConfig.userPromptPathText, api: vadarApiConfig.userPromptPathText, solver: vadarSolverConfig.userPromptPathText };
 
   const runSolver = (iterDir, iterCode, iterCsv) => {
     if (!(doRun && existsSync(iterCode))) return { status: "empty", stderr: "" };
@@ -1001,13 +1008,13 @@ async function runQueryDirect(args, planObj, csvPath) {
       ...common, query_sql: querySql,
       schema_json: "(DIRECT mode: no schema; read value spaces from the CSVs at runtime)",
       sig_path: sigPath,
-    }, iterDir, args, { systemPromptPath: sysPrompts.sig }));
+    }, iterDir, args, { systemPromptPath: sysPrompts.sig, userPromptPath: userPrompts.sig }));
     record("vadar_api", await runPhase(vadarApiConfig, {
       ...common, sig_path: sigPath, helpers_path: helpersPath,
-    }, iterDir, args, { systemPromptPath: sysPrompts.api }));
+    }, iterDir, args, { systemPromptPath: sysPrompts.api, userPromptPath: userPrompts.api }));
     record("vadar_solver", await runPhase(vadarSolverConfig,
       solverVars(iterCode, querySql, helpersPath),
-      iterDir, args, { systemPromptPath: sysPrompts.solver }));
+      iterDir, args, { systemPromptPath: sysPrompts.solver, userPromptPath: userPrompts.solver }));
   };
 
   const regenSolver = async (iterDir, iterCode, feedback) => {
@@ -1017,7 +1024,7 @@ async function runQueryDirect(args, planObj, csvPath) {
     const vars = solverVars(iterCode, sql + "\n\n" + feedback,
       existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)");
     record("vadar_solver", await runPhase(vadarSolverConfig, vars, iterDir, args,
-      { systemPromptPath: sysPrompts.solver }));
+      { systemPromptPath: sysPrompts.solver, userPromptPath: userPrompts.solver }));
   };
 
   const genFirst = async (iterDir, iterCode, iterCsv) => {
