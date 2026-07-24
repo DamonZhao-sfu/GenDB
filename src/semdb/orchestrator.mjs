@@ -26,7 +26,7 @@
  */
 
 import { readFile, writeFile, mkdir, readdir } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -55,7 +55,7 @@ import { config as codeGeneratorConfig } from "./agents/code-generator/index.mjs
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = {
     query: null,
     benchmark: null,     // inferred from --query-dir/--data-dir path if not given
@@ -69,6 +69,7 @@ function parseArgs(argv) {
     agentProvider: defaults.agentProvider,
     modelOverride: null,   // force one model for all agents (testing)
     groundTruthDir: null,  // SemBench raw_results/ground_truth
+    noGroundTruth: false,  // production mode: never derive/read GT or compute F1
     telemetryCsv: null,    // append the telemetry+metrics row here
     // Execution of the downstream Python steps (extract → compiled query → eval).
     run: false,            // force-run; auto-enabled when --ground-truth-dir is set
@@ -102,6 +103,7 @@ function parseArgs(argv) {
     else if (a === "--data-dir" && argv[i + 1]) args.dataDir = resolve(argv[++i]);
     else if (a === "--image-dir" && argv[i + 1]) args.imageDir = resolve(argv[++i]);
     else if (a === "--ground-truth-dir" && argv[i + 1]) args.groundTruthDir = resolve(argv[++i]);
+    else if (a === "--no-ground-truth") args.noGroundTruth = true;
     else if (a === "--telemetry-csv" && argv[i + 1]) args.telemetryCsv = resolve(argv[++i]);
     else if (a === "--out" && argv[i + 1]) args.out = resolve(argv[++i]);
     else if (a === "--run") args.run = true;
@@ -146,7 +148,9 @@ function parseArgs(argv) {
         ? resolve(base, "data", `sf_${args.scaleFactor}`)
         : resolve(base, "data");
     }
-    if (!args.groundTruthDir && b) args.groundTruthDir = resolve(base, b.gtDir);
+    if (!args.noGroundTruth && !args.groundTruthDir && b) {
+      args.groundTruthDir = resolve(base, b.gtDir);
+    }
   }
   // Image root varies by scenario (imageBase): under <dataDir> ("sf"), at the
   // sembench root for repo-relative path columns ("root"), or absolute ("absolute").
@@ -156,11 +160,12 @@ function parseArgs(argv) {
     else if (ib === "root") args.imageDir = args.sembenchDir || null;
     else args.imageDir = resolve(args.dataDir, (b && b.imageRoot) || "images");
   }
+  if (args.noGroundTruth) args.groundTruthDir = null;
   return args;
 }
 
 /**
- * Improvement judge — correctness-first, then F1 (mirrors GenDB checkExecutionImprovement).
+ * Improvement selector — correctness-first, then F1 (mirrors GenDB behavior).
  * `prev`/`next` are { status: "ok"|"crash"|"empty", f1: number|null }.
  */
 export function checkSemdbImprovement(prev, next) {
@@ -187,6 +192,34 @@ export function shouldContinueSemdb(history, iteration, maxIter, stallThreshold)
     return { action: "stop", reason: `Stalled: ${thresh} non-improving iterations` };
   }
   return { action: "continue", reason: "Refinement potential remains" };
+}
+
+/**
+ * VADAR-generated runtime code is strictly offline. Code-generation agents may run
+ * before this point, but the emitted Python must not call a model/network endpoint or
+ * use an endpoint-backed semantic-judgement wrapper.
+ */
+const VADAR_RUNTIME_FORBIDDEN = [
+  ["semantic judge API", /\bjudge\s*\(|\b(?:vlm_judge|gen_endpoint)\s*\(/i],
+  ["semtext endpoint wrapper", /\b(?:semtext|TextPatch|get_ctx)\b/i],
+  ["endpoint/API credential",
+    /--endpoint\b|--api-key\b|\.endpoint\b|\.api_?key\b|\b(?:endpoint|api_?key)\s*(?:=|[,):])/i],
+  ["OpenAI client", /\b(?:from|import)\s+openai\b|\bOpenAI\s*\(/i],
+  ["HTTP/network client", /\b(?:requests|httpx|aiohttp|urllib|socket)\b/i],
+  ["shell/network escape", /\b(?:subprocess|Popen|urlopen|curl)\b|\bos\.system\s*\(/i],
+];
+
+export function offlineVadarViolations(source) {
+  return VADAR_RUNTIME_FORBIDDEN
+    .filter(([, pattern]) => pattern.test(source))
+    .map(([label]) => label);
+}
+
+function validateOfflineVadarFile(path) {
+  const violations = offlineVadarViolations(readFileSync(path, "utf-8"));
+  if (violations.length) {
+    throw new Error(`Refusing to execute non-offline VADAR code ${path}: ${violations.join(", ")}`);
+  }
 }
 
 /** Load a SemBench query's SQL from the query folder, and its NL intent if present. */
@@ -570,8 +603,7 @@ async function ensureCorpus(args, corpus, corpusQueries) {
 
   // Phase B — Extractor ONCE, in two steps mirroring Phase C (Code Generator):
   //   1. GENERATE a thin per-corpus driver (agent) -> extract_<corpus>.py that
-  //      implements the semextract ExtractDriver hooks (column mapping, prompt +
-  //      context columns, preprocessing) and calls semextract.run(...).
+  //      composes a local modality API and calls its offline execution engine.
   //   2. EXECUTE it (orchestrator) on the full corpus -> attrs + <attrs>.meta.json.
   // Both cache per corpus (amortized across all its queries).
   const driverPath = resolve(corpusDir, `extract_${corpus.table}.py`);
@@ -592,10 +624,12 @@ async function ensureCorpus(args, corpus, corpusQueries) {
       record("vadar_api", await runPhase(vadarApiConfig, {
         ...common, sig_path: sigPath, helpers_path: helpersPath,
       }, corpusDir, args));
+      if (!args.dryRun && existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
       record("vadar_program", await runPhase(vadarProgramConfig, {
         ...common, schema_json: schemaJson, helpers_path: helpersPath, driver_path: driverPath,
         header: cols.join(", "), id_col: idCol, image_col: imageCol,
       }, corpusDir, args));
+      if (!args.dryRun && existsSync(driverPath)) validateOfflineVadarFile(driverPath);
     } else {
       record("extractor", await runPhase(extractorConfig, {
         corpus_name: corpus.table,
@@ -613,20 +647,24 @@ async function ensureCorpus(args, corpus, corpusQueries) {
         attrs_path: attrsPath,
         semextract_path: resolve(__dirname, "semextract.py"),
       }, corpusDir, args));
+      if (!args.dryRun && existsSync(driverPath)) validateOfflineVadarFile(driverPath);
     }
   } else if (existsSync(driverPath)) {
     console.log(`[SemDB] reuse cached corpus extractor driver: ${driverPath}`);
   }
   if (doRun && !args.dryRun && existsSync(driverPath) && (!existsSync(attrsPath) || args.force)) {
-    // IMAGE corpora extract locally via semvision (tiered CV+CLIP proxies) — the model
-    // is a CLIP id (NOT the VLM --extract-model) and NO vLLM endpoint is needed. TEXT
-    // corpora keep the endpoint path with the VLM --extract-model.
+    // Generated extraction drivers run locally. Image drivers use CV+CLIP; text drivers
+    // use deterministic string/regex helpers. Neither generated runtime receives an
+    // endpoint or API key.
     const imageModel = args.clipModel || defaults.extraction.clipModel;
+    validateOfflineVadarFile(driverPath);
+    if (isImage) {
+      const helpersPath = resolve(corpusDir, "_vadar_helpers.py");
+      if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
+    }
     const exArgs = [driverPath, corpus.path, attrsPath, "--schema", schemaPath,
       "--model", (isImage ? imageModel : extractModel),
       ...(isImage ? ["--image-dir", args.imageDir] : []),
-      ...(!isImage && args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey,
-                           "--concurrency", String(args.concurrency)] : []),
       ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
     console.log(`\n[SemDB] Extracting corpus ${corpus.table} (once): python3 ${exArgs.join(" ")}`);
     const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
@@ -964,7 +1002,6 @@ async function runQueryDirect(args, planObj, csvPath) {
   const dataDir = args.tableDir || args.dataDir;
   const telePath = resolve(runDir, "telemetry.json");
 
-  const textModel = args.extractModel || defaults.extraction.smallTextModel;
   // Text corpora select BOTH the text system prompt AND the text user prompt (the shared
   // user prompts are image-specific and would otherwise make the text solver emit image
   // code). Image corpora leave both undefined → runPhase falls back to the image prompts.
@@ -976,12 +1013,21 @@ async function runQueryDirect(args, planObj, csvPath) {
     : { sig: vadarSignatureConfig.userPromptPathText, api: vadarApiConfig.userPromptPathText, solver: vadarSolverConfig.userPromptPathText };
 
   const runSolver = (iterDir, iterCode, iterCsv) => {
-    if (!(doRun && existsSync(iterCode))) return { status: "empty", stderr: "" };
+    if (!existsSync(iterCode)) return { status: "empty", stderr: "" };
+    try {
+      validateOfflineVadarFile(iterCode);
+      const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
+      if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
+    } catch (error) {
+      const stderr = String(error && error.message ? error.message : error);
+      console.warn(`[SemDB] ${stderr}`);
+      return { status: "crash", stderr };
+    }
+    if (!doRun) return { status: "empty", stderr: "" };
     const sArgs = isImage
       ? [iterCode, iterCsv, "--data-dir", dataDir, ...(imageDir ? ["--image-dir", imageDir] : []),
          "--clip-model", clipModel]
-      : [iterCode, iterCsv, "--data-dir", dataDir,
-         "--endpoint", args.endpoint || "", "--model", textModel, "--api-key", args.apiKey];
+      : [iterCode, iterCsv, "--data-dir", dataDir];
     console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
     const s = spawnSync("python3", sArgs, { stdio: ["inherit", "inherit", "pipe"] });
     const stderr = (s.stderr || "").toString();
@@ -1012,19 +1058,23 @@ async function runQueryDirect(args, planObj, csvPath) {
     record("vadar_api", await runPhase(vadarApiConfig, {
       ...common, sig_path: sigPath, helpers_path: helpersPath,
     }, iterDir, args, { systemPromptPath: sysPrompts.api, userPromptPath: userPrompts.api }));
+    if (!args.dryRun && existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
     record("vadar_solver", await runPhase(vadarSolverConfig,
       solverVars(iterCode, querySql, helpersPath),
       iterDir, args, { systemPromptPath: sysPrompts.solver, userPromptPath: userPrompts.solver }));
+    if (!args.dryRun && existsSync(iterCode)) validateOfflineVadarFile(iterCode);
   };
 
   const regenSolver = async (iterDir, iterCode, feedback) => {
     // Helpers were generated ONCE into iter_0 (refineLoop seeds only code forward) — read
     // from iter_0, not the current iterDir which has no helpers file.
     const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
+    if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
     const vars = solverVars(iterCode, sql + "\n\n" + feedback,
       existsSync(helpersPath) ? helpersPath : "(seed helpers from iter_0)");
     record("vadar_solver", await runPhase(vadarSolverConfig, vars, iterDir, args,
       { systemPromptPath: sysPrompts.solver, userPromptPath: userPrompts.solver }));
+    if (!args.dryRun && existsSync(iterCode)) validateOfflineVadarFile(iterCode);
   };
 
   const genFirst = async (iterDir, iterCode, iterCsv) => {
