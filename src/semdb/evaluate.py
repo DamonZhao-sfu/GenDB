@@ -208,6 +208,61 @@ def diff_pair(results, gold, cap):
     }
 
 
+_TEXT_RE = re.compile(r"text|description|overview|body|content|summary|symptoms|review|complaint|plot|display", re.I)
+
+
+def _corpus_text_map(rows, id_col=None, text_col=None):
+    """id -> a short text snippet, best-effort. id_col defaults to 'id' or the first
+    column; text_col defaults to the first text-ish column or the last column."""
+    if not rows:
+        return {}
+    keys = list(rows[0].keys())
+    idc = id_col or ("id" if "id" in keys else keys[0])
+    txc = text_col or next((k for k in keys if _TEXT_RE.search(k)), keys[-1])
+    out = {}
+    for r in rows:
+        rid = str(r.get(idc, "")).strip()
+        if rid:
+            out[rid] = str(r.get(txc, "")).strip()
+    return out
+
+
+def _norm(v):
+    """Match evaluate.py membership normalization: str, stripped, lowercased."""
+    return None if v is None else str(v).strip().lower()
+
+
+def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None):
+    """Per-row inference accuracy of a DIRECT solver's trace_<q>.json against a
+    hand-labeled val.json. Compares trace.rows[id] to val.labels[id] over the LABELED
+    ids only (normalized). A labeled id absent from the trace counts as wrong with
+    predicted=None. Returns accuracy + capped mistake samples (with a text snippet)."""
+    attr = val.get("attr", trace.get("attr", ""))
+    labels = val.get("labels", {})
+    pred_rows = trace.get("rows", {}) if isinstance(trace.get("rows"), dict) else {}
+    text_map = _corpus_text_map(corpus_rows, id_col, text_col)
+    correct = 0
+    mistakes = []
+    for rid, expected in labels.items():
+        sid = str(rid)
+        raw_pred = pred_rows.get(sid, pred_rows.get(rid, None))
+        if raw_pred is not None and _norm(raw_pred) == _norm(expected):
+            correct += 1
+        else:
+            snippet = text_map.get(sid, "")[:200]
+            mistakes.append({"id": sid, "text": snippet,
+                             "predicted": None if raw_pred is None else str(raw_pred),
+                             "expected": str(expected)})
+    n = len(labels)
+    return {
+        "query": val.get("query", trace.get("query", "")),
+        "attr": attr, "n": n, "correct": correct,
+        "accuracy": round(correct / n, 4) if n else None,
+        "mistakes": mistakes[:cap], "n_mistakes": len(mistakes),
+        "sampled": len(mistakes) > cap,
+    }
+
+
 def handler_id(query):
     """q3a -> 3, q10 -> 10 (SemBench: int(query_id[:-1]) when a letter trails)."""
     m = re.match(r"(\d+)", str(query).lower().lstrip("q"))
@@ -355,10 +410,34 @@ def main():
     ap.add_argument("--benchmark", default="", help="scenario: mmqa (stdlib) | movie|cars|medical|animals|ecomm (scenario_metrics)")
     ap.add_argument("--sf", default="", help="scale factor (cars/medical GT suffix resolution)")
     ap.add_argument("--telemetry", help="telemetry.json from the orchestrator")
-    ap.add_argument("--csv", required=True, help="output CSV (row appended; header written if new)")
+    ap.add_argument("--csv", help="output CSV (row appended; header written if new)")
+    ap.add_argument("--score-inference", action="store_true",
+                    help="per-row inference scoring mode: score --trace vs --val-file")
+    ap.add_argument("--trace", help="trace_<q>.json from a DIRECT solver (id -> inferred attr value)")
+    ap.add_argument("--val-file", help="hand-labeled val.json (id -> expected attr value)")
+    ap.add_argument("--corpus-csv", help="text corpus CSV, for mistake text snippets")
+    ap.add_argument("--id-col", help="corpus id column (default: 'id' or first column)")
+    ap.add_argument("--text-col", help="corpus text column (default: first text-ish or last column)")
     ap.add_argument("--emit-diff", help="also write FP/FN sample rows JSON to this path")
     ap.add_argument("--diff-cap", type=int, default=15, help="max FP and FN samples to emit")
     args = ap.parse_args()
+
+    if args.score_inference:
+        if not (args.trace and args.val_file):
+            ap.error("--score-inference requires --trace and --val-file")
+        trace = json.load(open(args.trace)) if os.path.exists(args.trace) else {"rows": {}}
+        val = json.load(open(args.val_file))
+        corpus_rows = None
+        if args.corpus_csv and os.path.exists(args.corpus_csv):
+            corpus_rows, _ = load_pred_rows(args.corpus_csv)
+        out = score_inference(trace, val, corpus_rows, args.diff_cap, args.id_col, args.text_col)
+        if args.emit_diff:
+            json.dump(out, open(args.emit_diff, "w"), indent=2)
+        print(f"[eval] inference accuracy {out['accuracy']} "
+              f"({out['correct']}/{out['n']}, {out['n_mistakes']} wrong) -> {args.emit_diff}")
+        return
+    if not args.csv:
+        ap.error("--csv is required unless --score-inference is set")
 
     tele = json.load(open(args.telemetry)) if args.telemetry and os.path.exists(args.telemetry) else {}
     llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
