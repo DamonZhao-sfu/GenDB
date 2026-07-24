@@ -89,6 +89,7 @@ export function parseArgs(argv) {
                            // solve_<q>.py that calls the local vision API and answers the query.
     maxIterations: defaults.maxRefineIterations,
     noRefine: false,
+    valFile: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -120,6 +121,7 @@ export function parseArgs(argv) {
     else if (a === "--direct") args.direct = true;
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--max-iterations" && argv[i + 1]) args.maxIterations = parseInt(argv[++i], 10);
+    else if (a === "--val-file" && argv[i + 1]) args.valFile = resolve(argv[++i]);
     else if (a === "--no-refine") args.noRefine = true;
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
@@ -463,7 +465,7 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
 
 /** Render the per-iteration feedback block appended to a generating agent's prompt.
  *  Runtime failures short-circuit to a fix-first block; otherwise metrics + FP/FN. */
-function renderFeedback(prev) {
+export function renderFeedback(prev) {
   const histLines = (prev.history || [])
     .map((h) => `  iter ${h.iter}: F1=${h.f1 == null ? "n/a" : h.f1} ${h.status.toUpperCase()}${h.improved ? " (improved)" : ""}`)
     .join("\n");
@@ -476,6 +478,23 @@ function renderFeedback(prev) {
       "```",
       "Diagnose and fix the error before any accuracy work.",
       histLines ? `\n## HISTORY\n${histLines}` : "",
+    ].join("\n");
+  }
+  // Per-row validation mode: diff carries `mistakes` (id/text/predicted/expected).
+  if (prev.diff && Array.isArray(prev.diff.mistakes)) {
+    const pm = prev.metrics || {};
+    const rows = (prev.diff.mistakes || [])
+      .map((r) => `  - id=${r.id} predicted=${r.predicted == null ? "MISSING" : r.predicted} expected=${r.expected}  text="${(r.text || "").slice(0, 160)}"`)
+      .join("\n") || "  (none)";
+    return [
+      `\n## LAST RUN — PER-ROW INFERENCE accuracy=${prev.f1} (${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)`,
+      `## MISLABELED ROWS — ${prev.diff.n_mistakes ?? 0} total, showing ${(prev.diff.mistakes || []).length}:`,
+      rows,
+      histLines ? `## HISTORY\n${histLines}` : "",
+      "Each row above was inferred WRONG for the query's key attribute. Diagnose WHY:",
+      "wrong value-space mapping, an over/under-broad judge/classify prompt, a bad",
+      "threshold, or the wrong attribute entirely. Revise the judge/classify/extract",
+      "call in the solver. Edit the existing program in place. Keep writing trace_<q>.json.",
     ].join("\n");
   }
   const m = prev.metrics || {};
