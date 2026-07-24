@@ -1,0 +1,11 @@
+{
+  "query": "q3a",
+  "attr": "genre",
+  "labels": {
+    "m1": "comedy",
+    "m2": "drama",
+    "m3": "comedy",
+    "m4": "documentary",
+    "m5": "drama"
+  }
+}
