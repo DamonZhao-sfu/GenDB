@@ -721,6 +721,27 @@ async function ensureCorpus(args, corpus, corpusQueries) {
   return { corpusDir, schemaPath, attrsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
 }
 
+/** Per-row validation scoring for one iteration: run evaluate.py --score-inference on
+ *  the solver's trace_<q>.json vs val.json, read accuracy + mistakes back. The loop's
+ *  generic `f1` field carries accuracy here. status "ok" requires a trace file. */
+async function scoreInference(args, query, iterDir, corpusCsv, valFile, diffPath) {
+  const tracePath = resolve(iterDir, `trace_${query}.json`);
+  if (!existsSync(tracePath)) return { status: "empty", f1: null, metrics: null, diff: null };
+  const evArgs = [resolve(__dirname, "evaluate.py"), "--score-inference",
+    "--trace", tracePath, "--val-file", valFile,
+    "--emit-diff", diffPath, "--diff-cap", String(defaults.refineSampleCap),
+    ...(corpusCsv ? ["--corpus-csv", corpusCsv] : [])];
+  const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
+  if (ev.status !== 0) console.warn(`[SemDB] evaluate.py --score-inference exited ${ev.status}.`);
+  const out = await readJSON(diffPath);
+  if (!out) return { status: "ok", f1: null, metrics: null, diff: null };
+  return {
+    status: "ok", f1: out.accuracy,
+    metrics: { accuracy: out.accuracy, n: out.n, correct: out.correct },
+    diff: { mistakes: out.mistakes || [], n_mistakes: out.n_mistakes ?? 0, sampled: out.sampled },
+  };
+}
+
 /** Run evaluate.py (with --emit-diff) for one iteration and read the outcome back.
  *  Returns { status, f1, metrics, diff, stderrTail }. status: "ok"|"empty" (crash is
  *  detected by the caller from the run step). Only writes results.csv when finalize. */
@@ -1021,6 +1042,16 @@ async function runQueryDirect(args, planObj, csvPath) {
   const dataDir = args.tableDir || args.dataDir;
   const telePath = resolve(runDir, "telemetry.json");
 
+  // Per-row validation mode (text corpora only): a hand-labeled val.json is the only GT.
+  const valMode = !!args.valFile && !isImage && !args.noRefine;
+  const val = valMode ? await readJSON(args.valFile) : null;
+  const valIdsPath = resolve(runDir, "_val_ids.txt");
+  if (valMode) {
+    if (!val || !val.labels) throw new Error(`[SemDB] --val-file ${args.valFile} has no "labels"`);
+    await writeFile(valIdsPath, Object.keys(val.labels).join("\n") + "\n");
+    console.log(`[SemDB] [${query}] per-row validation mode: ${Object.keys(val.labels).length} labeled rows from ${args.valFile}`);
+  }
+
   // Text corpora select BOTH the text system prompt AND the text user prompt (the shared
   // user prompts are image-specific and would otherwise make the text solver emit image
   // code). Image corpora leave both undefined → runPhase falls back to the image prompts.
@@ -1031,7 +1062,7 @@ async function runQueryDirect(args, planObj, csvPath) {
     ? {}
     : { sig: vadarSignatureConfig.userPromptPathText, api: vadarApiConfig.userPromptPathText, solver: vadarSolverConfig.userPromptPathText };
 
-  const runSolver = (iterDir, iterCode, iterCsv) => {
+  const runSolver = (iterDir, iterCode, iterCsv, onlyIds = null) => {
     if (!existsSync(iterCode)) return { status: "empty", stderr: "" };
     try {
       validateOfflineVadarFile(iterCode);
@@ -1046,7 +1077,8 @@ async function runQueryDirect(args, planObj, csvPath) {
     const sArgs = isImage
       ? [iterCode, iterCsv, "--data-dir", dataDir, ...(imageDir ? ["--image-dir", imageDir] : []),
          "--clip-model", clipModel]
-      : [iterCode, iterCsv, "--data-dir", dataDir];
+      : [iterCode, iterCsv, "--data-dir", dataDir,
+         ...(onlyIds ? ["--only-ids", onlyIds] : [])];
     console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
     const s = spawnSync("python3", sArgs, { stdio: ["inherit", "inherit", "pipe"] });
     const stderr = (s.stderr || "").toString();
@@ -1098,14 +1130,21 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   const genFirst = async (iterDir, iterCode, iterCsv) => {
     await gen3Agents(iterDir, iterCode, sql);
-    return runSolver(iterDir, iterCode, iterCsv);
+    return runSolver(iterDir, iterCode, iterCsv, valMode ? valIdsPath : null);
   };
   const regen = async (iterDir, iterCode, iterCsv, feedback) => {
     await regenSolver(iterDir, iterCode, feedback);
-    return runSolver(iterDir, iterCode, iterCsv);
+    return runSolver(iterDir, iterCode, iterCsv, valMode ? valIdsPath : null);
   };
   const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
     const diffPath = resolve(iterDir, "diff.json");
+    if (valMode) {
+      const scored = await scoreInference(args, query, iterDir, corpus.path, args.valFile, diffPath);
+      // "ok" requires a trace to score; without one the agent must fix-first.
+      const traceOk = existsSync(resolve(iterDir, `trace_${query}.json`));
+      const status = run.status === "crash" ? "crash" : (traceOk ? "ok" : "empty");
+      return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+    }
     const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
     const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
     return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
@@ -1116,6 +1155,15 @@ async function runQueryDirect(args, planObj, csvPath) {
   const { bestIter, bestF1, history } = await refineLoop({
     args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter,
   });
+
+  // Val mode: the loop scored the frozen solver on the LABELED sub-corpus only. Now run
+  // the promoted best solver over the FULL corpus (NO --only-ids) to produce the real
+  // result CSV. No-leakage: the reported output covers all rows, not just labeled ones.
+  if (valMode && doRun) {
+    const bestCode = resolve(runDir, codeBasename);
+    console.log(`[SemDB] [${query}] val mode: final full-corpus run of the frozen solver.`);
+    runSolver(runDir, bestCode, resultsCsv, null);
+  }
 
   // Minimal telemetry (agent stages only — no extraction/compile split in DIRECT mode).
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
@@ -1130,7 +1178,10 @@ async function runQueryDirect(args, planObj, csvPath) {
     naive_llm_calls: planObj.plan.naive ?? null,
     total_estimated_cost_usd: Number(agentCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
-    refine: { iterations: history.length - 1, best_iteration: bestIter,
+    refine: { mode: valMode ? "per_row_val" : "f1",
+              ...(valMode ? { objective: "inference_accuracy", val_file: args.valFile,
+                              val_n: Object.keys(val.labels).length } : {}),
+              iterations: history.length - 1, best_iteration: bestIter,
               max_iterations: args.noRefine ? 0 : args.maxIterations,
               f1_history: history },
     phases,
