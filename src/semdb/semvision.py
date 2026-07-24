@@ -181,7 +181,10 @@ class ClipEncoder:
 
     def encode_text(self, labels, template="a photo of {}"):
         prompts = [template.format(str(l).replace('_', ' ')) for l in labels]
-        inp = self.proc(text=prompts, return_tensors="pt", padding=True).to(self.device)
+        # CLIP's text context length is 77 tokens; truncate so long inputs (e.g. a full
+        # product description) don't blow past max_position_embeddings and crash.
+        inp = self.proc(text=prompts, return_tensors="pt", padding=True,
+                        truncation=True, max_length=77).to(self.device)
         with self.torch.no_grad():
             out = self.model.text_model(input_ids=inp["input_ids"],
                                         attention_mask=inp["attention_mask"])

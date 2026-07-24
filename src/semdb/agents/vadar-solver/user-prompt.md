@@ -59,3 +59,4 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+Do not add endpoint/API-key options or any LLM/VLM/network call to this generated program.

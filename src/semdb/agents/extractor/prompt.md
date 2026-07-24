@@ -10,47 +10,35 @@ touches the corpus. A logo image extracted for Q2a is reused, free, by Q2b and Q
 The schema is your only spec — you serve every query over the corpus uniformly.
 
 ## What you write
-A single file `extract_<corpus>.py` that imports the shared engine `semextract`
-and supplies ONLY the corpus-specific decisions via a small `Driver` class:
+A single file `extract_<corpus>.py` that imports the local modality engine
+(`vadar_engine` for images or `vadar_text_engine` for text) and supplies only
+corpus-specific decisions via a small `Driver` class. Generated runtime code is offline.
 
 ```python
 import os, sys, argparse, json
-sys.path.insert(0, "<dir containing semextract.py>")   # given to you
-import semextract
+sys.path.insert(0, "<semdb_dir>")   # given to you
+# import vadar_engine OR vadar_text_engine
 
 class Driver:
     def map_columns(self, header):
         # header: list[str] of the corpus CSV columns. Return the mapping:
         return {"id": "<id col>", "text": "<text col or None>",
                 "image": "<image col or None>", "context": ["<extra structured cols>"]}
-    def preprocess(self, row, cols):
-        # text  -> {"text": <the text to read>}
-        # image -> {"image_path": semextract.resolve_image_path(row[cols["image"]], self.image_dir)}
+    def extract(self, value):
+        # compose only the documented local image/text primitives
         ...
-    def build_prompt(self, schema, row, cols):
-        # Start from the generic prompt, then INJECT the context columns for this row:
-        base = semextract.build_prompt(schema, "json")
-        ctx = " ".join(f"{c}={row.get(c,'')}" for c in cols["context"])
-        return base + ("\n\nContext: " + ctx if ctx else "")
 
 if __name__ == "__main__":
     # EXACT CLI the orchestrator invokes (positional table + out, then flags):
     #   python3 extract_<corpus>.py <table.csv> <attrs.json> --schema S --model M \
-    #       [--image-dir D] [--endpoint U --api-key K --concurrency N] [--theta T]
+    #       [--image-dir D] [--theta T]
     ...
-    driver = Driver(); driver.image_dir = args.image_dir
-    semextract.run(driver, json.load(open(args.schema)), args.table, args.out,
-                   modality="<image|text>", model=args.model,
-                   endpoint=args.endpoint, api_key=args.api_key,
-                   concurrency=args.concurrency, theta=args.theta)
+    # call the selected local engine
 ```
 
 ## The engine owns everything mechanical — DO NOT re-implement it
-`semextract.run(...)` already does: endpoint HTTP with **guided-JSON** decoding,
-local-HF backends, **concurrency** for the endpoint path, per-row error tolerance,
-a **systemic-failure guard** (exits non-zero without writing the output when most
-calls error), a crash-safe `.partial` checkpoint, and the `<out>.meta.json`
-sidecar. Never write your own HTTP/threading/JSON-parsing/checkpoint code.
+The selected local engine owns CSV iteration, per-row error tolerance, output shaping,
+and the `<out>.meta.json` sidecar. Never write HTTP/network/model-service plumbing.
 
 ## Image corpora — you are the PROGRAM agent (generated-code extraction, VADAR-style)
 When the corpus modality is IMAGE, do NOT call a VLM. You WRITE a Python function
@@ -100,66 +88,58 @@ if __name__ == "__main__":
 `--model` is the CLIP id; NO `--endpoint`.
 (Reference compositions + engine: `src/semdb/vadar_run.py`, `src/semdb/vadar_engine.py`.)
 
-## Text corpora — compose the predefined TEXT API (in-code semantic inference)
-When the corpus modality is TEXT, do NOT hand-roll endpoint/JSON plumbing. You WRITE a
-`Driver.extract(patch) -> {field: value, ...}` that composes the predefined TEXT API
-(`judge / classify / extract / generate / score` from `vadar/predefined_text.py`, backed
-by `semtext.TextPatch`) — the text analog of the image `Driver.extract(patch)` that
-composes ImagePatch. Pick the lightest primitive per schema attribute:
+## Text corpora — deterministic offline extraction
+When the corpus modality is TEXT, write `Driver.extract(text) -> {field: value, ...}` over
+an ordinary string. Compose the offline functions in `vadar/predefined_text.py` with
+Python standard-library string, regex, numeric, and date operations. Use explicit
+keywords/aliases, delimiter parsing, and regexes derived from the schema. Closed value
+spaces come from `schema.attributes[].labels`; never fabricate DB values.
 
-- boolean AI.IF predicate → `judge(patch, "<yes/no question>")`
-- a value from a CLOSED value space (enum / DB column) → `classify(patch, LABELS)`
-- one named attribute → `extract(patch, "<field>")`
-- a soft/relevance score → `score(patch, "<short phrase>")`
-
-Value-space lists come from the schema's `labels` (already filled from `labels_from`).
-The returned value IS the field value (joins/filters downstream). Emit exactly this shape
-(the orchestrator runs it with `<table> <attrs> --schema S --model M --endpoint U --api-key K
---concurrency N`):
+The generated driver must not import `semtext`, `TextPatch`, model SDKs, HTTP/network
+libraries, or use endpoint/API-key arguments or semantic judgement services. If a field
+cannot be recovered by explicit local rules, return the type-appropriate empty value.
+Emit this shape:
 
 ```python
 import sys, os, json, argparse
-sys.path.insert(0, "<dir containing semtext.py>")   # given to you (semdb_dir)
-import semtext
-from vadar.predefined_text import judge, classify, extract, score
+sys.path.insert(0, "<dir containing vadar_text_engine.py>")   # semdb_dir
+import vadar_text_engine
+from vadar.predefined_text import (
+    normalize, contains_phrase, contains_any, contains_all,
+    lexical_score, best_lexical_match, regex_extract, split_values,
+)
 
 LABELS = [...]                      # e.g. from schema.attributes[].labels
 
 class Driver:
     def map_columns(self, header):
         return {"id": "<id col>", "text": "<text col>", "context": ["<extra cols>"]}
-    def extract(self, patch):
-        # ONE entry per schema attribute, composing predefined_text over `patch`.
-        return {"sentiment": classify(patch, LABELS)}
+    def extract(self, text):
+        # ONE entry per schema attribute, using deterministic local rules.
+        return {"genre": best_lexical_match(text, LABELS)}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("table"); ap.add_argument("out")
-    ap.add_argument("--schema", required=True); ap.add_argument("--model", required=True)
-    ap.add_argument("--endpoint"); ap.add_argument("--api-key", default="EMPTY")
-    ap.add_argument("--concurrency", type=int, default=8)
-    ap.add_argument("--image-dir"); ap.add_argument("--theta")   # accepted, ignored
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--model"); ap.add_argument("--image-dir"); ap.add_argument("--theta")
     a = ap.parse_args()
-    semtext.run_extraction(Driver(), json.load(open(a.schema)), a.table, a.out,
-                           model=a.model, endpoint=a.endpoint, api_key=a.api_key,
-                           concurrency=a.concurrency, theta=a.theta)
+    vadar_text_engine.run(Driver(), json.load(open(a.schema)), a.table, a.out)
 ```
-`--model` is the endpoint LLM id; `--endpoint` is required for text. Accept `--image-dir`
-and ignore it. (Reference API: `src/semdb/vadar/predefined_text.py`, engine: `semtext.run_extraction`.)
+`--model`, `--image-dir`, and `--theta` are compatibility options and are ignored. No
+endpoint option is accepted. Reference API: `src/semdb/vadar/predefined_text.py`; engine:
+`src/semdb/vadar_text_engine.py`.
 
 ## Rules
 - Map columns from the ACTUAL header you are given; pick the id/text/image columns
   and any structured **context** columns that help disambiguate (e.g. a `title`).
-- Inject context columns into the prompt (that is the main value you add over the
-  generic driver). Do NOT read query-specific logic — the schema is your spec.
-- Keep the driver THIN: only `map_columns` / `preprocess` / `build_prompt` + a
-  `main()` with the exact CLI above. Everything else is the engine's job.
+- For text, list useful structured context columns in `map_columns`; the offline engine
+  appends them to the text before calling `extract`.
+- Keep the driver thin: column mapping, deterministic field logic, and the exact CLI.
 - The CLI MUST accept `--image-dir` even for text corpora (ignore it there), so the
   orchestrator's fixed invocation always parses.
-- Self-test on a 1–2 row sample with `--limit 2` if an endpoint is available, but
-  the authoritative full run is the orchestrator's — do not run the whole corpus.
-- Never fabricate a value to avoid a `none`; under-confident is correct (the
-  compiled query's residual path re-checks low-confidence/`none` rows).
+- Self-test on a 1–2 row sample if useful, but do not run the whole corpus.
+- Never fabricate a value to avoid a `none`; a conservative empty result is correct.
 
 ## Validation
 After writing the driver, confirm it imports and its `--help` works. The engine

@@ -40,7 +40,10 @@ def verify_property(image, prop):
 
 
 def score(image, text):
-    """CLIP image-text similarity in [0, 1]."""
+    """CLIP image-text similarity in [0, 1]. NOTE: CLIP's text side sees only the first
+    ~77 tokens — pass a SHORT phrase (e.g. "a black handbag"), NEVER a full product
+    description. For long text predicates, extract visual attributes with classify /
+    dominant_colors / detect and match those instead."""
     return image.score(text)
 
 

@@ -1,25 +1,31 @@
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from vadar import predefined_text as PT
+from vadar import predefined_text as pt
 
 
-class _FakePatch:
-    def judge(self, q): return True
-    def classify(self, opts): return opts[0]
-    def extract(self, field): return "x"
-    def generate(self, instr): return "y"
-    def score(self, q): return 0.5
+def test_normalized_phrase_matching_is_local_and_deterministic():
+    text = "A SCI-FI / comedy film, directed by Chloé Zhao."
+    assert pt.normalize(text) == "a sci fi comedy film directed by chloe zhao"
+    assert pt.contains_phrase(text, "comedy film")
+    assert pt.contains_any(text, ["horror", "sci fi"])
+    assert pt.contains_all(text, ["film", "chloe zhao"])
+    assert not pt.contains_phrase(text, "comed")
 
 
-def test_free_functions_delegate_to_patch():
-    p = _FakePatch()
-    assert PT.judge(p, "q?") is True
-    assert PT.classify(p, ["a", "b"]) == "a"
-    assert PT.extract(p, "genre") == "x"
-    assert PT.generate(p, "summarize") == "y"
-    assert PT.score(p, "romance") == 0.5
+def test_lexical_matching_regex_and_lists():
+    assert pt.lexical_score("direct flights to Frankfurt", "flights Frankfurt") == 1.0
+    assert pt.best_lexical_match("A funny romantic comedy", ["horror", "comedy"]) == "comedy"
+    assert pt.best_lexical_match("unknown", ["horror", "comedy"]) == "none"
+    assert pt.regex_extract("Director: Jane Doe; 2024", r"Director:\s*([^;]+)") == "Jane Doe"
+    assert pt.split_values("Drama, sci-fi | unknown", allowed=["Drama", "Sci-Fi"]) == [
+        "Drama", "Sci-Fi"
+    ]
 
 
-def test_signatures_doc_present():
-    assert "judge(" in PT.MODULES_SIGNATURES_TEXT
-    assert "classify(" in PT.MODULES_SIGNATURES_TEXT
+def test_api_surface_has_no_endpoint_or_semantic_judge():
+    public = set(pt.MODULES_SIGNATURES_TEXT.casefold().split())
+    assert "judge" not in public
+    assert "endpoint" not in public
+    assert not hasattr(pt, "judge")

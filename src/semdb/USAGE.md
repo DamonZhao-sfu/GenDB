@@ -91,6 +91,30 @@ node src/semdb/orchestrator.mjs --query q3a --query-dir <...> --data-dir <...> -
 
 ---
 
+## Production VADAR run — no ground truth and no runtime model endpoint
+
+Use `--direct --run --no-ground-truth`. Do not pass `--endpoint` or `--api-key`:
+
+```bash
+node src/semdb/orchestrator.mjs \
+  --direct --run --no-ground-truth \
+  --query q3a \
+  --query-dir /path/to/query/bigquery \
+  --data-dir /path/to/data/sf_200
+```
+
+`--no-ground-truth` prevents the orchestrator from auto-deriving or reading a SemBench
+ground-truth directory. A successful unscored run is single-shot; a crash can still be
+regenerated from local stderr feedback. VADAR-generated runtime code receives no model
+endpoint or API key. The orchestrator rejects generated code that contains endpoint-backed
+text wrappers, model/HTTP clients, or a semantic judgement call before executing it.
+
+Text solvers use deterministic string/regex/lexical helpers. Image solvers may use the
+local CLIP/OCR/CV/detector stack via `--clip-model`; this is local inference, not an
+LLM/VLM endpoint.
+
+---
+
 ## Mode 2 — step by step (explicit control of the small model)
 
 ### A. Design the schema (once per query family)

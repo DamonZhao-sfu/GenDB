@@ -38,3 +38,6 @@ if __name__ == "__main__":
     a=ap.parse_args(); d=Driver(); d.image_dir=a.image_dir
     vadar_engine.run(d, json.load(open(a.schema)), a.table, a.out, model=a.model, image_dir=a.image_dir)
 ```
+The generated driver may use the local CLIP/OCR/CV/detector stack shown above, but must not
+create or call an LLM/VLM endpoint, model-service SDK, HTTP client, API key, or semantic
+judgement API.

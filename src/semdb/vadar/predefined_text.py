@@ -1,93 +1,110 @@
 #!/usr/bin/env python3
 """
-vadar/predefined_text.py — the PREDEFINED TEXT API (the text analog of predefined.py).
-Free functions taking a `TextPatch` `text` (semtext-backed), mirroring the vision API's
-`classify(image, ...)` call style. The generated solve_<q>.py and helper functions
-compose ONLY these. `MODULES_SIGNATURES_TEXT` is the docstring block shown to the
-Signature/API/Program agents.
+Offline text primitives for VADAR-generated programs.
+
+These functions operate on ordinary strings.  They are intentionally deterministic:
+they do not create model clients, make network requests, or delegate to ``TextPatch``.
+Query-specific VADAR helpers may compose them with Python's standard library.
 """
-import os
-import sys
+from __future__ import annotations
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # src/semdb
-
-
-def judge(text, question):
-    """True/False LLM judgement over the text (AI.IF semantics)."""
-    return text.judge(question)
+import re
+import unicodedata
+from collections.abc import Iterable, Mapping
 
 
-def classify(text, options):
-    """Pick the single best VALUE from a CLOSED value space (enum / DB column values)."""
-    return text.classify(options)
+def _plain_text(value) -> str:
+    """Accept a string or a legacy object exposing a `.text` string."""
+    return str(getattr(value, "text", value) or "")
 
 
-def extract(text, field):
-    """Extract one attribute value named `field` from the text (AI.GENERATE field)."""
-    return text.extract(field)
+def normalize(text) -> str:
+    """Case-fold text and collapse punctuation/whitespace for stable matching."""
+    value = unicodedata.normalize("NFKD", _plain_text(text)).casefold()
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return " ".join(re.findall(r"\w+", value, flags=re.UNICODE))
 
 
-def generate(text, instruction):
-    """Free-form generation over the text following `instruction`."""
-    return text.generate(instruction)
+def tokens(text) -> set[str]:
+    """Return the normalized word-token set."""
+    return set(normalize(text).split())
 
 
-def score(text, query):
-    """Relevance of the text to `query` in [0, 1] (soft filter / ranking)."""
-    return text.score(query)
+def contains_phrase(text, phrase) -> bool:
+    """True when a normalized phrase occurs on token boundaries."""
+    haystack = f" {normalize(text)} "
+    needle = normalize(phrase)
+    return bool(needle) and f" {needle} " in haystack
+
+
+def contains_any(text, phrases: Iterable[str]) -> bool:
+    """True when at least one normalized phrase occurs in the text."""
+    return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+def contains_all(text, phrases: Iterable[str]) -> bool:
+    """True when every normalized phrase occurs in the text."""
+    return all(contains_phrase(text, phrase) for phrase in phrases)
+
+
+def lexical_score(text, query) -> float:
+    """Token-overlap score in [0, 1], with an exact-phrase match scoring 1."""
+    if contains_phrase(text, query):
+        return 1.0
+    left, right = tokens(text), tokens(query)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(right)
+
+
+def best_lexical_match(text, options, aliases: Mapping[str, Iterable[str]] | None = None,
+                       default="none"):
+    """Return the best locally matched option, or ``default`` when none overlaps."""
+    best, best_score = default, 0.0
+    for option in options:
+        candidates = [str(option)]
+        if aliases:
+            candidates.extend(str(v) for v in aliases.get(option, ()))
+        score = max((lexical_score(text, candidate) for candidate in candidates), default=0.0)
+        if score > best_score:
+            best, best_score = option, score
+    return best
+
+
+def regex_extract(text, pattern, group=1, flags=re.IGNORECASE, default="none"):
+    """Return a regex capture from text, or ``default`` when it is absent."""
+    match = re.search(pattern, _plain_text(text), flags)
+    if not match:
+        return default
+    try:
+        value = match.group(group)
+    except (IndexError, KeyError):
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+
+def split_values(text, separators=r"[,;/|]", allowed=None):
+    """Split a delimited field and optionally retain only allowed normalized values."""
+    values = [part.strip() for part in re.split(separators, _plain_text(text)) if part.strip()]
+    if allowed is None:
+        return values
+    lookup = {normalize(value): value for value in allowed}
+    return [lookup[normalize(value)] for value in values if normalize(value) in lookup]
 
 
 MODULES_SIGNATURES_TEXT = '''
-"""
-Answers a yes/no question about the text and returns a bool. Use for AI.IF predicates.
-Args:
-    text (TextPatch): the row's text.
-    question (string): a yes/no question.
-Returns:
-    bool: True iff the answer is yes.
-"""
-def judge(text, question) -> bool
+All functions are deterministic, offline, and take ordinary strings. They never call a
+model or a network service. Query-specific helpers may also use Python standard-library
+string, regex, numeric, and date operations.
 
-"""
-Classifies the text into the single best option from a CLOSED value space and returns
-that VALUE (a real field). Use for enum categories or a DB column's values. Read the
-value space from the structured CSV column AT RUNTIME — never hardcode it.
-Args:
-    text (TextPatch): the row's text.
-    options (list): candidate string values.
-Returns:
-    string: the best-matching option value.
-"""
-def classify(text, options) -> str
-
-"""
-Extracts the value of a named attribute from the text (AI.GENERATE of one field).
-Returns 'none' when absent.
-Args:
-    text (TextPatch): the row's text.
-    field (string): the attribute name to extract.
-Returns:
-    string: the extracted value (or 'none').
-"""
-def extract(text, field) -> str
-
-"""
-Free-form generation over the text following an instruction (AI.GENERATE text).
-Args:
-    text (TextPatch): the row's text.
-    instruction (string): what to produce.
-Returns:
-    string: the generated text.
-"""
-def generate(text, instruction) -> str
-
-"""
-Relevance of the text to a short query in [0,1]. Use for ranking / soft filters.
-Args:
-    text (TextPatch): the row's text.
-    query (string): a short phrase to match.
-Returns:
-    float: similarity in [0,1].
-"""
-def score(text, query) -> float
+def normalize(text) -> str
+def tokens(text) -> set[str]
+def contains_phrase(text, phrase) -> bool
+def contains_any(text, phrases) -> bool
+def contains_all(text, phrases) -> bool
+def lexical_score(text, query) -> float
+def best_lexical_match(text, options, aliases=None, default="none")
+def regex_extract(text, pattern, group=1, flags=re.IGNORECASE, default="none")
+def split_values(text, separators=r"[,;/|]", allowed=None) -> list[str]
 '''
