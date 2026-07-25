@@ -316,3 +316,15 @@ class ImagePatch:
         """The central `frac` of the patch — excludes a product photo's white margin."""
         m = (1.0 - float(frac)) / 2.0
         return self._child((m, m, 1.0 - m, 1.0 - m))
+
+    def propose_regions(self, max_regions=8, min_area_frac=0.01, method="contour"):
+        """OpImgRegion: content-driven regions as SUB-PATCHES, largest first (a region's
+        RegIdx is its index here, its BBox is `.bbox`). `method="contour"` splits on
+        foreground connected components — deterministic and model-free, unlike
+        `regions_grid`'s blind cut. Any other method warns and falls back to contour
+        rather than pretending a learned proposer is installed."""
+        if method != "contour":
+            print(f"[imagepatch] propose_regions: method {method!r} is not available — "
+                  f"using 'contour'")
+        boxes = semvision.propose_region_boxes(self._src(), max_regions, min_area_frac)
+        return [self._child(b) for b in boxes]

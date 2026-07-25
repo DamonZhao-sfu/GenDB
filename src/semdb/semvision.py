@@ -118,6 +118,83 @@ def cv_dominant_colors(img_path, palette=None, min_frac=0.04, size=96,
 
 
 # ---------------------------------------------------------------------------
+# ① Structural — OpImgRegion by foreground connected components (model-free)
+# ---------------------------------------------------------------------------
+
+def _label_4c(mask):
+    """4-connected component labels for a boolean mask (two-pass union-find). Returns an
+    int32 array of the same shape where 0 is background and each component has its own id.
+    Deterministic and dependency-free — deliberately not scipy.ndimage.label, so region
+    proposal works in any environment that can already run the CLIP path."""
+    h, w = mask.shape
+    lab = np.zeros((h, w), np.int32)
+    parent = [0]
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    nxt = 1
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x]:
+                continue
+            up = int(lab[y - 1, x]) if y else 0
+            left = int(lab[y, x - 1]) if x else 0
+            if up and left:
+                lab[y, x] = min(up, left)
+                union(up, left)
+            elif up or left:
+                lab[y, x] = up or left
+            else:
+                lab[y, x] = nxt
+                parent.append(nxt)
+                nxt += 1
+    if nxt > 1:
+        root = np.array([find(i) for i in range(nxt)], np.int32)
+        lab = root[lab]
+    return lab
+
+
+def propose_region_boxes(src, max_regions=8, min_area_frac=0.01, size=128, tol=0.12):
+    """OpImgRegion (BBox only, no Mask): content-driven region proposals as boxes.
+
+    Estimates the background color from the border pixels, marks every pixel further than
+    `tol` from it as foreground, labels the 4-connected components, and returns their
+    bounding boxes as FRACTIONS of the image — (left, top, right, bottom) each in [0,1],
+    largest component first. Unlike `regions_grid` this cuts along content, which is what
+    a product photo with several items or a localized defect needs. Model-free, so it is
+    the cheap first backend for OpImgRegion; a learned proposer (SAM/DINO) would be a
+    second one under the same signature.
+    """
+    im = _open(src).resize((size, size))
+    arr = np.asarray(im, np.float32) / 255.0
+    border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]])
+    bg = np.median(border, axis=0)
+    fg = np.abs(arr - bg).max(-1) > tol
+    if not fg.any():
+        return []
+    lab = _label_4c(fg)
+    ids, counts = np.unique(lab[lab > 0], return_counts=True)
+    keep = [(int(i), int(c)) for i, c in zip(ids, counts)
+            if c / float(size * size) >= min_area_frac]
+    keep.sort(key=lambda ic: (-ic[1], ic[0]))          # largest first, id breaks ties
+    out = []
+    for cid, _c in keep[:max_regions]:
+        ys, xs = np.nonzero(lab == cid)
+        out.append((float(xs.min()) / size, float(ys.min()) / size,
+                    float(xs.max() + 1) / size, float(ys.max() + 1) / size))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # ② CLIP zero-shot — classify / multilabel / match (injectable encoder)
 # ---------------------------------------------------------------------------
 

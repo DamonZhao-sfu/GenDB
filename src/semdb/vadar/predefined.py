@@ -140,6 +140,13 @@ def domain_classify(image, model_id, labels, threshold=0.5):
     return image.domain_classify(model_id, labels, threshold)
 
 
+# --- P1.3: Structural — OpImgRegion by content, not by grid --------------------
+
+def regions_propose(image, max_regions=8, min_area_frac=0.01):
+    """OpImgRegion: foreground regions as sub-images, largest first."""
+    return image.propose_regions(max_regions, min_area_frac)
+
+
 MODULES_SIGNATURES = '''
 SCORES. Every `*_detail` variant returns the operator's confidence alongside its value.
 A score is comparable ACROSS ROWS for the SAME primitive (so a threshold on it is
@@ -414,6 +421,23 @@ Returns:
     tuple: ("yes" or "no", the max probability over `labels`).
 """
 def domain_classify(image, model_id, labels, threshold=0.5):
+
+"""
+Splits the image into regions along its CONTENT — it estimates the background from the
+border, then returns each foreground blob as a sub-image, largest first. Prefer over
+`regions_grid` when the image holds several distinct objects (a product photo with two
+garments, a localized defect on a car): a grid cuts blindly and can slice one object
+across cells, while this cuts around each object. Deterministic and model-free.
+A region's index in the returned list identifies it; its box is `bbox(region)`.
+Args:
+    image (image): the image.
+    max_regions (int): keep at most this many, largest first (default 8).
+    min_area_frac (float): ignore blobs smaller than this fraction of the image
+        (default 0.01).
+Returns:
+    list: sub-images (empty for a uniform image).
+"""
+def regions_propose(image, max_regions=8, min_area_frac=0.01):
 '''
 
 
