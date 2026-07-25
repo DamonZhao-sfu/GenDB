@@ -4,7 +4,8 @@
 > for Semantic Query Processing**（Jaehyun Ha, Yongjoo Park, Wook-Shin Han；SIGMOD '27；
 > arXiv 2606.29151）。本文只覆盖 **image modality**，text 算子另议。
 >
-> 状态：**计划文档，未改动任何代码。**
+> 状态：**P0 与 P1.1–P1.4 已实现**（分支 `vis-operator`，实施计划见
+> [VIS_OPERATOR_IMPL_PLAN.md](VIS_OPERATOR_IMPL_PLAN.md)）。P1.5 / P2 / P3 / P4 未开始。
 > 决策前提（已确认）：(1) VLM 采「受控放开 + 计费」；(2) 补齐范围 = **Score 化优先 + 新算子并行**。
 
 ---
@@ -301,11 +302,11 @@ def caption(image) -> str
 
 | 期 | 内容 | 依赖 | 相对成本 | 解锁的论文能力 |
 |---|---|---|---|---|
-| **P0** | 全算子 `(Value, Score)` 化 + BBox/RegIdx 暴露 | 无 | 小（底座已有） | cascade / router / BO 的**前置** |
-| **P1.1** | `OpImgEmbed` + top-k 检索 | P0 | 小 | 向量化 join/rank，Plan 2 region 对齐 |
-| **P1.2** | multilabel + domain backend 暴露 | P0 | 极小（纯暴露） | Healthcare 场景 |
-| **P1.3** | `OpImgRegion` 区域提案（contour 先行） | P0 | 中 | E-Commerce / CarDamage 局部抽取 |
-| **P1.4** | `OpImgObj` 开放词表 | — | 中（新模型） | Wildlife species / car parts |
+| ✅ **P0** | 全算子 `(Value, Score)` 化 + BBox/RegIdx 暴露 | 无 | 小（底座已有） | cascade / router / BO 的**前置** |
+| ✅ **P1.1** | `OpImgEmbed` + top-k 检索 | P0 | 小 | 向量化 join/rank，Plan 2 region 对齐 |
+| ✅ **P1.2** | multilabel + domain backend 暴露 | P0 | 极小（纯暴露） | Healthcare 场景 |
+| ✅ **P1.3** | `OpImgRegion` 区域提案（contour 先行） | P0 | 中 | E-Commerce / CarDamage 局部抽取 |
+| ✅ **P1.4** | `OpImgObj` 开放词表 | — | 中（新模型） | Wildlife species / car parts |
 | **P1.5** | `OpImgKeypt` | — | 小 | 无强需求，可延后 |
 | **P2** | `OpImgVQA`/`OpImgCap` 算子化 + guard 改造 + 计费 | P0 | 中 | Q8 selective verifier、Plan 3 闭式验证 |
 | **P3** | 多实现 + percentile router + BO | P0/P1/P2 | 大 | 论文的核心性能来源 |

@@ -23,6 +23,32 @@ patch.pair_score(other) -> float             # CLIP image-IMAGE similarity in [0
 patch.read_text() -> str                     # raw OCR text
 patch.read_text_boxes() -> list[dict]        # [{"text", "box": (l,t,r,b), "score"}]
 patch.size -> (w, h)                         # of THIS patch
+patch.bbox -> (l, t, r, b)                   # THIS patch's box in ABSOLUTE image pixels
+```
+
+### With a confidence — gate, rank, or hand the unsure rows to a heavier pass
+A score is comparable ACROSS ROWS for the same primitive, but NOT across different
+primitives (CLIP probabilities, detector confidences and OCR match strengths are on
+different scales). Use the plain variant when you only need the value.
+```python
+patch.classify_detail(options, template="a photo of {}") -> (str, float)
+patch.verify_detail(prop) -> (bool, float)
+patch.best_ocr_match_detail(options) -> (str, float)   # a miss is ("none", 0.0)
+patch.find_detail(name) -> list[dict]        # [{"image", "label", "box", "score"}]
+patch.classify_multi(options, thresh=0.5) -> (list[str], float)
+    # set-valued fields: keeps EVERY option over the threshold, not one winner
+patch.domain_classify(model_id, labels, threshold=0.5) -> (str, float)
+    # a model trained for this domain, e.g.
+    # domain_classify("torchxrayvision:densenet121-res224-all", ["Pneumonia"])
+```
+
+### Vectors — encode once, compare many times
+```python
+patch.embed() -> list[float]                 # unit-norm image vector
+patch.topk_similar(others, k=5) -> list[(int, float)]
+    # ranks OTHER patches by image-image similarity; vectorized `pair_score`
+patch.topk_text(texts, k=5) -> list[(str, float)]
+    # ranks candidate TEXTS; narrows a large value space to a short scored list
 ```
 
 ### Regions — run a primitive on PART of the image
@@ -34,9 +60,14 @@ patch.crop(left, top, right, bottom) -> ImagePatch   # e.g. crop(0.5, 0, 1, 1) =
 patch.regions_grid(rows, cols, overlap=0.0) -> list[ImagePatch]   # partitioned extraction
 patch.regions_center(frac=0.6) -> ImagePatch         # drops a product photo's margin
 patch.find(object_name) -> list[ImagePatch]          # YOLO instances, most confident first
+patch.find_open(object_name) -> list[ImagePatch]     # OPEN vocabulary — any name
+patch.propose_regions(max_regions=8) -> list[ImagePatch]   # cuts along CONTENT
 ```
 `find` has a CLOSED vocabulary (COCO-80: person, car, dog, zebra, bird, bottle, ...).
-A name outside it returns `[]` and warns — use `classify`/`verify_property` for those.
+A name outside it returns `[]` and warns — use `find_open` (the prompt IS the class, so a
+species or a car part works), or `classify`/`verify_property`.
+`propose_regions` splits on foreground blobs instead of a blind grid — prefer it over
+`regions_grid` when the image holds several distinct objects.
 Reach for regions when ONE whole-image call is too coarse: a small target in a big
 frame, several products in one photo, or text that only appears in one corner.
 

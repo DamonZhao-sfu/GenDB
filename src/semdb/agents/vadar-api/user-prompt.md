@@ -8,4 +8,11 @@ Read `MODULES_SIGNATURES` in `{{semdb_dir}}/vadar/predefined.py`.
 Write a Python module with ALL helper implementations (composing only the predefined API /
 earlier helpers) to: `{{helpers_path}}`. Each is `def name(image, ...): <body>`. Import the
 predefined functions at the top:
-`from vadar.predefined import classify, best_ocr_match, dominant_colors, verify_property, detect, score, read_text`
+```python
+from vadar.predefined import (classify, classify_detail, classify_multi, best_ocr_match,
+                              best_ocr_match_detail, dominant_colors, domain_classify,
+                              verify_property, verify_detail, score, read_text, ocr_detail,
+                              detect, detect_detail, detect_open, crop, bbox, regions_grid,
+                              regions_center, regions_propose, pair_score, embed,
+                              topk_similar, topk_text)
+```

@@ -27,6 +27,14 @@ Rules:
   origin; fractions when all four are in [0,1]), and each `detect` hit is itself an image
   you can classify or read. Regions cost extra passes — reach for them only when needed.
 - Comparing two IMAGES (an image-to-image join/dedup/rank) -> `pair_score`, not `score`.
+- Need a confidence to gate or rank on (keep only sure rows, or hand the unsure ones to a
+  second pass)? Use the `*_detail` variant — a score is comparable across rows for that
+  one primitive, never across different primitives.
+- Several distinct objects in one photo -> `regions_propose` (cuts along content), not
+  `regions_grid` (cuts blindly). A name `detect` says is out of vocabulary -> `detect_open`.
+- Narrowing a LARGE value space -> `topk_text` for a scored short list, then verify those.
+  Ranking many images against one -> `topk_similar`, not repeated `pair_score`.
+- A field that holds SEVERAL values at once -> `classify_multi`, not `classify`.
 - CLIP text is limited to ~77 tokens: pass SHORT phrases to `classify`/`verify_property`/
   `score`, NEVER a full product description. For a long text predicate, distill it into the
   visual attributes to check (category via `classify`, colors via `dominant_colors`,

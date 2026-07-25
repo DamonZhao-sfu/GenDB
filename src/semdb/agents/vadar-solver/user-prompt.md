@@ -30,7 +30,12 @@ Write the program to `{{solve_path}}` with EXACTLY this shape (the orchestrator 
 import sys, os, csv, argparse
 sys.path.insert(0, "{{semdb_dir}}")
 import semvision, imagepatch, semextract
-from vadar.predefined import classify, best_ocr_match, dominant_colors, verify_property, detect, score, read_text
+from vadar.predefined import (classify, classify_detail, classify_multi, best_ocr_match,
+                              best_ocr_match_detail, dominant_colors, domain_classify,
+                              verify_property, verify_detail, score, read_text, ocr_detail,
+                              detect, detect_detail, detect_open, crop, bbox, regions_grid,
+                              regions_center, regions_propose, pair_score, embed,
+                              topk_similar, topk_text)
 # <paste the generated helper implementations here>
 
 def _read(data_dir, name):
