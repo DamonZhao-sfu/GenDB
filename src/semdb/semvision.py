@@ -479,6 +479,54 @@ class YoloDetector:
 
 
 # ---------------------------------------------------------------------------
+# ③ Open-vocabulary detector (OWLv2) — the prompt IS the vocabulary
+# ---------------------------------------------------------------------------
+
+def detect_open_boxes(src, prompts, detector, min_conf=0.1):
+    """OpImgObj with an OPEN vocabulary: [(label, conf, (x1,y1,x2,y2))], most confident
+    first. Where `detect_boxes` can only answer for the detector's fixed class list,
+    here the prompts ARE the class list, so a species or a car part is detectable."""
+    return detector.detect_prompts(src, list(prompts), min_conf)
+
+
+_OPEN_DETECTOR_CACHE = {}
+
+
+def get_open_detector(model_id="google/owlv2-base-patch16-ensemble"):
+    if model_id not in _OPEN_DETECTOR_CACHE:
+        _OPEN_DETECTOR_CACHE[model_id] = OwlDetector(model_id)
+    return _OPEN_DETECTOR_CACHE[model_id]
+
+
+class OwlDetector:
+    """OWLv2 open-vocabulary detection. Optional: `transformers` must be able to load the
+    weights, and callers degrade to [] with a warning when it cannot."""
+
+    def __init__(self, model_id="google/owlv2-base-patch16-ensemble"):
+        import torch
+        from transformers import Owlv2ForObjectDetection, Owlv2Processor
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = Owlv2ForObjectDetection.from_pretrained(model_id).to(self.device).eval()
+        self.proc = Owlv2Processor.from_pretrained(model_id)
+
+    def detect_prompts(self, src, prompts, min_conf=0.1):
+        im = _open(src)
+        queries = [[f"a photo of a {p}" for p in prompts]]
+        inp = self.proc(text=queries, images=im, return_tensors="pt").to(self.device)
+        with self.torch.no_grad():
+            out = self.model(**inp)
+        sizes = self.torch.tensor([[im.size[1], im.size[0]]]).to(self.device)
+        # The post-process helper was renamed across transformers releases.
+        post = (getattr(self.proc, "post_process_grounded_object_detection", None)
+                or self.proc.post_process_object_detection)
+        res = post(outputs=out, target_sizes=sizes, threshold=min_conf)[0]
+        rows = [(prompts[int(l)], float(s), tuple(float(v) for v in b))
+                for s, l, b in zip(res["scores"], res["labels"], res["boxes"])]
+        return sorted(rows, key=lambda r: -r[1])
+
+
+# ---------------------------------------------------------------------------
 # ③ Domain classifiers (chest X-ray) — pathology probabilities
 # ---------------------------------------------------------------------------
 

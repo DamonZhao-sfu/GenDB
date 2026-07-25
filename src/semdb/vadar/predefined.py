@@ -147,6 +147,13 @@ def regions_propose(image, max_regions=8, min_area_frac=0.01):
     return image.propose_regions(max_regions, min_area_frac)
 
 
+# --- P1.4: OpImgObj over an open vocabulary -----------------------------------
+
+def detect_open(image, object_prompt, min_conf=0.1):
+    """OpImgObj, open vocabulary: instances of ANY object name, as sub-images."""
+    return image.find_open(object_prompt, min_conf)
+
+
 MODULES_SIGNATURES = '''
 SCORES. Every `*_detail` variant returns the operator's confidence alongside its value.
 A score is comparable ACROSS ROWS for the SAME primitive (so a threshold on it is
@@ -438,6 +445,21 @@ Returns:
     list: sub-images (empty for a uniform image).
 """
 def regions_propose(image, max_regions=8, min_area_frac=0.01):
+
+"""
+Detects instances of ANY object name and returns them as SUB-IMAGES, most confident first
+— the prompt IS the vocabulary. Use when `detect` reports the name is outside its closed
+COCO-80 list (a species like "impala", a part like "bumper"). Slower and less precise than
+`detect`, so prefer `detect` whenever the name is in its vocabulary. Returns [] with a
+warning when the open-vocabulary backend is not installed.
+Args:
+    image (image): the image.
+    object_prompt (string): any object name.
+    min_conf (float): drop detections below this confidence (default 0.1).
+Returns:
+    list: detected instances as images (empty if none).
+"""
+def detect_open(image, object_prompt, min_conf=0.1):
 '''
 
 

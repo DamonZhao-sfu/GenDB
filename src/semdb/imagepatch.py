@@ -295,6 +295,45 @@ class ImagePatch:
         vocabulary (see `semvision.detector_classes`) — it warns rather than pretending."""
         return [d["image"] for d in self.find_detail(object_prompt, min_conf)]
 
+    # --- open vocabulary: the prompt IS the class ---------------------------
+    _OPEN_WARNED = set()
+
+    def _open_detector(self):
+        """The open-vocabulary backend, loaded once per run. Returns None (warning once)
+        when the optional weights are unavailable — a missing extra must degrade the
+        query, not crash it."""
+        det = self.ctx.get("open_detector")
+        if det is not None:
+            return det
+        try:
+            det = self.ctx["open_detector"] = semvision.get_open_detector()
+            return det
+        except Exception as e:               # noqa: BLE001 — optional heavy dependency
+            if "load" not in ImagePatch._OPEN_WARNED:
+                ImagePatch._OPEN_WARNED.add("load")
+                print(f"[imagepatch] no open-vocabulary detector available ({e}) — "
+                      f"find_open returns []; use classify/verify_property instead")
+            return None
+
+    def find_open_detail(self, object_prompt, min_conf=0.1):
+        """OpImgObj over an OPEN vocabulary: [{"image", "label", "box" (ABSOLUTE px),
+        "score"}]. The prompt IS the class, so names outside the closed detector's
+        COCO-80 (a species, a car part) are detectable here."""
+        det = self._open_detector()
+        if det is None:
+            return []
+        out = []
+        for label, conf, box in semvision.detect_open_boxes(
+                self._src(), [str(object_prompt)], det, min_conf):
+            child = self._child(box)
+            out.append({"image": child, "label": label, "box": child.box, "score": float(conf)})
+        return out
+
+    def find_open(self, object_prompt, min_conf=0.1):
+        """Instances of ANY object name as SUB-PATCHES, most confident first. Slower than
+        `find` but not limited to a closed vocabulary."""
+        return [d["image"] for d in self.find_open_detail(object_prompt, min_conf)]
+
     def regions_grid(self, rows=2, cols=2, overlap=0.0):
         """Split the patch into a rows×cols grid of sub-patches (row-major). `overlap` is
         the fraction of a cell each side extends by, so a target straddling a cut line is
