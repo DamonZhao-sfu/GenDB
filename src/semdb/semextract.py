@@ -320,9 +320,11 @@ class _Cfg:
     timeout: int
 
 
-def gen_endpoint(cfg, json_schema, prompt, modality, image_path=None, text=None):
+def gen_endpoint_full(cfg, json_schema, prompt, modality, image_path=None, text=None,
+                      logprobs=False):
     """POST one chat completion to an OpenAI-compatible server with guided_json.
-    Returns the assistant message content (guaranteed schema-valid JSON)."""
+    Returns the whole `choices[0]` object — message plus, when `logprobs=True`, the
+    per-token logprobs a caller needs to derive a CALIBRATED confidence (see semvqa)."""
     import urllib.request
     content = [{"type": "text", "text": prompt}]
     if modality == "image":
@@ -338,6 +340,8 @@ def gen_endpoint(cfg, json_schema, prompt, modality, image_path=None, text=None)
         "response_format": {"type": "json_schema",
                             "json_schema": {"name": "extract", "schema": json_schema}},
     }
+    if logprobs:
+        body["logprobs"] = True
     req = urllib.request.Request(
         cfg.endpoint.rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode(),
@@ -346,7 +350,13 @@ def gen_endpoint(cfg, json_schema, prompt, modality, image_path=None, text=None)
     )
     with urllib.request.urlopen(req, timeout=cfg.timeout) as resp:
         out = json.loads(resp.read())
-    return out["choices"][0]["message"]["content"]
+    return out["choices"][0]
+
+
+def gen_endpoint(cfg, json_schema, prompt, modality, image_path=None, text=None):
+    """The assistant message content (guaranteed schema-valid JSON)."""
+    return gen_endpoint_full(cfg, json_schema, prompt, modality,
+                             image_path=image_path, text=text)["message"]["content"]
 
 
 # ---------------------------------------------------------------------------

@@ -72,7 +72,8 @@ def specs():
 def _build_extract(program_src, value_spaces, helpers_src=""):
     """Assemble + exec the generated module; return the `extract` function."""
     ns = {name: getattr(predefined, name) for name in
-          ("classify", "best_ocr_match", "dominant_colors", "verify_property", "score", "read_text", "detect")}
+          ("classify", "best_ocr_match", "dominant_colors", "verify_property", "score", "read_text",
+           "detect", "crop", "regions_grid", "regions_center", "pair_score")}
     ns.update(value_spaces)
     exec(compile(helpers_src + "\n\n" + program_src, "<generated>", "exec"), ns)
     return ns["extract"]

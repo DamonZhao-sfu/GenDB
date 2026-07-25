@@ -22,6 +22,22 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------------------
+# Source resolution — every proxy accepts a PATH or an already-loaded PIL image
+# ---------------------------------------------------------------------------
+
+def _open(src, mode="RGB"):
+    """Resolve a proxy input to a PIL image in `mode`.
+
+    `src` is either a path (the whole-image fast path) or an already-cropped
+    PIL image — that second form is what lets `ImagePatch.crop`/`find`/`regions_*`
+    run a proxy on a REGION instead of silently re-running it on the full frame.
+    Passing a path reproduces the previous behavior byte-for-byte.
+    """
+    im = Image.open(src) if isinstance(src, (str, os.PathLike)) else src
+    return im.convert(mode)
+
+
+# ---------------------------------------------------------------------------
 # ① Pure CV — dominant colors
 # ---------------------------------------------------------------------------
 
@@ -69,7 +85,7 @@ def cv_dominant_colors(img_path, palette=None, min_frac=0.04, size=96,
     ≥ sat_thresh) map to a color by HSV HUE (so pale accents keep their hue); the rest
     bucket to black/gray/silver/white by lightness. `center_frac`<1 crops to the central
     region first (excludes a product photo's white background). Deterministic → conf 1.0."""
-    im = Image.open(img_path).convert("RGB")
+    im = _open(img_path)
     if center_frac < 1.0:
         w, h = im.size
         cw, ch = int(w * center_frac), int(h * center_frac)
@@ -105,6 +121,26 @@ def cv_dominant_colors(img_path, palette=None, min_frac=0.04, size=96,
 # ② CLIP zero-shot — classify / multilabel / match (injectable encoder)
 # ---------------------------------------------------------------------------
 
+_ENCODER_TAKES_KEY = {}
+
+
+def _encode_image(encoder, src, key=None):
+    """Encode via `encoder`, passing the region cache key only if it accepts one.
+    An encoder is any object with `encode_image` — the pre-cache signature `(src)` and
+    the cache-aware `(src, key=...)` must both keep working."""
+    if key is None:
+        return encoder.encode_image(src)
+    cls = type(encoder)
+    if cls not in _ENCODER_TAKES_KEY:
+        import inspect
+        try:
+            _ENCODER_TAKES_KEY[cls] = "key" in inspect.signature(encoder.encode_image).parameters
+        except (TypeError, ValueError):
+            _ENCODER_TAKES_KEY[cls] = False
+    return (encoder.encode_image(src, key=key) if _ENCODER_TAKES_KEY[cls]
+            else encoder.encode_image(src))
+
+
 def _softmax(x, temp=0.01):
     x = np.asarray(x, np.float32) / temp
     x = x - x.max()
@@ -112,12 +148,13 @@ def _softmax(x, temp=0.01):
     return e / e.sum()
 
 
-def clip_classify(img_path, labels, encoder, template="a photo of {}"):
+def clip_classify(img_path, labels, encoder, template="a photo of {}", key=None):
     """Zero-shot classify into `labels` (the field's VALUE SPACE — an enum or a
     structured column's values). Returns (the winning VALUE, prob). `template`
     frames the text prompt (e.g. 'the logo of {}' for logos) but the returned value
-    is the raw label, so this yields a real structured FIELD value, not a score."""
-    iv = encoder.encode_image(img_path)          # [D], normalized
+    is the raw label, so this yields a real structured FIELD value, not a score.
+    `key` identifies the image region for the encoder's cache (see ClipEncoder)."""
+    iv = _encode_image(encoder, img_path, key)        # [D], normalized
     tv = encoder.encode_text(list(labels), template)  # [L,D], normalized
     sims = tv @ iv                               # [L] cosine
     probs = _softmax(sims)
@@ -125,8 +162,8 @@ def clip_classify(img_path, labels, encoder, template="a photo of {}"):
     return labels[j], float(probs[j])
 
 
-def clip_multilabel(img_path, labels, encoder, thresh=0.5, template="a photo of {}"):
-    iv = encoder.encode_image(img_path)
+def clip_multilabel(img_path, labels, encoder, thresh=0.5, template="a photo of {}", key=None):
+    iv = _encode_image(encoder, img_path, key)
     tv = encoder.encode_text(list(labels), template)
     sims = tv @ iv                               # cosine in [-1,1]
     probs = 1.0 / (1.0 + np.exp(-(sims - 0.2) / 0.05))   # sigmoid centered ~0.2 cos
@@ -138,10 +175,46 @@ def clip_multilabel(img_path, labels, encoder, thresh=0.5, template="a photo of 
     return chosen, conf
 
 
-def clip_match(img_path, text, encoder):
-    iv = encoder.encode_image(img_path)
+def clip_match(img_path, text, encoder, key=None):
+    iv = _encode_image(encoder, img_path, key)
     tv = encoder.encode_text([text])[0]
     return float(np.clip((tv @ iv + 1.0) / 2.0, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# ② Latent — OpImgEmbed / OpImgPairScore
+# ---------------------------------------------------------------------------
+
+def img_pair_score(a, b, encoder, key_a=None, key_b=None):
+    """IMAGE–IMAGE similarity in [0,1] (cosine, rescaled like `clip_match` so the two
+    are on one scale). This is the primitive an image-to-image join/dedup/top-k needs;
+    `clip_match` only compares an image to TEXT."""
+    va = _encode_image(encoder, a, key_a)
+    vb = _encode_image(encoder, b, key_b)
+    return float(np.clip((float(va @ vb) + 1.0) / 2.0, 0.0, 1.0))
+
+
+def embed_corpus(paths, encoder, batch=64, on_error="zero"):
+    """Encode a whole corpus into an [N, D] float32 matrix (batched — an order of
+    magnitude faster than per-row `encode_image`). Unreadable images become zero rows
+    when `on_error='zero'` so the matrix stays aligned with `paths`."""
+    return encoder.encode_images(list(paths), batch=batch, on_error=on_error)
+
+
+def save_embeddings(out_path, ids, matrix):
+    """Persist a corpus embedding table as <out_path> (.npy) + <out_path>.ids.json,
+    so it amortizes across a query family exactly like the attribute table does."""
+    np.save(out_path, np.asarray(matrix, np.float32))
+    json.dump({"ids": [str(i) for i in ids], "dim": int(np.shape(matrix)[1]) if len(matrix) else 0},
+              open(str(out_path) + ".ids.json", "w"))
+    return out_path
+
+
+def load_embeddings(path):
+    """Returns (matrix, {id -> row index})."""
+    mat = np.load(str(path))
+    ids = json.load(open(str(path) + ".ids.json"))["ids"]
+    return mat, {v: i for i, v in enumerate(ids)}
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +231,12 @@ def get_encoder(model_id="openai/clip-vit-base-patch32"):
 
 
 class ClipEncoder:
+    # Bounded caches. The image cache pays off WITHIN a row (a patch that is cropped
+    # into regions and scored several times); the text cache pays off ACROSS rows —
+    # a value space (e.g. 135 airline names) was previously re-encoded once per image.
+    _IMG_CACHE_CAP = 256
+    _TXT_CACHE_CAP = 64
+
     def __init__(self, model_id="openai/clip-vit-base-patch32", device=None):
         import torch
         from transformers import CLIPModel, CLIPProcessor
@@ -165,21 +244,58 @@ class ClipEncoder:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CLIPModel.from_pretrained(model_id).to(self.device).eval()
         self.proc = CLIPProcessor.from_pretrained(model_id)
+        self._icache, self._tcache = {}, {}
 
     def _norm(self, t):
         return (t / t.norm(dim=-1, keepdim=True)).detach().cpu().numpy()
 
-    def encode_image(self, img_path):
+    @staticmethod
+    def _put(cache, cap, key, val):
+        if len(cache) >= cap:
+            cache.clear()            # cheap bounded eviction; these are hit-locality caches
+        cache[key] = val
+        return val
+
+    def _encode_pixels(self, ims):
         # Compute via the vision tower + projection (version-robust: some transformers
         # builds make get_image_features return a model-output object, not a tensor).
-        im = Image.open(img_path).convert("RGB")
-        inp = self.proc(images=[im], return_tensors="pt").to(self.device)
+        inp = self.proc(images=ims, return_tensors="pt").to(self.device)
         with self.torch.no_grad():
             out = self.model.vision_model(pixel_values=inp["pixel_values"])
             v = self.model.visual_projection(out.pooler_output)
-        return self._norm(v)[0]
+        return self._norm(v)
+
+    def encode_image(self, src, key=None):
+        """`src` is a path or a PIL region. `key` (a hashable region identity, e.g.
+        (path, box)) enables caching — omit it and behavior is exactly as before."""
+        if key is not None and key in self._icache:
+            return self._icache[key]
+        v = self._encode_pixels([_open(src)])[0]
+        return v if key is None else self._put(self._icache, self._IMG_CACHE_CAP, key, v)
+
+    def encode_images(self, srcs, batch=64, on_error="zero"):
+        """Batched corpus encoding → [N, D]. Unreadable images become zero rows so the
+        matrix stays row-aligned with `srcs`."""
+        dim = int(getattr(self.model.config, "projection_dim", 512))
+        out = np.zeros((len(srcs), dim), np.float32)
+        for i in range(0, len(srcs), batch):
+            chunk = srcs[i:i + batch]
+            ims, keep = [], []
+            for j, s in enumerate(chunk):
+                try:
+                    ims.append(_open(s)); keep.append(j)
+                except Exception as e:  # noqa: BLE001 — one bad image must not kill the batch
+                    if on_error != "zero":
+                        raise
+                    print(f"[semvision] embed skip {s!r}: {e}")
+            if ims:
+                out[[i + j for j in keep]] = self._encode_pixels(ims)
+        return out
 
     def encode_text(self, labels, template="a photo of {}"):
+        key = (tuple(str(l) for l in labels), template)
+        if key in self._tcache:
+            return self._tcache[key]
         prompts = [template.format(str(l).replace('_', ' ')) for l in labels]
         # CLIP's text context length is 77 tokens; truncate so long inputs (e.g. a full
         # product description) don't blow past max_position_embeddings and crash.
@@ -189,23 +305,53 @@ class ClipEncoder:
             out = self.model.text_model(input_ids=inp["input_ids"],
                                         attention_mask=inp["attention_mask"])
             v = self.model.text_projection(out.pooler_output)
-        return self._norm(v)
+        return self._put(self._tcache, self._TXT_CACHE_CAP, key, self._norm(v))
 
 
 # ---------------------------------------------------------------------------
 # ③ Detectors (YOLO) — object/species presence & counting
 # ---------------------------------------------------------------------------
 
+def _unpack_det(d):
+    """A detection is (name, conf) or (name, conf, box) — tolerate both so that
+    third-party/mock detectors written against the older 2-tuple shape keep working."""
+    return (d[0], d[1], d[2] if len(d) >= 3 else None)
+
+
 def detect(img_path, classes, detector, min_conf=0.25):
-    """`detector.detect(img_path, min_conf) -> list[(class_name, conf)]`.
+    """`detector.detect(img_path, min_conf) -> list[(class_name, conf[, box])]`.
     Returns (present classes ⊆ `classes`, max confidence, per-class counts)."""
     conf_by, count_by = {}, {}
-    for name, c in detector.detect(img_path, min_conf):
+    for d in detector.detect(img_path, min_conf):
+        name, c, _box = _unpack_det(d)
         if name in classes:
             conf_by[name] = max(conf_by.get(name, 0.0), c)
             count_by[name] = count_by.get(name, 0) + 1
     found = [c for c in classes if c in conf_by]
     return found, (max(conf_by.values()) if conf_by else 0.0), count_by
+
+
+def detect_boxes(img_path, classes, detector, min_conf=0.25):
+    """OpImgObj proper: one row PER INSTANCE — [(label, conf, (x1,y1,x2,y2))], sorted by
+    confidence. `classes=None` keeps every detected class. Detections whose backend gave
+    no box are dropped (a box is the whole point of this entry point)."""
+    rows = []
+    for d in detector.detect(img_path, min_conf):
+        name, c, box = _unpack_det(d)
+        if box is not None and (classes is None or name in classes):
+            rows.append((name, float(c), tuple(float(v) for v in box)))
+    return sorted(rows, key=lambda r: -r[1])
+
+
+def detector_classes(detector):
+    """The detector's CLOSED vocabulary (YOLOv8n = COCO-80). Anything outside it can
+    never be detected, so callers surface that instead of silently returning nothing."""
+    names = getattr(getattr(detector, "model", None), "names", None)
+    if isinstance(names, dict):
+        return [str(v) for v in names.values()]
+    if isinstance(names, (list, tuple)):
+        return [str(v) for v in names]
+    return []
 
 
 _DETECTOR_CACHE = {}
@@ -225,7 +371,8 @@ class YoloDetector:
     def detect(self, img_path, min_conf=0.25):
         res = self.model.predict(img_path, verbose=False, conf=min_conf)[0]
         names = res.names
-        return [(names[int(b.cls)], float(b.conf)) for b in res.boxes]
+        return [(names[int(b.cls)], float(b.conf), tuple(b.xyxy[0].tolist()))
+                for b in res.boxes]
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +409,7 @@ class XrayClassifier:
         self.model = xrv.models.DenseNet(weights=weights).eval()
 
     def probs(self, img_path):
-        img = np.asarray(Image.open(img_path).convert("L"), dtype=np.float32)
+        img = np.asarray(_open(img_path, "L"), dtype=np.float32)
         img = self.xrv.datasets.normalize(img, 255)          # → [-1024, 1024]
         img = self.xrv.datasets.XRayCenterCrop()(img[None, ...])
         t = self.torch.from_numpy(img)[None, ...]            # [1,1,H,W]

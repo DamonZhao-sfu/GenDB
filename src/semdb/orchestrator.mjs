@@ -79,6 +79,8 @@ export function parseArgs(argv) {
     concurrency: 8,        // in-flight extract.py --endpoint requests (vLLM batches server-side)
     extractModel: null,    // small VLM/LLM id for TEXT corpora (config extraction.small*Model)
     clipModel: null,       // CLIP id for IMAGE corpora (config extraction.clipModel)
+    caption: false,        // OpImgCap: caption the image corpus once (needs --endpoint)
+    captionModel: null,    // VLM id for captioning (config extraction.captionModel)
     theta: null,
     predCols: "0,1",       // predicted columns to compare vs GT tuple order
     force: false,          // re-run corpus schema design + extraction even if cached
@@ -112,6 +114,8 @@ export function parseArgs(argv) {
     else if (a === "--endpoint" && argv[i + 1]) args.endpoint = argv[++i];
     else if (a === "--api-key" && argv[i + 1]) args.apiKey = argv[++i];
     else if (a === "--concurrency" && argv[i + 1]) args.concurrency = parseInt(argv[++i], 10);
+    else if (a === "--caption") args.caption = true;
+    else if (a === "--caption-model" && argv[i + 1]) args.captionModel = argv[++i];
     else if (a === "--extract-model" && argv[i + 1]) args.extractModel = argv[++i];
     else if (a === "--clip-model" && argv[i + 1]) args.clipModel = argv[++i];
     else if (a === "--theta" && argv[i + 1]) args.theta = argv[++i];
@@ -203,7 +207,11 @@ export function shouldContinueSemdb(history, iteration, maxIter, stallThreshold)
  */
 const VADAR_RUNTIME_FORBIDDEN = [
   ["semantic judge API", /\bjudge\s*\(|\b(?:vlm_judge|gen_endpoint)\s*\(/i],
-  ["semtext endpoint wrapper", /\b(?:semtext|TextPatch|get_ctx)\b/i],
+  // Endpoint-backed modules. semvqa (OpImgVQA) and semcaption (OpImgCap) DO call a VLM
+  // by design — they belong to the extraction/residual layer, which runs outside this
+  // guard. Naming them here keeps generated VADAR code from importing its way around it.
+  ["endpoint-backed module",
+    /\b(?:semtext|semvqa|semcaption|TextPatch|get_ctx|img_vqa)\b/i],
   ["endpoint/API credential",
     /--endpoint\b|--api-key\b|\.endpoint\b|\.api_?key\b|\b(?:endpoint|api_?key)\s*(?:=|[,):])/i],
   ["OpenAI client", /\b(?:from|import)\s+openai\b|\bOpenAI\s*\(/i],
@@ -692,7 +700,30 @@ async function ensureCorpus(args, corpus, corpusQueries) {
     console.log(`[SemDB] reuse cached corpus attrs: ${attrsPath}`);
   }
 
+  // --- OpImgCap: one caption per corpus image, amortized like the attribute table ----
+  // A caption is the cross-modal proxy that lets the cheap TEXT side answer an image
+  // predicate. It needs a VLM, so it cannot live in the (offline) generated program —
+  // it runs here, once per CORPUS, and every query in the family reads the column.
+  const captionsPath = resolve(corpusDir, "captions.json");
+  if (args.caption && isImage && doRun && !args.dryRun) {
+    if (!args.endpoint) {
+      console.warn("[SemDB] --caption needs --endpoint (OpImgCap is a VLM call); skipping.");
+    } else if (existsSync(captionsPath) && !args.force) {
+      console.log(`[SemDB] reuse cached corpus captions: ${captionsPath}`);
+    } else {
+      const capArgs = [resolve(__dirname, "semcaption.py"), corpus.path, captionsPath,
+        "--id-col", idCol, "--image-col", imageCol,
+        ...(args.imageDir ? ["--image-dir", args.imageDir] : []),
+        "--model", args.captionModel || defaults.extraction.captionModel,
+        "--endpoint", args.endpoint, "--concurrency", String(args.concurrency ?? 8)];
+      console.log(`\n[SemDB] Captioning corpus ${corpus.table} (once): python3 ${capArgs.join(" ")}`);
+      const cap = spawnSync("python3", capArgs, { stdio: "inherit" });
+      if (cap.status !== 0) console.warn(`[SemDB] captioning exited ${cap.status}.`);
+    }
+  }
+
   const extMeta = await readJSON(attrsPath + ".meta.json");
+  const capMeta = await readJSON(captionsPath + ".meta.json");
   const sd = phases.filter((p) => p.phase === "schema_designer");
   const ext = phases.filter((p) => p.phase === "extractor" || p.phase.startsWith("vadar_"));
   const corpusTelemetry = {
@@ -716,9 +747,16 @@ async function ensureCorpus(args, corpus, corpusQueries) {
       calls: extMeta?.llm_calls ?? null,
       model: extractModel,
     },
+    // Amortized across the whole query family, like extraction — not per query.
+    captioning: capMeta ? {
+      sec: capMeta.elapsed_sec ?? null,
+      calls: capMeta.llm_calls ?? null,
+      rows: capMeta.rows ?? null,
+      model: args.captionModel || defaults.extraction.captionModel,
+    } : null,
   };
   if (!args.dryRun) await writeFile(resolve(corpusDir, "corpus_telemetry.json"), JSON.stringify(corpusTelemetry, null, 2));
-  return { corpusDir, schemaPath, attrsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
+  return { corpusDir, schemaPath, attrsPath, captionsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
 }
 
 /** Per-row validation scoring for one iteration: run evaluate.py --score-inference on

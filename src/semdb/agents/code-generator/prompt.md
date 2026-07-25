@@ -23,12 +23,18 @@ table. Your program must:
    Emit exactly those columns (CSV with header) — the evaluator compares this shape
    directly to ground truth (id-set F1, aggregation error, ranking, etc.).
 4. **Normalize** using the compile-time `synonym_map` before comparing keys.
-5. **Residual is currently DISABLED.** `P.vlm_judge` / `P.llm` are no-ops (they
-   return False without calling any model), so the result comes PURELY from the
-   extracted attributes + relational code — that is intentional (we measure the
-   compiled code's own ability). Keep the residual branch for `value == 'none' OR
-   conf < theta` rows for forward-compat, but expect **zero** residual matches; do
-   NOT depend on it for correctness.
+5. **Residual = typed `OpImgVQA`** via `semruntime`. Rows the cheap path was unsure
+   about (`value == 'none' OR conf < theta`) go to `vlm_judge(...)` for a boolean
+   re-check of the ORIGINAL predicate, or `vlm_answer(question, choices, ...)` when the
+   query has a closed value space — prefer `vlm_answer`, because it returns a REAL
+   field value that joins instead of a yes/no. Both answer under guided decoding and
+   return a logprob-derived score, so it is comparable across rows and `theta` is a
+   meaningful cut point.
+   - Collect the unsure rows and resolve them AFTER the relational pass — never call a
+     judge inside the scan loop, and never on a row the proxy was already confident about.
+   - With no `--endpoint`, every judge is a no-op counted in `METER.skipped`: the result
+     comes purely from the extracted attributes. The program must still be correct then,
+     just lower recall. Report `residual_calls = METER.judge_calls` either way.
 6. Emit the result in the query's `SELECT` shape (CSV with header).
 
 ## Why this is correct AND fast
@@ -48,7 +54,7 @@ table. Your program must:
   program containing `{"elapsed_sec": <float>, "rows": <int>, "residual_calls": <int>}`.
   The orchestrator merges this into telemetry.json as the code-execution time.
 - Mirror `compiled_q7.py`: build hash side, scan extracted side, defer unsure
-  rows to `P.vlm_judge`, `write_pairs`.
+  rows to `vlm_answer`/`vlm_judge`, `write_pairs`.
 
 ## Discipline
 Think about the INNER LOOP: the scan over the largest (extracted) side must be

@@ -18,10 +18,27 @@ patch.best_ocr_match(options) -> str
 patch.dominant_colors(min_frac=0.06) -> list[str]
     # colors present (incl. pale accents). Use for color fields / color predicates.
 patch.verify_property(prop) -> bool          # CLIP: does the patch match `prop`?
-patch.score(text) -> float                   # CLIP image-text similarity in [0,1]
+patch.score(text) -> float                   # CLIP image-TEXT similarity in [0,1]
+patch.pair_score(other) -> float             # CLIP image-IMAGE similarity in [0,1]
 patch.read_text() -> str                     # raw OCR text
-patch.crop(l, low, r, up) -> ImagePatch      # region
+patch.read_text_boxes() -> list[dict]        # [{"text", "box": (l,t,r,b), "score"}]
+patch.size -> (w, h)                         # of THIS patch
 ```
+
+### Regions — run a primitive on PART of the image
+Every primitive below returns sub-patches; calling any method on one reads ONLY that
+region. Boxes are `(left, top, right, bottom)` with the origin at the **TOP-LEFT**
+(PIL order); pass pixels, or fractions of the patch when all four are in `[0, 1]`.
+```python
+patch.crop(left, top, right, bottom) -> ImagePatch   # e.g. crop(0.5, 0, 1, 1) = right half
+patch.regions_grid(rows, cols, overlap=0.0) -> list[ImagePatch]   # partitioned extraction
+patch.regions_center(frac=0.6) -> ImagePatch         # drops a product photo's margin
+patch.find(object_name) -> list[ImagePatch]          # YOLO instances, most confident first
+```
+`find` has a CLOSED vocabulary (COCO-80: person, car, dog, zebra, bird, bottle, ...).
+A name outside it returns `[]` and warns — use `classify`/`verify_property` for those.
+Reach for regions when ONE whole-image call is too coarse: a small target in a big
+frame, several products in one photo, or text that only appears in one corner.
 
 ## Worked examples (instruction -> extract) — generalize, do not copy blindly
 ```python
@@ -37,11 +54,27 @@ def extract(patch):
 def extract(patch):
     return {"product_type": patch.classify(["sports_shoes","sandal","boot","other_footwear","not_footwear"]),
             "colors": patch.dominant_colors(0.03)}
+
+# PARTITIONED: the category is decided by the product, not the white background;
+# and a small logo can be lost when CLIP sees the whole frame -> decide per region
+# and combine. Cheap: still zero VLM calls, just a few more CLIP passes.
+def extract(patch):
+    product = patch.regions_center(0.6)                       # drop the margin
+    cat = product.classify(CATEGORIES)
+    logo = "none"
+    for cell in patch.regions_grid(2, 2, overlap=0.1):        # scan quadrants for a wordmark
+        hit = cell.best_ocr_match(BRAND_VALUES)
+        if hit != "none":
+            logo = hit
+            break
+    return {"category": cat, "brand": logo, "colors": product.dominant_colors(0.03)}
 ```
 
 ## Rules
 - SMALL/visual value space or a category enum -> `classify`. LARGE value space of legible
   WORDMARK names (airlines, brands with text) -> `best_ocr_match`. Colors -> `dominant_colors`.
+- Whole image first. Reach for `regions_center` / `regions_grid` / `find` only when the
+  whole-image call is genuinely too coarse — each region costs another pass.
 - Return the field VALUE (or list), never a bare score. Value-space lists (e.g. TRACK_VALUES)
   are provided to you (from the schema's `labels`/`labels_from` — the DB value space).
 - Compose when a single primitive is insufficient (gate then classify; crop then read).

@@ -22,7 +22,8 @@ Write the driver to `{{driver_path}}` with EXACTLY this shape (the orchestrator 
 import sys, os, json, argparse
 sys.path.insert(0, "{{semdb_dir}}")
 import vadar_engine
-from vadar.predefined import classify, best_ocr_match, dominant_colors, verify_property, detect, score, read_text
+from vadar.predefined import (classify, best_ocr_match, dominant_colors, verify_property, detect,
+                              score, read_text, crop, regions_grid, regions_center, pair_score)
 # <paste the generated helper implementations here>
 # value-space constants from schema.attributes[].labels, e.g. TRACKS = [...]
 class Driver:

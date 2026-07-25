@@ -17,7 +17,16 @@ Rules:
   column AT RUNTIME — do NOT hardcode it.
 - SMALL/visual value space or enum -> `classify`; LARGE value space of legible wordmark
   names (airlines/brands) -> `best_ocr_match`; colors -> `dominant_colors`; presence -> `detect`.
+  `detect` returns SUB-IMAGES (len = count) and covers only COCO-80 names — anything else
+  returns [] and warns, so use `classify`/`verify_property` for those.
 - When a lone visual target hides among many images, GATE first (verify/classify a "kind").
+- When the whole-image call is too COARSE (a small target in a big frame, several products
+  in one photo, background dominating the colors), decompose into regions and combine:
+  `regions_center(frac)` drops a product photo's margin, `regions_grid(r, c, overlap)`
+  scans quadrants, `crop(left, top, right, bottom)` takes a known area (PIL order, TOP-LEFT
+  origin; fractions when all four are in [0,1]), and each `detect` hit is itself an image
+  you can classify or read. Regions cost extra passes — reach for them only when needed.
+- Comparing two IMAGES (an image-to-image join/dedup/rank) -> `pair_score`, not `score`.
 - CLIP text is limited to ~77 tokens: pass SHORT phrases to `classify`/`verify_property`/
   `score`, NEVER a full product description. For a long text predicate, distill it into the
   visual attributes to check (category via `classify`, colors via `dominant_colors`,

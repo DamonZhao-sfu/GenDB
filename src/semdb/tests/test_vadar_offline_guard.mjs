@@ -14,6 +14,15 @@ keep = contains_phrase(row["description"], "comedy")
 `;
 assert.deepEqual(offlineVadarViolations(localText), []);
 
+// The region/pair primitives are pure-local and must stay allowed.
+const localRegions = `
+from vadar.predefined import detect, crop, regions_grid, regions_center, pair_score
+cells = regions_grid(image, 2, 2, overlap=0.1)
+hits = detect(cells[0], "zebra")
+sim = pair_score(crop(image, 0.5, 0, 1, 1), regions_center(other, 0.6))
+`;
+assert.deepEqual(offlineVadarViolations(localRegions), []);
+
 for (const source of [
   "import semtext\nctx = semtext.get_ctx(model, url)",
   "from openai import OpenAI\nclient = OpenAI()",
@@ -21,6 +30,10 @@ for (const source of [
   "answer = judge(text, question)",
   "answer = semruntime.vlm_judge(prompt)",
   "raw = gen_endpoint(config, schema, prompt)",
+  // OpImgVQA / OpImgCap are VLM-backed: legitimate in the extraction layer,
+  // never inside generated VADAR code.
+  "import semvqa\nans, s = semvqa.img_vqa(path, 'damaged?')",
+  "import semcaption\ncaps = semcaption.load(p)",
   'ap.add_argument("--endpoint")',
   "api_key = 'secret'",
   "import subprocess\nsubprocess.run(['curl', url])",

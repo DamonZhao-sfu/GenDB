@@ -27,7 +27,8 @@ export const defaults = {
     strongImageModel: "Qwen/Qwen3-VL-2B-Instruct",
     smallTextModel: "Qwen/Qwen2.5-0.5B-Instruct",
     escalationImageModel: "Qwen/Qwen3-VL-2B-Instruct",
-    theta: 0.5,               // residual confidence floor
+    captionModel: "Qwen/Qwen3-VL-2B-Instruct",   // OpImgCap — one caption per corpus image
+    theta: 0.5,               // residual confidence floor, cut on OpImgVQA's logprob score
   },
 
   agentTimeoutMs: 20 * 60 * 1000,

@@ -20,12 +20,20 @@
 
 ## Runtime library
 Import the shared residual runtime for the masked model calls:
-`from semruntime import vlm_judge, METER` (add `sys.path` to `src/semdb` if needed).
-`vlm_judge(prompt, endpoint, model, api_key, image_path=None)` sends the ORIGINAL
-semantic predicate (the AI.IF question, e.g. "Determine if the image shows the
-logo of {airline}. ") to the vLLM/OpenAI endpoint and returns True/False; pass
-`image_path` for image queries, omit it for text. `METER.judge_calls` is your
-`residual_calls`.
+`from semruntime import vlm_judge, vlm_answer, METER` (add `sys.path` to `src/semdb`
+if needed). Both are typed OpImgVQA calls — guided decoding constrains the answer, and
+the returned score comes from token logprobs, so it is comparable across rows.
+
+- `vlm_answer(question, choices, endpoint, model, api_key, image_path=None, text=None)`
+  -> `(answer, score)`. **Prefer this** when the query has a closed value space
+  (e.g. the set of `Airlines` values): the answer is a real field value that joins.
+- `vlm_judge(prompt, endpoint, model, api_key, image_path=None, theta=None)` -> bool.
+  Sends the ORIGINAL semantic predicate (the AI.IF question, e.g. "Does the image show
+  the logo of {airline}?"); pass `theta` to also require the score to clear it.
+
+Pass `image_path` for image queries, `text=` for text ones. With no `--endpoint` both
+are no-ops returning False/"none" and counting `METER.skipped`, so the program must be
+correct without them. `METER.judge_calls` is your `residual_calls`.
 
 ## Output
 - Write the compiled program to: {{code_path}}
