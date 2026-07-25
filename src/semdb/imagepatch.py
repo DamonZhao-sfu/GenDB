@@ -66,6 +66,15 @@ class ImagePatch:
         l, t, r, b = self.box
         return (r - l, b - t)
 
+    @property
+    def bbox(self):
+        """This patch's box in ABSOLUTE image pixels — `(0, 0, w, h)` for a whole image.
+        `OpImgRegion`'s BBox output; a region's RegIdx is its index in the producing list."""
+        if self.box is not None:
+            return self.box
+        w, h = self._image_size()
+        return (0, 0, w, h)
+
     def _src(self):
         """What to hand a proxy: the path (whole image, zero-copy) or the cropped region."""
         if self.box is None:
@@ -84,21 +93,31 @@ class ImagePatch:
         bottom). Accepts pixels, or fractions of this patch when all four are in [0,1]."""
         return self._child((left, top, right, bottom))
 
-    # --- CLIP: return the winning VALUE (a real field), not a score ---------
+    # --- CLIP: (VALUE, Score) — the paper's R_Cls(Label, Score) output schema ---
+    def classify_detail(self, options, template="a photo of {}"):
+        """OpImgCls: (best-matching VALUE, confidence in [0,1]). The score is comparable
+        ACROSS ROWS for this operator — not against another operator's score."""
+        label, s = semvision.clip_classify(self._src(), list(options),
+                                           self.ctx["encoder"], template, key=self._key)
+        return label, float(s)
+
     def classify(self, options, template="a photo of {}"):
         """Best-matching option from a closed value space (enum or DB column values)."""
-        label, _ = semvision.clip_classify(self._src(), list(options),
-                                           self.ctx["encoder"], template, key=self._key)
-        return label
+        return self.classify_detail(options, template)[0]
 
     def best_text_match(self, options, template="{}"):
         return self.classify(options, template)
 
+    def verify_detail(self, prop, template="a photo of {}"):
+        """(True iff the patch matches `prop` better than its negation, confidence of the
+        WINNING side)."""
+        label, s = semvision.clip_classify(self._src(), [prop, f"not {prop}"],
+                                           self.ctx["encoder"], template, key=self._key)
+        return label == prop, float(s)
+
     def verify_property(self, prop, template="a photo of {}"):
         """True iff the patch matches `prop` better than its negation."""
-        label, _ = semvision.clip_classify(self._src(), [prop, f"not {prop}"],
-                                           self.ctx["encoder"], template, key=self._key)
-        return label == prop
+        return self.verify_detail(prop, template)[0]
 
     def score(self, text, template="a photo of {}"):
         """Raw CLIP image-text similarity in [0,1] (for yes/no thresholds)."""
@@ -159,19 +178,20 @@ class ImagePatch:
     _GENERIC_TOKENS = {"air", "airlines", "airways", "airline", "aviation", "co", "ltd",
                        "the", "of", "and", "group", "international"}
 
-    def best_ocr_match(self, options, cutoff=0.6, min_len=3):
-        """Read the image text (OCR) and match it to the closest VALUE in a value space
-        — the field. Wins over `classify` for wordmark logos (airline names). Strict, to
-        avoid false positives on non-logo images: requires a strong fuzzy match OR that
-        the option's DISTINCTIVE (non-generic) tokens actually appear in the OCR text."""
+    def best_ocr_match_detail(self, options, cutoff=0.6, min_len=3):
+        """Read the image text (OCR) and match it to the closest VALUE in a value space —
+        returns (the field value, match strength in [0,1]); ("none", 0.0) when nothing
+        matches. Wins over `classify` for wordmark logos (airline names). Strict, to avoid
+        false positives on non-logo images: requires a strong fuzzy match OR that the
+        option's DISTINCTIVE (non-generic) tokens actually appear in the OCR text."""
         import difflib
         text = self.read_text().lower().strip()
         if len(text) < min_len:
-            return "none"
+            return "none", 0.0
         by_lower = {o.lower(): o for o in options}
         m = difflib.get_close_matches(text, list(by_lower), n=1, cutoff=cutoff)
         if m:
-            return by_lower[m[0]]
+            return by_lower[m[0]], float(difflib.SequenceMatcher(None, text, m[0]).ratio())
         toks = set(text.split())
         best, best_s = "none", 0.0
         for o in options:
@@ -181,16 +201,18 @@ class ImagePatch:
             hit = sum(1 for w in distinctive if w in toks) / len(distinctive)
             if hit >= 0.6 and hit > best_s:            # its distinctive name must be read
                 best, best_s = o, hit
-        return best
+        return best, float(best_s)
+
+    def best_ocr_match(self, options, cutoff=0.6, min_len=3):
+        """The matched VALUE only — see `best_ocr_match_detail` for the match strength."""
+        return self.best_ocr_match_detail(options, cutoff, min_len)[0]
 
     # --- region decomposition ----------------------------------------------
     _OOV_WARNED = set()
 
-    def find(self, object_prompt, min_conf=0.25):
-        """Detected instances of `object_prompt` as SUB-PATCHES (YOLO), highest confidence
-        first. `len(...)` counts, truthiness tests presence, and each element can be
-        further classified / read. Returns [] for a class outside the detector's closed
-        vocabulary (see `semvision.detector_classes`) — it warns rather than pretending."""
+    def _detect_rows(self, object_prompt, min_conf=0.25):
+        """[(label, conf, box in THIS patch's frame)], best first — [] for a class outside
+        the detector's closed vocabulary (it warns rather than pretending)."""
         det = self.ctx.get("detector")
         if det is None:
             det = self.ctx["detector"] = semvision.get_detector()
@@ -200,11 +222,27 @@ class ImagePatch:
             if want not in ImagePatch._OOV_WARNED:
                 ImagePatch._OOV_WARNED.add(want)
                 print(f"[imagepatch] find({object_prompt!r}): outside the detector's "
-                      f"vocabulary ({len(vocab)} classes) — use classify/verify_property instead")
+                      f"vocabulary ({len(vocab)} classes) — use classify/verify_property, "
+                      f"or find_open for an open-vocabulary detector")
             return []
         cls = [vocab[want]] if vocab else [object_prompt]
-        rows = semvision.detect_boxes(self._src(), cls, det, min_conf=min_conf)
-        return [self._child(box) for _label, _conf, box in rows]
+        return semvision.detect_boxes(self._src(), cls, det, min_conf=min_conf)
+
+    def find_detail(self, object_prompt, min_conf=0.25):
+        """OpImgObj proper: [{"image": patch, "label", "box" (ABSOLUTE px), "score"}],
+        most confident first — the paper's R_Obj(BBox, Label, Score)."""
+        out = []
+        for label, conf, box in self._detect_rows(object_prompt, min_conf):
+            child = self._child(box)
+            out.append({"image": child, "label": label, "box": child.box, "score": float(conf)})
+        return out
+
+    def find(self, object_prompt, min_conf=0.25):
+        """Detected instances of `object_prompt` as SUB-PATCHES (YOLO), highest confidence
+        first. `len(...)` counts, truthiness tests presence, and each element can be
+        further classified / read. Returns [] for a class outside the detector's closed
+        vocabulary (see `semvision.detector_classes`) — it warns rather than pretending."""
+        return [d["image"] for d in self.find_detail(object_prompt, min_conf)]
 
     def regions_grid(self, rows=2, cols=2, overlap=0.0):
         """Split the patch into a rows×cols grid of sub-patches (row-major). `overlap` is
