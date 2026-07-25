@@ -79,7 +79,46 @@ def pair_score(image, other):
     return image.pair_score(other)
 
 
+# --- P0: the (Value, Score) views — the paper's Table 1 output schemas ----------
+
+def classify_detail(image, options, template="a photo of {}"):
+    """OpImgCls: (best-matching VALUE, confidence)."""
+    return image.classify_detail(options, template)
+
+
+def verify_detail(image, prop):
+    """(True iff the image matches `prop`, confidence of the winning side)."""
+    return image.verify_detail(prop)
+
+
+def detect_detail(image, object_prompt, min_conf=0.25):
+    """OpImgObj: one dict per instance — {"image", "label", "box", "score"}."""
+    return image.find_detail(object_prompt, min_conf)
+
+
+def ocr_detail(image, min_conf=0.0):
+    """OpImgOCR: one dict per text box — {"text", "box", "score"}."""
+    return image.read_text_boxes(min_conf)
+
+
+def best_ocr_match_detail(image, options):
+    """(the OCR-matched VALUE or "none", match strength)."""
+    return image.best_ocr_match_detail(options)
+
+
+def bbox(image):
+    """This image's own box in ABSOLUTE pixels — (0, 0, w, h) for a whole image."""
+    return image.bbox
+
+
 MODULES_SIGNATURES = '''
+SCORES. Every `*_detail` variant returns the operator's confidence alongside its value.
+A score is comparable ACROSS ROWS for the SAME primitive (so a threshold on it is
+meaningful, and a cheap pass can hand only its low-score rows to a heavier one), but
+NOT across different primitives — CLIP probabilities, detector confidences and OCR
+match strengths are on different scales. Prefer the plain variant when you only need
+the value; reach for `_detail` when you need to gate, rank or cascade.
+
 """
 Classifies the image into the single best-matching option from a closed value space, and
 returns that VALUE (a real field). Use for enum categories or a DB column's values; the
@@ -211,6 +250,75 @@ Returns:
     float: similarity in [0,1].
 """
 def pair_score(image, other):
+
+"""
+OpImgCls with a score: same as `classify`, but returns (VALUE, confidence in [0,1]).
+Args:
+    image (image): the image.
+    options (list): the value space.
+    template (string): prompt template with one "{}", default "a photo of {}".
+Returns:
+    tuple: (best-matching option value, confidence).
+"""
+def classify_detail(image, options, template="a photo of {}"):
+
+"""
+Same as `verify_property`, but also returns the confidence of the winning side.
+Args:
+    image (image): the image.
+    prop (string): the property, e.g. "a damaged car".
+Returns:
+    tuple: (bool, confidence in [0,1]).
+"""
+def verify_detail(image, prop):
+
+"""
+OpImgObj proper: one entry PER DETECTED INSTANCE, most confident first, each a dict
+{"image": the sub-image, "label": the class name, "box": (left, top, right, bottom) in
+ABSOLUTE image pixels, "score": the detector confidence}. Use over `detect` when you need
+the box or the score (to rank instances, or to keep only confident ones).
+Args:
+    image (image): the image.
+    object_prompt (string): simple object name from the detector's closed vocabulary.
+    min_conf (float): drop detections below this confidence (default 0.25).
+Returns:
+    list: dicts as above (empty if none).
+"""
+def detect_detail(image, object_prompt, min_conf=0.25):
+
+"""
+OpImgOCR proper: one entry per detected text box — {"text", "box": (left, top, right,
+bottom) in ABSOLUTE image pixels, "score"}. Use over `read_text` when WHERE the text sits
+matters (a label in a corner, a caption strip) or to drop unreliable reads.
+Args:
+    image (image): the image.
+    min_conf (float): drop boxes below this OCR confidence (default 0.0 = keep all).
+Returns:
+    list: dicts as above.
+"""
+def ocr_detail(image, min_conf=0.0):
+
+"""
+Same as `best_ocr_match`, but also returns how strongly the OCR text matched. A miss is
+("none", 0.0), so the score doubles as a gate for non-logo images.
+Args:
+    image (image): the image.
+    options (list): the value space.
+Returns:
+    tuple: (matched value or "none", match strength in [0,1]).
+"""
+def best_ocr_match_detail(image, options):
+
+"""
+This image's own box in ABSOLUTE pixels, (0, 0, width, height) for a whole image and the
+region's box for a sub-image from crop / regions_grid / detect / regions_propose. Pair it
+with the region's index in the list it came from to identify a region.
+Args:
+    image (image): the image.
+Returns:
+    tuple: (left, top, right, bottom).
+"""
+def bbox(image):
 '''
 
 
