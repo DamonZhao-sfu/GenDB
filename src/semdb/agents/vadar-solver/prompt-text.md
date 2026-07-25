@@ -38,6 +38,50 @@ filter drops the row:
 - For a classify/extract attribute, the value is the inferred label / field value.
 - Accumulate into a dict as you iterate; `json.dump` it once at the end.
 
+### DIAGNOSTIC LOGGING — REQUIRED
+
+The program MUST report on its own execution to **stderr**. These lines are captured
+and shown to you verbatim on the next iteration; a silent program gives you nothing
+to debug with, so treat this as part of the output contract.
+
+Label every decision path in your program with a short `snake_case` branch name
+(at most 8 distinct names, ≤ 20 chars each) describing HOW the row was decided —
+`regex_hit`, `keyword_miss`, `fallback` — not what the answer was (never `is_comedy`).
+
+Print exactly these, and nothing per-row unless it is a problem:
+
+```python
+import sys, time, collections
+_branch = collections.Counter()
+_warn = collections.Counter()
+_t0 = time.time()
+
+# ... inside the row loop, after deciding a row:
+_branch[branch] += 1
+# when a row falls through to a default / matched nothing:
+_warn[f"{reason}"] += 1
+if _warn[reason] <= 5:                       # first few only; the rest are counted
+    print(f"[solve] WARN {reason} id={row_id}", file=sys.stderr)
+# wrap each row's inference so ONE bad row cannot kill the whole run:
+try:
+    ...
+except Exception as e:
+    print(f"[solve] ERROR {type(e).__name__}: {e} id={row_id}", file=sys.stderr)
+    errors[row_id] = f"{type(e).__name__}: {e}"
+    continue
+
+# ... after the loop:
+for name, n in _branch.most_common():
+    print(f"[solve] branch={name} n={n}", file=sys.stderr)
+for reason, n in _warn.most_common():
+    print(f"[solve] WARN-TOTAL {reason} n={n}", file=sys.stderr)
+print(f"[solve] rows_in={len(rows)} rows_out={len(out)} "
+      f"elapsed={time.time()-_t0:.1f}s", file=sys.stderr)
+```
+
+Keep it bounded: the per-row WARN lines are capped at 5 per reason and the totals
+carry the rest. Do NOT print a line for every row that succeeds.
+
 The program MUST also accept an OPTIONAL CLI arg `--only-ids <path>`: when given,
 `<path>` is a newline-separated list of row ids; restrict semantic inference (and
 the trace + result rows) to ONLY those ids. When absent, process the whole corpus.

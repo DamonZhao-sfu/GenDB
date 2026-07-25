@@ -124,6 +124,58 @@ python3 src/semdb/build_valset.py \
 # → select.json, cert.json, split_manifest.json, labels_cache 写入 runs/_labels/
 ```
 
+### 3.6 标签预算：固定 n ❌ → 顺序采样直到判定 ✅
+
+**这是直接从 BARGAIN 源码搬过来的机制**（`BARGAIN_A.__sample_till_confident_above_target`，
+`BARGAIN_P.__sample_till_confident`）：不预先定死 n，而是**每次买 10 条标签，用 anytime-valid
+的下注鞅（betting martingale）检验一次，一旦能判定就停**。
+
+```python
+# certify.py 的核心循环，对照 BARGAIN_A.py:52-83
+labels = []
+while budget_left > 0:
+    labels += oracle.label(next_batch(k=10))          # WoR，无放回
+    if mean(labels) < target:
+        decided = test_if_true_mean_is_below_m(labels, target, alpha=delta,
+                                               without_replacement=True, N=N,
+                                               fixed_sample_size=False)
+    else:
+        decided = test_if_true_mean_is_above_m(labels, target, alpha=delta,
+                                               without_replacement=True, N=N,
+                                               fixed_sample_size=False)
+    if not decided:                                    # 鞅已越过 1/alpha → 结论确定
+        return (mean(labels) >= target), labels
+```
+
+为什么重要：
+- **省标签**。真实质量离 target 远时（0.95 vs 0.90，或 0.4 vs 0.90）十几条就判完；只有贴近
+  target 时才烧到预算上限。固定 n=120 是按最坏情况付钱。
+- 这正好是本项目的度量：*认证到 (T, δ) 所需的 oracle 标签数*（§10 P3 的指标）。
+
+> ⚠️ **正确性约束（原稿 §3.1 写错了，此处修正）**：一旦采用顺序采样 + 边采边看，
+> **Clopper–Pearson 与任何固定样本量的区间都失效**（optional stopping 会把实际覆盖率
+> 打穿）。必须用 `fixed_sample_size=False` 的 anytime-valid 版本。`certify.py` 里要
+> assert：`design.adaptive == True → method ∈ {wsr-betting}`，禁止调用 CP。
+> 只有在"先一次性抽 n 条、抽完再算"的严格固定样本量路径下，CP 才可用。
+
+### 3.7 依赖：直接复用 BARGAIN 的 bounds，不重写
+
+`/localhome/hza214/BARGAIN/BARGAIN/bounds/betting_bounds.py`（65 行，只依赖 numpy）已经实现了
+带**有限总体 WoR 修正**的 Hoeffding-betting 检验，是我们需要的全部原语：
+
+| 我们要的 | BARGAIN 已有 | 我们要自己写的 |
+|---|---|---|
+| uniform WoR + 固定 n | `test_if_true_mean_is_above_m(..., fixed_sample_size=True)` | — |
+| uniform WoR + 顺序采样 | 同上，`fixed_sample_size=False` | — |
+| **点估计 → 下界 LCB** | 只给"是否 > m"的检验 | 对 m 二分搜索 ⇒ LCB（~10 行） |
+| **stratified / importance** | ❌ 只支持均匀 WoR（`m_wor_i` 递推假设从 size-N 池均匀抽） | 加权鞅，或按层各用 δ/H 后合并 |
+
+落地方式：`pip install bargain`（README 已发布到 PyPI），在 `certify.py` 里
+`from BARGAIN.bounds.betting_bounds import test_if_true_mean_is_above_m`；
+若不想引入依赖，就把这 65 行连同 license 头 vendored 到 `src/semdb/bounds_betting.py`。
+**不要自己重推鞅**——`__get_lambda` 的 `i*log(i+1)` 缩放和 `trunc_scale=3/4` 截断是有讲究的，
+写错了区间就不再有效，而且测试很难发现（只在覆盖率蒙特卡洛里才暴露）。
+
 ---
 
 ## 4. Phase 2 — 每轮 scorecard（五维信号）
@@ -183,11 +235,41 @@ python3 src/semdb/certify.py --run-dir src/semdb/runs/mmqa-q3a \
 ```
 
 - 输入：本次 run 里**实际被 promote 过**的 K 个候选（从 `pareto.json` 读，K 通常 2~6）。
-- 方法：Learn-then-Test —— 每个候选一个假设 `H_i: risk_i > 1-target`，用有限样本界（uniform→Clopper–Pearson；stratified/importance→WSR-betting）逐个检验，Bonferroni 用 δ/K。存活者即在 δ 水平被认证。
+- 方法：Learn-then-Test 的**固定序（fixed-sequence）变体**，见下。
+
+#### 6.1 用固定序检验替代 Bonferroni（原稿 §6 用 δ/K，此处收紧）
+
+BARGAIN_A 扫描 M 个阈值时**没有做任何多重性校正**：它把阈值排成单调序列，逐个用 δ 检验，
+**一旦失败立即 break**（`BARGAIN_A.py:158-162`）。这不是疏漏——固定序检验（fixed-sequence /
+fallback procedure）在预先指定顺序、且首次失败即停止的条件下，FWER 天然被 δ 控住，
+**每一步都花全额 δ 而不是 δ/K**。LTT 论文本身也把 fixed-sequence 列为合法的校正方式。
+
+我们的候选有天然顺序，所以直接照搬：
+
+```
+按 SELECT 集上的质量从高到低排序候选 c_1 .. c_K     # 顺序只依赖 SELECT，与密封的 CERT 独立
+for c in c_1 .. c_K:
+    if test_if_true_mean_is_above_m(cert_labels(c), target, alpha=delta, WoR, N=N_cert):
+        return certify(c)        # 花全额 delta
+    else:
+        break                    # 首次失败即停，不再检验后续候选
+return certified=false
+```
+
+- **关键前提**：排序必须只用 SELECT 集（循环内已看过的那份），不能偷看 CERT。这一点由
+  `split_manifest.json` 的读取留痕来保证（§3.2）。
+- 相比 δ/K Bonferroni：K=4、δ=0.05 时，阈值从 0.0125 松回 0.05，在 n_cert=60 的小样本下
+  LCB 通常能宽出 3~5 个百分点——这经常就是"能否认证"的分界线。
+- 代价：只能认证排序最靠前的那批；一旦 c_1 失败就整体放弃。对我们没损失，因为**本来就只
+  想认证最终交付的那一个程序**。K>1 只是为了在 c_1 恰好过拟合 SELECT 时有退路。
+- 若确实要同时认证多个不可排序的候选（例如 Pareto 前沿上的 3 个点），退回 Bonferroni δ/K，
+  在 `certificate.json` 的 `correction` 字段如实写明用了哪种。
 - 输出：
   ```json
   { "certified": true, "program": "iter_3", "target": 0.90, "delta": 0.05,
-    "lcb_cert": 0.912, "n_cert": 60, "K_tested": 4, "correction": "bonferroni",
+    "lcb_cert": 0.912, "n_cert": 60, "labels_used": 40, "rank_in_sequence": 1,
+    "K_available": 4, "correction": "fixed-sequence", "alpha_spent": 0.05,
+    "bound": "wsr-betting/WoR", "adaptive": true,
     "naive_select_score": 0.958, "optimism_gap": 0.046 }
   ```
 - `optimism_gap` = SELECT 上的胜者分 − CERT 上的认证下界，就是研究文档 §6 那张"selection-bias money plot"的数据点，**用现有 run 就能先画出来**。
@@ -252,7 +334,7 @@ full corpus. Improve the RULE, not the sample.
 |---|---|
 | `tests/test_build_valset.py` | 同 seed 可复现；select ∩ cert = ∅；WoR 无重复；分层分配 Σn_h = n；权重 Σ 1/π = N |
 | `tests/test_oracle_cache.py` | 缓存键命中/未命中；k-vote 多数票与 agreement 计算；超预算抛错而非截断 |
-| `tests/test_certify.py` | CP 下界对齐已知数值表；**蒙特卡洛覆盖率检验**（2000 次试验，名义 95% 的实际覆盖 ≥95%）；加权估计量无偏；Bonferroni 随 K 单调收紧；importance 设计调用 CP 时 assert 报错 |
+| `tests/test_certify.py` | 二分搜索得到的 LCB 与 `test_if_true_mean_is_above_m` 自洽；**蒙特卡洛覆盖率检验**（2000 次试验，名义 95% 的实际覆盖 ≥95%）——**顺序采样路径必须单独测一遍**，这是唯一能抓住 optional-stopping 失效的测试；加权估计量无偏；固定序在首次失败后不再检验后续候选；`adaptive=True` 时调用 CP 直接 assert 报错 |
 | `tests/test_scorecard.py` | compile 错误分类（SyntaxError/ImportError/NameError）；per-row 异常率；分支归因聚合 |
 | `tests/test_accept_rule.mjs` | 纯函数 `acceptIteration`：gate 优先级、diff_lcb≤0 不 promote、cost/latency tie-break |
 | `tests/test_feedback_v2.mjs` | 渲染包含 objective/scorecard/branch/guardrails 四段；分层采样 mistakes |
@@ -277,7 +359,7 @@ full corpus. Improve the RULE, not the sample.
 |---|---|---|
 | M1（~1d） | scorecard + compile 前置闸 + feedback v2，**不需要任何新标签** | 在既有 `runs/mmqa-q2a` 上重跑，iter 级 scorecard 齐全；compile 错误能定位到行 |
 | M2（~2d） | `oracle_label.py` + `build_valset.py`（uniform 先行） | q3a 上产出 select/cert，标签成本与缓存命中可复现 |
-| M3（~2d） | `certify.py` + `--accept-rule paired-lcb` 接线 | 蒙特卡洛覆盖率测试通过；q3a 产出 certificate.json 与 optimism_gap |
+| M3（~2d） | `certify.py`（vendored betting bounds + 顺序采样 + 固定序）+ `--accept-rule paired-lcb` 接线 | 蒙特卡洛覆盖率测试（固定 n 与顺序采样两条路径）通过；q3a 产出 certificate.json 与 optimism_gap；报告"认证所需标签数"较固定 n 的节省 |
 | M4（~2d） | stratified / importance 设计 + 分层估计 | 同预算下 CI 宽度较 uniform 显著更窄（在 q3a/q3b 上量化） |
 
 ---

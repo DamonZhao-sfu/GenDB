@@ -26,7 +26,7 @@
  */
 
 import { readFile, writeFile, mkdir, readdir } from "fs/promises";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -230,6 +230,144 @@ function validateOfflineVadarFile(path) {
   if (violations.length) {
     throw new Error(`Refusing to execute non-offline VADAR code ${path}: ${violations.join(", ")}`);
   }
+}
+
+/**
+ * Static compile gate — runs BEFORE the solver is executed so a syntax error or an
+ * undefined name costs one cheap static pass instead of a full corpus run, and so the
+ * agent gets an exact location plus source context instead of a truncated stderr tail.
+ * Complements validateOfflineVadarFile, which checks compliance rather than compilation.
+ *
+ * Returns { ok, stage, text, report } and never throws: a broken/missing preflight.py
+ * must not stop code generation, so an unusable checker reports ok with stage "skipped".
+ */
+export function runPreflight(paths, outPath) {
+  const files = paths.filter((p) => p && existsSync(p));
+  if (!files.length) return { ok: true, stage: "skipped", text: "", report: null };
+  const pf = spawnSync("python3", [resolve(__dirname, "preflight.py"), ...files,
+    ...(outPath ? ["--out", outPath] : []), "--quiet"], { encoding: "utf-8" });
+  if (pf.error || pf.status === null || pf.status > 1) {
+    console.warn(`[SemDB] preflight unavailable (${pf.error?.message || `exit ${pf.status}`}); skipping.`);
+    return { ok: true, stage: "skipped", text: "", report: null };
+  }
+  const report = outPath && existsSync(outPath) ? JSON.parse(readFileSync(outPath, "utf-8")) : null;
+  return { ok: pf.status === 0, stage: report?.stage ?? null,
+           text: renderPreflightText(report), report };
+}
+
+/** Lines worth showing an agent: everything else in a run log is progress noise.
+ *  `\w*(error|exception)` rather than `\berror\b` because the lines that matter most
+ *  are Python exception names — KeyError, ValueError — where no word boundary
+ *  precedes "Error". */
+const RUN_LOG_SIGNALS =
+  /\w*(?:error|exception)\b|\b(?:warn|warning|traceback|fail|failed|failure|fallback|retry|retries|skip|skipped|timeout|missing|unmatched|unknown)\b|^\s*File "/i;
+
+/** The marker the solver prompt contract requires on every diagnostic line. */
+const SOLVE_MARKER = /^\s*\[solve\]/;
+
+/**
+ * Reduce a captured run log to the handful of lines an agent can act on.
+ *
+ * Three reductions, in order, because a raw log is both too long to paste into a
+ * prompt and mostly repetition:
+ *   1. keep only signal lines (see RUN_LOG_SIGNALS), plus the final `tailLines`
+ *      lines whatever they say — a crash message rarely matches a keyword and the
+ *      end of the log is where it lands;
+ *   2. collapse identical lines into one with a count, so "no keyword matched"
+ *      repeated 180 times costs one line instead of drowning everything else;
+ *   3. cap the result and say how much was dropped, so a truncated view never
+ *      reads as a complete one.
+ *
+ * Pure: takes text, returns { lines, total, omitted }.
+ */
+export function filterRunLog(text, opts = {}) {
+  const { maxLines = 25, tailLines = 8, maxLineChars = 200, maxStructured = 40 } = opts;
+  const all = String(text || "").split("\n").map((l) => l.trimEnd()).filter((l) => l.trim());
+  if (!all.length) return { lines: [], total: 0, omitted: 0 };
+
+  const collapse = (lines) => {
+    const counts = new Map();
+    for (const line of lines) {
+      const key = line.length > maxLineChars ? `${line.slice(0, maxLineChars)}…` : line;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts].map(([line, n]) => (n > 1 ? `${line}   (× ${n})` : line));
+  };
+
+  // The prompt contract makes the solver emit its branch counts and totals AFTER
+  // the row loop, so they sit at the end of a log whose middle may be thousands of
+  // per-row lines. Selecting them by marker rather than by position guarantees the
+  // one part of the log we actually specified survives the tail window and the cap.
+  //
+  // The contract also splits its own output by shape: per-row diagnostics carry an
+  // `id=`, aggregates do not. Aggregates are bounded (<=8 branches plus totals) and
+  // are the highest-value lines, so they are kept whole and the per-row ones absorb
+  // the truncation — a solver that ignores the per-reason cap must not be able to
+  // push its own summary out of the report.
+  const marked = all.filter((l) => SOLVE_MARKER.test(l));
+  const summary = collapse(marked.filter((l) => !/\bid=/.test(l))).slice(0, maxStructured);
+  const perRow = collapse(marked.filter((l) => /\bid=/.test(l)))
+    .slice(0, Math.max(0, maxStructured - summary.length));
+  const structured = [...perRow, ...summary];
+
+  const rest = all.filter((l) => !SOLVE_MARKER.test(l));
+  const tailFrom = Math.max(0, rest.length - tailLines);
+  const collapsedRest = collapse(rest.filter((line, i) => i >= tailFrom || RUN_LOG_SIGNALS.test(line)));
+  const room = Math.max(0, maxLines - structured.length);
+
+  return {
+    lines: [...structured, ...collapsedRest.slice(0, room)],
+    total: all.length,
+    omitted: Math.max(0, collapsedRest.length - room),
+  };
+}
+
+/**
+ * Run a Python program, persisting its output to `<iterDir>/run.log` and timing it.
+ *
+ * stdout was previously `inherit`, which put it on the terminal and nowhere else —
+ * so whatever the generated program reported about its own execution was gone by
+ * the time feedback was assembled. Both streams are now captured; stdout is echoed
+ * afterwards to keep the console readable, at the cost of it arriving at the end of
+ * the run rather than during it.
+ */
+export function runPythonLogged(argv, logPath, label) {
+  const started = process.hrtime.bigint();
+  const proc = spawnSync("python3", argv, {
+    stdio: ["inherit", "pipe", "pipe"],
+    encoding: "utf-8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const execMs = Number((process.hrtime.bigint() - started) / 1000000n);
+  const stdout = proc.stdout || "";
+  // ENOBUFS (output past maxBuffer) or a spawn failure leaves the streams null;
+  // keep the reason in the log instead of reporting an empty run.
+  const stderr = proc.stderr || (proc.error ? `[SemDB] ${label} spawn error: ${proc.error.message}` : "");
+  if (stdout) process.stdout.write(stdout);
+  try {
+    writeFileSync(logPath, `$ python3 ${argv.join(" ")}\n\n${stdout}\n--- stderr ---\n${stderr}\n`);
+  } catch (error) {
+    console.warn(`[SemDB] could not write ${logPath}: ${error.message}`);
+  }
+  return { proc, stdout, stderr, execMs, logPath };
+}
+
+/** Mirror of preflight.render_text on the JS side, so the feedback block does not
+ *  need a second Python round-trip. */
+export function renderPreflightText(report) {
+  if (!report || report.ok) return "";
+  const lines = [`COMPILE FAILED at stage \`${report.stage}\``];
+  for (const err of report.errors || []) {
+    const where = `${err.file}:${err.line}${err.col ? `:${err.col}` : ""}`;
+    lines.push(`${err.error_class} at ${where} — ${err.message}`);
+    lines.push(...(err.context || []));
+  }
+  const warn = report.warnings || [];
+  if (warn.length) {
+    lines.push(`Also flagged (non-fatal, ${warn.length}):`);
+    lines.push(...warn.slice(0, 5).map((w) => `  ${w.error_class} at ${w.file}:${w.line} — ${w.message}`));
+  }
+  return lines.join("\n");
 }
 
 /** Load a SemBench query's SQL from the query folder, and its NL intent if present. */
@@ -477,14 +615,31 @@ export function renderFeedback(prev) {
   const histLines = (prev.history || [])
     .map((h) => `  iter ${h.iter}: F1=${h.f1 == null ? "n/a" : h.f1} ${h.status.toUpperCase()}${h.improved ? " (improved)" : ""}`)
     .join("\n");
+  // What the program itself reported while running. Empty for a program that
+  // printed nothing, in which case the section is dropped rather than shown blank.
+  const log = prev.runLog || { lines: [], total: 0, omitted: 0 };
+  const logBlock = log.lines.length
+    ? [`## RUNTIME LOG — what your program printed (${log.total} lines, showing ${log.lines.length}${log.omitted ? `, ${log.omitted} more omitted` : ""})`,
+       ...log.lines.map((l) => `  ${l}`)].join("\n")
+    : "";
+  const timing = prev.execMs == null ? "" : ` in ${(prev.execMs / 1000).toFixed(1)}s`;
   if (prev.status !== "ok") {
+    // A compile-gate failure never executed, so calling it a crash would send the
+    // agent looking for a runtime cause that does not exist.
+    const compileFailed = prev.stage === "compile";
     return [
-      "\n## LAST RUN FAILED — FIX THIS FIRST",
-      `The program ${prev.status === "empty" ? "produced no output rows" : "crashed"}.`,
+      compileFailed
+        ? "\n## LAST ITERATION DID NOT COMPILE — FIX THIS FIRST, NOTHING ELSE"
+        : "\n## LAST RUN FAILED — FIX THIS FIRST",
+      compileFailed
+        ? "The program was NOT executed, so there are no quality numbers this round."
+        : `The program ${prev.status === "empty" ? "produced no output rows" : "crashed"}.`,
       "```",
       (prev.stderrTail || "(no stderr captured)"),
       "```",
-      "Diagnose and fix the error before any accuracy work.",
+      compileFailed
+        ? "Fix the error above. Do not change anything else."
+        : "Diagnose and fix the error before any accuracy work.",
       histLines ? `\n## HISTORY\n${histLines}` : "",
     ].join("\n");
   }
@@ -495,9 +650,10 @@ export function renderFeedback(prev) {
       .map((r) => `  - id=${r.id} predicted=${r.predicted == null ? "MISSING" : r.predicted} expected=${r.expected}  text="${(r.text || "").slice(0, 160)}"`)
       .join("\n") || "  (none)";
     return [
-      `\n## LAST RUN — PER-ROW INFERENCE accuracy=${prev.f1} (${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)`,
+      `\n## LAST RUN — PER-ROW INFERENCE accuracy=${prev.f1} (${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)${timing}`,
       `## MISLABELED ROWS — ${prev.diff.n_mistakes ?? 0} total, showing ${(prev.diff.mistakes || []).length}:`,
       rows,
+      logBlock,
       histLines ? `## HISTORY\n${histLines}` : "",
       "Each row above was inferred WRONG for the query's key attribute. Diagnose WHY:",
       "wrong value-space mapping, an over/under-broad judge/classify prompt, a bad",
@@ -511,11 +667,12 @@ export function renderFeedback(prev) {
     ? rows.map((r) => `  - ${typeof r === "object" ? JSON.stringify(r) : r}`).join("\n")
     : "  (none)";
   return [
-    `\n## LAST RUN — F1=${prev.f1} (P=${m.precision} R=${m.recall}, tp=${m.tp} fp=${m.fp} fn=${m.fn})`,
+    `\n## LAST RUN — F1=${prev.f1} (P=${m.precision} R=${m.recall}, tp=${m.tp} fp=${m.fp} fn=${m.fn})${timing}`,
     `## FALSE POSITIVES (predicted, but wrong) — ${d.fp_total ?? 0} total, showing ${(d.false_positives || []).length}:`,
     fmt(d.false_positives),
     `## FALSE NEGATIVES (missed) — ${d.fn_total ?? 0} total, showing ${(d.false_negatives || []).length}:`,
     fmt(d.false_negatives),
+    logBlock,
     histLines ? `## HISTORY\n${histLines}` : "",
     "Diagnose WHY these are wrong and revise the code. Common causes: wrong threshold,",
     "wrong label/value mapping, over-broad predicate, wrong join key, CLIP/LLM prompt",
@@ -860,7 +1017,8 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
 
     const feedback = renderFeedback({
       status: best.outcome.status, f1: best.outcome.f1, metrics: best.outcome.metrics,
-      diff: best.outcome.diff, stderrTail: best.outcome.stderrTail, history,
+      diff: best.outcome.diff, stderrTail: best.outcome.stderrTail,
+      stage: best.outcome.stage, history,
     });
     const run = await regen(itDir, itCode, itCsv, feedback);
     const outcome = await scoreIter(itDir, itCode, itCsv, run);
@@ -910,13 +1068,23 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
 
   const runCompiled = (iterDir, iterCode, iterCsv) => {
     if (!(doRun && existsSync(iterCode) && existsSync(attrsPath))) return { status: "empty", stderr: "" };
+    const pre = runPreflight([iterCode], resolve(iterDir, "preflight.json"));
+    if (!pre.ok) {
+      console.warn(`[SemDB] [${query}] preflight failed (${pre.stage}) — not executing.\n${pre.text}`);
+      return { status: "crash", stage: "compile", preflight: pre.report, stderr: pre.text };
+    }
     const cqArgs = [iterCode, structured.path, attrsPath, iterCsv,
       ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
     console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
-    const cq = spawnSync("python3", cqArgs, { stdio: ["inherit", "inherit", "pipe"] });
-    const stderr = (cq.stderr || "").toString();
-    if (cq.status !== 0) { console.warn(`[SemDB] compiled query exited ${cq.status}.`); return { status: "crash", stderr }; }
-    return { status: "ok", stderr };
+    const { proc, stdout, stderr, execMs, logPath } =
+      runPythonLogged(cqArgs, resolve(iterDir, "run.log"), "compiled query");
+    const out = { stderr, stdout, execMs, logPath };
+    if (proc.status !== 0) {
+      console.warn(`[SemDB] compiled query exited ${proc.status} (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
+      return { status: "crash", ...out };
+    }
+    console.log(`[SemDB] compiled query ok (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
+    return { status: "ok", ...out };
   };
 
   const genFirst = async (iterDir, iterCode, iterCsv) => {
@@ -931,7 +1099,10 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
     const diffPath = resolve(iterDir, "diff.json");
     const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
     const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
-    return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+    return { ...scored, status, stage: run.stage ?? null,
+             execMs: run.execMs ?? null,
+             runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
+             stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
   };
 
   const { bestIter, bestF1, history } = await refineLoop({
@@ -1102,14 +1273,20 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   const runSolver = (iterDir, iterCode, iterCsv, onlyIds = null) => {
     if (!existsSync(iterCode)) return { status: "empty", stderr: "" };
+    const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
     try {
       validateOfflineVadarFile(iterCode);
-      const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
       if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
     } catch (error) {
       const stderr = String(error && error.message ? error.message : error);
       console.warn(`[SemDB] ${stderr}`);
       return { status: "crash", stderr };
+    }
+    // Compile gate: a syntax error or an undefined name must not cost a corpus run.
+    const pre = runPreflight([iterCode, helpersPath], resolve(iterDir, "preflight.json"));
+    if (!pre.ok) {
+      console.warn(`[SemDB] [${query}] preflight failed (${pre.stage}) — not executing.\n${pre.text}`);
+      return { status: "crash", stage: "compile", preflight: pre.report, stderr: pre.text };
     }
     if (!doRun) return { status: "empty", stderr: "" };
     const sArgs = isImage
@@ -1118,10 +1295,15 @@ async function runQueryDirect(args, planObj, csvPath) {
       : [iterCode, iterCsv, "--data-dir", dataDir,
          ...(onlyIds ? ["--only-ids", onlyIds] : [])];
     console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
-    const s = spawnSync("python3", sArgs, { stdio: ["inherit", "inherit", "pipe"] });
-    const stderr = (s.stderr || "").toString();
-    if (s.status !== 0) { console.warn(`[SemDB] direct solver exited ${s.status}.`); return { status: "crash", stderr }; }
-    return { status: "ok", stderr };
+    const { proc, stdout, stderr, execMs, logPath } =
+      runPythonLogged(sArgs, resolve(iterDir, "run.log"), "direct solver");
+    const out = { stderr, stdout, execMs, logPath };
+    if (proc.status !== 0) {
+      console.warn(`[SemDB] direct solver exited ${proc.status} (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
+      return { status: "crash", ...out };
+    }
+    console.log(`[SemDB] direct solver ok (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
+    return { status: "ok", ...out };
   };
 
   // Solver template vars differ by modality: image gets manifest cols, text does not.
@@ -1181,11 +1363,17 @@ async function runQueryDirect(args, planObj, csvPath) {
       // "ok" requires a trace to score; without one the agent must fix-first.
       const traceOk = existsSync(resolve(iterDir, `trace_${query}.json`));
       const status = run.status === "crash" ? "crash" : (traceOk ? "ok" : "empty");
-      return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+      return { ...scored, status, stage: run.stage ?? null,
+               execMs: run.execMs ?? null,
+               runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
+               stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
     }
     const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
     const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
-    return { ...scored, status, stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
+    return { ...scored, status, stage: run.stage ?? null,
+             execMs: run.execMs ?? null,
+             runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
+             stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
   };
 
   if (args.dryRun) { await gen3Agents(runDir, solvePath, sql); return null; }

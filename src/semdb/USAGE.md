@@ -115,6 +115,76 @@ LLM/VLM endpoint.
 
 ---
 
+## Refining against a sampled validation set (`--val-file`)
+
+Instead of scoring each iteration against the full ground truth, draw a probability
+sample of the corpus, label it, and refine against **that**. Two steps.
+
+### Step 1 — build the validation set
+
+```bash
+python3 src/semdb/build_valset.py \
+  --corpus /path/to/data/sf_200/lizzy_caplan_text_data.csv \
+  --id-col row_id --text-col text \
+  --query q3a --attr is_comedy --query-nl "Which movies are comedies?" \
+  --method importance --importance-by query-similarity --epsilon 0.2 \
+  --n 60 --cert-n 30 --seed 7 \
+  --label-source gt \
+  --gt-file /path/to/raw_results/ground_truth/Q3a.json --gt-match-col title \
+  --out src/semdb/runs/_val/mmqa-q3a
+```
+
+Writes `select.json` (the loop reads this), `cert.json` (sealed — the orchestrator
+never reads it), and `split_manifest.json`. The two are disjoint by construction.
+
+| flag | meaning |
+|---|---|
+| `--method` | `uniform` (SRSWOR) · `stratified` · `importance` (Pareto πps) |
+| `--strata-by` | `length` · `kmeans` · `column:<name>` — must be a signal available *before* any program exists |
+| `--importance-by` | `query-similarity` (TF-IDF vs `--query-nl`) · `column:<name>` |
+| `--epsilon` | uniform mixing in the importance proposal; bounds weights at `N/(n·ε)` |
+| `--n` / `--cert-n` | SELECT and CERT sizes, drawn as one sample then partitioned |
+| `--label-source` | `gt` (plumbing only — prints a warning) · `none` (ids only) · `oracle` (not yet) |
+
+On a 200-row corpus with 13 positives (6.5%), a 60-row budget catches 4 positives
+under `uniform` and 7 under `importance` — that gap is the point of the design.
+
+> `--label-source gt` has the refinement loop reading the benchmark answer key. It
+> exists to exercise the plumbing without an oracle model and supports no claim
+> about oracle-free operation. It warns on every run.
+
+### Step 2 — refine against it
+
+```bash
+node src/semdb/orchestrator.mjs \
+  --direct --run --benchmark mmqa --query q3a \
+  --query-dir /path/to/query/bigquery \
+  --data-dir  /path/to/data/sf_200 \
+  --val-file  src/semdb/runs/_val/mmqa-q3a/select.json \
+  --max-iterations 3
+```
+
+Each iteration runs the solver over the labeled rows only (via the solver's
+`--only-ids` contract), scores per-row accuracy against `select.json`, and feeds the
+mislabeled rows back to the solver agent. After the loop, the promoted best solver is
+run once more over the **full** corpus to produce the real result CSV.
+
+## The compile gate
+
+Before any generated solver is executed, `preflight.py` runs `compile()` for syntax
+and pyflakes for undefined names. A failure costs a static pass instead of a full
+corpus run, and the agent gets an exact line plus a marked source window rather than
+a truncated stderr tail. The report lands in `iter_N/preflight.json`.
+
+```bash
+python3 src/semdb/preflight.py src/semdb/runs/mmqa-q3a/iter_0/solve_q3a.py --out /tmp/pf.json
+```
+
+pyflakes is optional (`pip install pyflakes`); without it the name check reports
+`unavailable` and the gate passes — a missing linter never blocks generation.
+
+---
+
 ## Mode 2 — step by step (explicit control of the small model)
 
 ### A. Design the schema (once per query family)
