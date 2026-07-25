@@ -111,6 +111,23 @@ def bbox(image):
     return image.bbox
 
 
+# --- P1.1: Latent — OpImgEmbed and vectorized ranking --------------------------
+
+def embed(image):
+    """OpImgEmbed: the image's dense vector."""
+    return image.embed()
+
+
+def topk_similar(image, others, k=5):
+    """Vectorized OpImgPairScore: rank `others` against `image`."""
+    return image.topk_similar(others, k)
+
+
+def topk_text(image, texts, k=5):
+    """Rank candidate texts against the image; the top-k with scores."""
+    return image.topk_text(texts, k)
+
+
 MODULES_SIGNATURES = '''
 SCORES. Every `*_detail` variant returns the operator's confidence alongside its value.
 A score is comparable ACROSS ROWS for the SAME primitive (so a threshold on it is
@@ -319,6 +336,43 @@ Returns:
     tuple: (left, top, right, bottom).
 """
 def bbox(image):
+
+"""
+OpImgEmbed: encodes the image into a dense vector (a plain list of floats, unit-norm).
+Two vectors are compared by `pair_score`-style cosine; use this when you want to encode
+once and compare many times, or to materialize a vector column.
+Args:
+    image (image): the image.
+Returns:
+    list: the vector.
+"""
+def embed(image):
+
+"""
+Ranks OTHER images against this one by image-to-image similarity — the vectorized form of
+`pair_score` (one encode per candidate, then one matmul, instead of a pairwise call per
+comparison). Use for an image-to-image join, dedup or top-k.
+Args:
+    image (image): the query image.
+    others (list): candidate images.
+    k (int): how many to keep (default 5).
+Returns:
+    list: (index into `others`, score in [0,1]) tuples, best first.
+"""
+def topk_similar(image, others, k=5):
+
+"""
+Ranks candidate TEXTS against the image and keeps the top-k WITH scores. `classify` keeps
+only the single best option; use this when you want a short candidate list out of a large
+value space (e.g. narrow 135 airline names down to 5, then verify those 5 more carefully).
+Args:
+    image (image): the image.
+    texts (list): candidate strings.
+    k (int): how many to keep (default 5).
+Returns:
+    list: (text, score in [0,1]) tuples, best first.
+"""
+def topk_text(image, texts, k=5):
 '''
 
 

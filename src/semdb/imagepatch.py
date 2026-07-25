@@ -20,6 +20,8 @@ that region — `crop(...).dominant_colors()` reads the crop, not the whole fram
 patches compose: `patch.crop(...).crop(...)` and `patch.find(...)[0].read_text()` work,
 and `find`/`read_text_boxes` report boxes back in absolute image coordinates.
 """
+import numpy as np
+
 import semvision
 
 
@@ -129,6 +131,38 @@ class ImagePatch:
         image-to-image join, dedup, or top-k. (`score` compares against TEXT.)"""
         return semvision.img_pair_score(self._src(), other._src(), self.ctx["encoder"],
                                         key_a=self._key, key_b=other._key)
+
+    # --- Latent: OpImgEmbed + vectorized top-k ------------------------------
+    def embed(self):
+        """OpImgEmbed: this patch's unit-norm vector as a plain float list (JSON-safe, so
+        it can be materialized into a column)."""
+        return [float(v) for v in
+                semvision.embed_image(self._src(), self.ctx["encoder"], self._key)]
+
+    def topk_similar(self, others, k=5):
+        """Rank other patches against this one by IMAGE-IMAGE similarity, returning
+        [(index into `others`, score)] best first. The vectorized form of `pair_score` —
+        encodes each candidate once, then a single matmul. Use for an image-to-image
+        join, dedup, or top-k."""
+        others = list(others)
+        if not others:
+            return []
+        q = semvision.embed_image(self._src(), self.ctx["encoder"], self._key)
+        mat = np.stack([semvision.embed_image(o._src(), self.ctx["encoder"], o._key)
+                        for o in others])
+        return semvision.topk_similar(q, mat, k)
+
+    def topk_text(self, texts, k=5, template="a photo of {}"):
+        """Rank candidate TEXTS against this patch, returning [(text, score)] best first.
+        `classify` keeps only the argmax; this keeps the top-k WITH scores — the candidate
+        set a cascade needs before a heavier verifier runs on a few options."""
+        texts = [str(t) for t in texts]
+        if not texts:
+            return []
+        enc = self.ctx["encoder"]
+        q = semvision.embed_image(self._src(), enc, self._key)
+        rows = semvision.topk_similar(q, enc.encode_text(texts, template), k)
+        return [(texts[i], s) for i, s in rows]
 
     # --- CV: colors present (incl. pale accents) ----------------------------
     def dominant_colors(self, min_frac=0.06, center_frac=1.0):

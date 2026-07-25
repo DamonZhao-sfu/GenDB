@@ -194,6 +194,32 @@ def img_pair_score(a, b, encoder, key_a=None, key_b=None):
     return float(np.clip((float(va @ vb) + 1.0) / 2.0, 0.0, 1.0))
 
 
+def embed_image(src, encoder, key=None):
+    """OpImgEmbed: the unit-norm image vector for one image or region. `pair_score` and
+    `topk_similar` both consume this space, so a corpus can be encoded once and reused."""
+    return np.asarray(_encode_image(encoder, src, key), np.float32)
+
+
+def embed_text(text, encoder, template="{}"):
+    """OpTxtEmbed on the image side: the unit-norm text vector in the SAME space as
+    `embed_image`. This is how the paper grounds OpTxtImgSim into OpImgEmbed->OpTxtEmbed."""
+    return np.asarray(encoder.encode_text([str(text)], template)[0], np.float32)
+
+
+def topk_similar(query_vec, matrix, k=5):
+    """Top-k rows of an [N, D] unit-norm `matrix` by cosine against `query_vec`, rescaled
+    to [0,1] on the same scale as `img_pair_score`/`clip_match`. Returns [(row index,
+    score)], best first — one matmul instead of N pairwise encoder calls."""
+    q = np.asarray(query_vec, np.float32)
+    m = np.asarray(matrix, np.float32)
+    if m.size == 0:
+        return []
+    sims = np.clip((m @ q + 1.0) / 2.0, 0.0, 1.0)
+    k = max(0, min(int(k), int(sims.shape[0])))
+    order = np.argsort(-sims, kind="stable")[:k]
+    return [(int(i), float(sims[i])) for i in order]
+
+
 def embed_corpus(paths, encoder, batch=64, on_error="zero"):
     """Encode a whole corpus into an [N, D] float32 matrix (batched — an order of
     magnitude faster than per-row `encode_image`). Unreadable images become zero rows
