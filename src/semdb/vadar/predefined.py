@@ -128,6 +128,18 @@ def topk_text(image, texts, k=5):
     return image.topk_text(texts, k)
 
 
+# --- P1.2: more OpImgCls backends — multilabel and domain specialists ----------
+
+def classify_multi(image, options, thresh=0.5):
+    """OpImgCls, multilabel: every option over the threshold, with a confidence."""
+    return image.classify_multi(options, thresh)
+
+
+def domain_classify(image, model_id, labels, threshold=0.5):
+    """A domain-specialist classifier (e.g. chest X-ray pathologies)."""
+    return image.domain_classify(model_id, labels, threshold)
+
+
 MODULES_SIGNATURES = '''
 SCORES. Every `*_detail` variant returns the operator's confidence alongside its value.
 A score is comparable ACROSS ROWS for the SAME primitive (so a threshold on it is
@@ -373,6 +385,35 @@ Returns:
     list: (text, score in [0,1]) tuples, best first.
 """
 def topk_text(image, texts, k=5):
+
+"""
+OpImgCls, multilabel: keeps EVERY option whose match clears `thresh`, not just the best
+one. Use when the field is a SET (several attributes hold at once, e.g. damage types on
+one car) rather than a single enum value — `classify` would force one winner.
+Args:
+    image (image): the image.
+    options (list): the value space.
+    thresh (float): keep options scoring at or above this (default 0.5).
+Returns:
+    tuple: (list of matching values, confidence in [0,1]).
+"""
+def classify_multi(image, options, thresh=0.5):
+
+"""
+Runs a DOMAIN-SPECIALIST classifier — a model trained for this exact domain, far more
+accurate there than zero-shot CLIP. Currently available: chest X-ray pathologies via
+model_id "torchxrayvision:densenet121-res224-all" (labels are pathology names such as
+"Pneumonia", "Effusion", "Cardiomegaly"). Returns "yes" when the strongest listed label
+clears `threshold`.
+Args:
+    image (image): the image.
+    model_id (string): the specialist model, e.g. "torchxrayvision:densenet121-res224-all".
+    labels (list): the positive labels to test for.
+    threshold (float): decision threshold (default 0.5).
+Returns:
+    tuple: ("yes" or "no", the max probability over `labels`).
+"""
+def domain_classify(image, model_id, labels, threshold=0.5):
 '''
 
 

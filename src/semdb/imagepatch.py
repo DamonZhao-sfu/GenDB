@@ -121,6 +121,12 @@ class ImagePatch:
         """True iff the patch matches `prop` better than its negation."""
         return self.verify_detail(prop, template)[0]
 
+    def classify_multi(self, options, thresh=0.5, template="a photo of {}"):
+        """OpImgCls, multilabel: (every option scoring over `thresh`, confidence). Use when
+        the field is a SET (several attributes true at once), not a single enum value."""
+        return semvision.clip_multilabel(self._src(), list(options), self.ctx["encoder"],
+                                         thresh, template, key=self._key)
+
     def score(self, text, template="a photo of {}"):
         """Raw CLIP image-text similarity in [0,1] (for yes/no thresholds)."""
         return semvision.clip_match(self._src(), template.format(text),
@@ -169,6 +175,17 @@ class ImagePatch:
         colors, _ = semvision.cv_dominant_colors(self._src(), self.ctx.get("palette"),
                                                  min_frac=min_frac, center_frac=center_frac)
         return colors
+
+    # --- domain specialists (a task-tuned model, not a zero-shot one) --------
+    def domain_classify(self, model_id, labels, threshold=0.5):
+        """A domain-specialist classifier — e.g.
+        `domain_classify("torchxrayvision:densenet121-res224-all", ["Pneumonia"])`.
+        Returns ("yes"|"no", the max probability over `labels`). The model is loaded once
+        and cached in `ctx`, so a corpus scan pays for it a single time."""
+        cache = self.ctx.setdefault("domain", {})
+        if model_id not in cache:
+            cache[model_id] = semvision.get_domain_model(model_id)
+        return semvision.domain_classify(self._src(), cache[model_id], list(labels), threshold)
 
     # --- OCR (printed text; stylized logos are unreliable — prefer classify) -
     def _ocr(self):
