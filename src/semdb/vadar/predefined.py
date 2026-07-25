@@ -128,6 +128,30 @@ Returns:
 def verify_property(image, prop):
 
 """
+CLIP image-to-TEXT similarity in [0,1] — a raw score, for thresholding when no closed
+value space exists. CLIP's text side sees only the first ~77 tokens, so pass a SHORT
+phrase ("a black handbag"), NEVER a full product description; for a long predicate,
+extract visual attributes with classify / dominant_colors / detect and match those.
+Args:
+    image (image): the image.
+    text (string): a short phrase.
+Returns:
+    float: similarity in [0,1].
+"""
+def score(image, text):
+
+"""
+The raw OCR text of the image, reading order preserved. Use `best_ocr_match` instead when
+you want to land on a value from a known value space; use `ocr_detail` when WHERE the text
+sits matters.
+Args:
+    image (image): the image.
+Returns:
+    string: the text ("" if none was read).
+"""
+def read_text(image):
+
+"""
 Detects instances of an object in the image (YOLO) and returns them as SUB-IMAGES, most
 confident first. Use len(...) for a count, truthiness for presence, and pass an element
 back into classify/read_text/dominant_colors to inspect just that object. The detector
@@ -188,3 +212,18 @@ Returns:
 """
 def pair_score(image, other):
 '''
+
+
+def _public_api():
+    """The agent-visible API surface, derived from this module rather than hand-listed —
+    a new predefined function is exposed to the generated program the moment it is defined
+    here, and `tests/test_predefined_api_surface.py` fails if it is not also documented in
+    `MODULES_SIGNATURES`."""
+    import inspect
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    return {n: o for n, o in vars(mod).items()
+            if inspect.isfunction(o) and not n.startswith("_") and o.__module__ == __name__}
+
+
+PREDEFINED_API = _public_api()
