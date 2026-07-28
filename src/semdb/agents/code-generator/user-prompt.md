@@ -41,8 +41,9 @@ correct without them. `METER.judge_calls` is your `residual_calls`.
   `python3 {{code_basename}} <structured.csv> <attrs.json> <out.csv> [--endpoint URL --api-key KEY --model NAME]`
   Write the result rows to `<out.csv>` with a header (columns in the query's
   SELECT order, e.g. `ID,uri`). Residual rows (extracted key is `none`/empty or
-  `conf < theta`) are re-checked by `vlm_judge(...)` against the endpoint; if no
-  `--endpoint` is given, skip them and log how many were left unresolved.
+  `conf < theta`) are re-checked by `vlm_answer(...)`/`vlm_judge(...)` against the
+  endpoint, in ONE pass after the relational work; if no `--endpoint` is given, skip
+  them and log how many were left unresolved (`METER.skipped`).
 - Also write `compiled_{{query_id}}.meta.json` = `{"elapsed_sec": ..., "rows": ...,
   "residual_calls": ...}` next to the program (the orchestrator reads it).
 - Print rows emitted and residual model calls.

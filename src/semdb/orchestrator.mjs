@@ -26,7 +26,7 @@
  */
 
 import { readFile, writeFile, mkdir, readdir } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, realpathSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -92,6 +92,18 @@ export function parseArgs(argv) {
     maxIterations: defaults.maxRefineIterations,
     noRefine: false,
     valFile: null,
+    valRate: null,          // build a val set at this sampling rate instead of --val-file
+    // Retained only so older command lines get an explicit warning. Join validation
+    // now samples the complete pair population; pruning changes the estimand.
+    valPairTop: null,
+    valCertRate: null,      // sealed CERT half, as a fraction of the corpus
+    valMethod: "stratified",
+    valSeed: 7,
+    valStrataK: 5,
+    valScoreTilt: 2.0,
+    valCallSite: null,      // which AI call site to label, for a multi-predicate query
+    oracleModel: null,      // labeling model; defaults to the strong image/text model
+    valPlanOnly: false,     // build/cardinality-check validation frames; no Oracle/agents
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -126,6 +138,16 @@ export function parseArgs(argv) {
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--max-iterations" && argv[i + 1]) args.maxIterations = parseInt(argv[++i], 10);
     else if (a === "--val-file" && argv[i + 1]) args.valFile = resolve(argv[++i]);
+    else if (a === "--val-rate" && argv[i + 1]) args.valRate = parseFloat(argv[++i]);
+    else if (a === "--val-cert-rate" && argv[i + 1]) args.valCertRate = parseFloat(argv[++i]);
+    else if (a === "--val-method" && argv[i + 1]) args.valMethod = argv[++i];
+    else if (a === "--val-seed" && argv[i + 1]) args.valSeed = parseInt(argv[++i], 10);
+    else if (a === "--val-strata-k" && argv[i + 1]) args.valStrataK = parseInt(argv[++i], 10);
+    else if (a === "--val-score-tilt" && argv[i + 1]) args.valScoreTilt = parseFloat(argv[++i]);
+    else if (a === "--val-call-site" && argv[i + 1]) args.valCallSite = parseInt(argv[++i], 10);
+    else if (a === "--oracle-model" && argv[i + 1]) args.oracleModel = argv[++i];
+    else if (a === "--val-plan-only") args.valPlanOnly = true;
+    else if (a === "--val-pair-top" && argv[i + 1]) args.valPairTop = parseInt(argv[++i], 10);
     else if (a === "--no-refine") args.noRefine = true;
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
@@ -170,6 +192,59 @@ export function parseArgs(argv) {
   return args;
 }
 
+/** Fail once, before planning every query, when a requested sf directory is absent. */
+export async function validateDataDirectory(args) {
+  if (!args.dataDir || existsSync(args.dataDir)) return;
+  let available = [];
+  try {
+    const entries = await readdir(dirname(args.dataDir), { withFileTypes: true });
+    available = entries
+      .filter((entry) => entry.isDirectory() && /^sf_/.test(entry.name))
+      .map((entry) => entry.name.slice(3))
+      .sort((a, b) => Number(a) - Number(b));
+  } catch { /* the parent itself is missing */ }
+  const requested = Number((basename(args.dataDir).match(/^sf_(\d+)$/) || [])[1]);
+  const suggestion = available.length
+    ? [...available].sort((a, b) =>
+        Math.abs(Number(a) - requested) - Math.abs(Number(b) - requested))[0]
+    : null;
+  const hint = available.length
+    ? ` Available scale factors: ${available.join(", ")}.`
+    : "";
+  throw new Error(
+    `data directory does not exist: ${args.dataDir}.${hint}`
+    + (suggestion ? ` Nearest available value: --sf ${suggestion}.` : ""));
+}
+
+/** Verify an explicitly requested oracle model exists before paying for any work. */
+export async function validateEndpointModel(endpoint, model, apiKey = "EMPTY") {
+  if (!endpoint || !model) return;
+  const url = endpoint.replace(/\/+$/, "") + "/models";
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (error) {
+    throw new Error(`cannot reach oracle endpoint ${url}: ${error.message}`);
+  }
+  if (!response.ok) {
+    throw new Error(`oracle endpoint ${url} returned HTTP ${response.status}`);
+  }
+  let payload;
+  try { payload = await response.json(); }
+  catch { throw new Error(`oracle endpoint ${url} did not return JSON`); }
+  const available = (payload?.data || []).map((entry) => entry.id).filter(Boolean);
+  if (!available.includes(model)) {
+    throw new Error(
+      `oracle model '${model}' is not served by ${endpoint}. `
+      + `Available model(s): ${available.join(", ") || "(none)"}. `
+      + `Restart the endpoint with --model ${model}, or pass a served --oracle-model.`
+    );
+  }
+}
+
 /**
  * Improvement selector — correctness-first, then F1 (mirrors GenDB behavior).
  * `prev`/`next` are { status: "ok"|"crash"|"empty", f1: number|null }.
@@ -184,20 +259,37 @@ export function checkSemdbImprovement(prev, next) {
 }
 
 /**
- * Stop/continue gate (mirrors GenDB shouldContinue). `history` = [{ iter, f1, status, improved }].
+ * Iteration-budget gate. `history` = [{ iter, f1, status, improved }].
+ *
+ * Validation quality selects the best candidate but never shortens the requested
+ * experiment. A perfect score on a finite validation sample can be accidental
+ * (mmqa q7 scored 1.0 on 40 sampled pairs and 0.1569 on the full join), while a
+ * stalled candidate can still be repaired by a later independent agent call.
  */
 export function shouldContinueSemdb(history, iteration, maxIter, stallThreshold) {
   if (iteration > maxIter) return { action: "stop", reason: "Max iterations reached" };
   const last = history[history.length - 1];
   if (last && last.status !== "ok") return { action: "continue", reason: "Fix runtime failure first" };
-  const bestF1 = history.reduce((m, h) => Math.max(m, h.f1 ?? -1), -1);
-  if (bestF1 >= 1.0) return { action: "stop", reason: "Perfect F1 reached" };
-  const thresh = stallThreshold || 2;
-  const recent = history.slice(-thresh);
-  if (recent.length >= thresh && recent.every((h) => !h.improved)) {
-    return { action: "stop", reason: `Stalled: ${thresh} non-improving iterations` };
-  }
-  return { action: "continue", reason: "Refinement potential remains" };
+  return { action: "continue", reason: "Iteration budget remains" };
+}
+
+/** Reconcile DIRECT-mode wall time without treating every non-agent millisecond as
+ * generated-code execution. All stages are sequential in this orchestrator, so the
+ * residual is scoring, preflight, artifact I/O, and other orchestration overhead. */
+export function directTimingBreakdown(
+  wallMs, agentMs, validationSamplingLlmMs, codeExecutionRuns = [],
+) {
+  const codeExecutionMs = codeExecutionRuns.reduce(
+    (total, run) => total + (Number(run?.duration_ms) || 0), 0);
+  return {
+    agent_stage_ms: Number(agentMs) || 0,
+    validation_sampling_llm_ms: Number(validationSamplingLlmMs) || 0,
+    code_execution_ms: codeExecutionMs,
+    other_overhead_ms: (Number(wallMs) || 0)
+      - (Number(agentMs) || 0)
+      - (Number(validationSamplingLlmMs) || 0)
+      - codeExecutionMs,
+  };
 }
 
 /**
@@ -241,6 +333,225 @@ function validateOfflineVadarFile(path) {
  * Returns { ok, stage, text, report } and never throws: a broken/missing preflight.py
  * must not stop code generation, so an unusable checker reports ok with stage "skipped".
  */
+/**
+ * Build (or reuse) an oracle-labeled validation set for one query.
+ *
+ * Cached under `<out>/_val/<bench>-<query>/`, keyed by the design that produced it, so
+ * re-running a query does not re-pay for labels. The key includes the oracle model and
+ * the call site because either one changing means the labels answer a different
+ * question; it includes the rate and seed because those change which rows were drawn.
+ *
+ * Returns the path to select.json, or null when no val set could be built. Never
+ * throws: a query whose predicate is pairwise (a join) has no per-row label frame, and
+ * that must degrade to the existing full-ground-truth scoring rather than kill the run.
+ */
+export function buildValSet(args, query, spec) {
+  const key = [args.valMethod, args.valRate, args.valCertRate ?? 0, args.valSeed,
+    args.valStrataK, args.valScoreTilt, spec.oracleModel,
+    args.valCallSite ?? "auto",
+    // Sampling v2 adds a probability-valid certainty stratum at the score-ranked
+    // head; it must not reuse a pre-v2 draw with a different inclusion design.
+    "oracleframes-v3",
+    spec.importanceBy || "default-score",
+    ...(spec.textCols || []),
+    // A pairwise design samples a different frame with different keys, so it must
+    // never reuse a per-row cache entry (or vice versa).
+    ...(spec.pairwise ? ["pairwise", spec.frameKey || "full-frame"] : []),
+  ].join("_").replace(/[^\w.-]/g, "");
+  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`, key);
+  const selectPath = resolve(dir, "select.json");
+  if (existsSync(selectPath)) {
+    console.log(`[SemDB] [${query}] reusing cached validation set ${selectPath}`);
+    return selectPath;
+  }
+  // A PAIRWISE frame already carries its own score column (build_pairs.py computed it
+  // with one matmul), so importance reads that column instead of re-encoding, and the
+  // images come from --pair-image-cols rather than a single --image-col.
+  const pairMode = !!spec.pairwise;
+  const importanceBy = spec.importanceBy || (pairMode ? "column:pair_score"
+    : (spec.isImage ? "clip-similarity" : "query-similarity"));
+  const bvArgs = [resolve(__dirname, "build_valset.py"),
+    "--corpus", spec.corpusCsv, "--id-col", spec.idCol,
+    "--query", query, "--attr", "answer", "--sql", spec.sqlPath,
+    "--method", args.valMethod, "--rate", String(args.valRate),
+    ...(args.valCertRate ? ["--cert-rate", String(args.valCertRate)] : []),
+    "--seed", String(args.valSeed), "--strata-k", String(args.valStrataK),
+    "--score-tilt", String(args.valScoreTilt),
+    "--strata-by", "score-decile",
+    "--importance-by", importanceBy,
+    ...(pairMode
+      ? ["--pairwise", "--pair-image-cols",
+         (spec.pairImageCols ?? ["file2"]).join(","),
+         "--image-dir", spec.imageDir || "", "--clip-model", spec.clipModel]
+      : (spec.isImage ? ["--image-col", spec.imageCol, "--image-dir", spec.imageDir,
+                         "--clip-model", spec.clipModel] : [])),
+    ...(spec.textCols || []).flatMap((c) => ["--text-col", c]),
+    ...(args.valCallSite != null ? ["--call-site", String(args.valCallSite)] : []),
+    "--label-source", "oracle", "--endpoint", spec.endpoint,
+    "--oracle-model", spec.oracleModel, "--api-key", args.apiKey || "EMPTY",
+    "--concurrency", String(args.concurrency ?? 8),
+    // One cache per (benchmark, query) rather than per design: raising the rate then
+    // re-pays only for rows never labeled before.
+    "--label-cache", resolve(args.out, "_val", `${args.benchmark}-${query}`, "labels.json"),
+    "--out", dir];
+  console.log(`\n[SemDB] [${query}] building validation set (rate=${args.valRate}, `
+    + `${args.valMethod}, oracle=${spec.oracleModel})`);
+  const proc = spawnSync("python3", bvArgs, { stdio: "inherit" });
+  if (proc.status !== 0 || !existsSync(selectPath)) {
+    console.warn(`[SemDB] [${query}] validation set not built (build_valset.py exited `
+      + `${proc.status}); falling back to full ground-truth scoring.`);
+    return null;
+  }
+  return selectPath;
+}
+
+/** The AI call sites of a query, via predicate.py --json. [] when unreadable — the
+ *  caller then behaves as it did before shapes were consulted. */
+export function callSites(sqlPath) {
+  const pr = spawnSync("python3", [resolve(__dirname, "predicate.py"), sqlPath, "--json"],
+    { encoding: "utf-8" });
+  if (pr.status !== 0) return [];
+  try { return JSON.parse(pr.stdout) || []; } catch { return []; }
+}
+
+/** Versioned candidate-domain plan from validation_plan.py. */
+export function validationPlan(sqlPath, benchmark, query) {
+  const pr = spawnSync("python3", [
+    resolve(__dirname, "validation_plan.py"), sqlPath,
+    "--benchmark", benchmark || "", "--query", query || "",
+  ], { encoding: "utf-8" });
+  if (pr.status !== 0) {
+    throw new Error(`validation_plan.py exited ${pr.status}: ${(pr.stderr || "").trim()}`);
+  }
+  try { return JSON.parse(pr.stdout); }
+  catch { throw new Error(`validation_plan.py returned invalid JSON for ${query}`); }
+}
+
+/** Execute EComm's ordinary CTE/filter prefix before a semantic self join. */
+export function buildDeterministicSelfJoinRows(args, query, sqlPath) {
+  if (args.benchmark !== "ecomm") {
+    throw new Error(`automatic self-join validation is not implemented for `
+      + `benchmark '${args.benchmark}'`);
+  }
+  const products = resolve(args.tableDir || args.dataDir, "ecomm_products.csv");
+  if (!existsSync(products)) {
+    throw new Error(`normalized EComm product view not found: ${products}`);
+  }
+  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`);
+  const out = resolve(dir, "deterministic_rows.csv");
+  const fbArgs = [
+    resolve(__dirname, "frame_builder.py"),
+    "--benchmark", args.benchmark, "--query", query,
+    "--sql", sqlPath, "--products", products, "--out", out,
+  ];
+  console.log(`\n[SemDB] [${query}] executing deterministic self-join prefix`);
+  const proc = spawnSync("python3", fbArgs, { stdio: "inherit" });
+  if (proc.status !== 0 || !existsSync(out)) {
+    throw new Error(`frame_builder.py exited ${proc.status}; no deterministic `
+      + `self-join frame was produced`);
+  }
+  return out;
+}
+
+/** Materialize an ordered self-join population after deterministic filtering. */
+export function buildSelfPairFrame(args, query, spec) {
+  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`);
+  const mode = spec.textCol ? "text" : "image";
+  const diagonal = spec.includeDiagonal ? "diag" : "nodiag";
+  const out = resolve(dir, `pairs_self_${mode}_ordered_${diagonal}.csv`);
+  const bpArgs = [
+    resolve(__dirname, "build_pairs.py"),
+    "--corpus", spec.corpusCsv, "--id-col", spec.idCol,
+    ...(spec.textCol ? ["--text-col", spec.textCol]
+      : ["--image-col", spec.imageCol]),
+    ...(spec.imageDir ? ["--image-dir", spec.imageDir] : []),
+    "--clip-model", spec.clipModel, "--ordered",
+    ...(spec.includeDiagonal ? ["--include-diagonal"] : []),
+    "--out", out,
+  ];
+  console.log(`\n[SemDB] [${query}] building ordered self-join pair frame `
+    + `(${mode}, diagonal=${spec.includeDiagonal ? "included" : "excluded"})`);
+  const proc = spawnSync("python3", bpArgs, { stdio: "inherit" });
+  if (proc.status !== 0 || !existsSync(out)) {
+    throw new Error(`build_pairs.py exited ${proc.status}; no self-join pair frame `
+      + `was produced`);
+  }
+  return out;
+}
+
+/**
+ * Materialize the CROSS-TABLE pair frame for a join query whose AI predicate is the
+ * join condition (mmqa q2a/q7: a structured table joined to the image table). Returns
+ * the frame CSV path, or null if it could not be built.
+ *
+ * The frame is the sampling unit for a pairwise val set: its id column is
+ * "<left_id>-<image_id>", the composite key SemBench's own join ground truth lists.
+ * Cached next to the val set so re-running a query does not re-encode the corpus.
+ */
+export function buildPairFrame(args, query, spec) {
+  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`);
+  const out = resolve(dir, `pairs${spec.top ? `_top${spec.top}` : ""}.csv`);
+  if (existsSync(out)) {
+    console.log(`[SemDB] [${query}] reusing cached pair frame ${out}`);
+    return out;
+  }
+  const bpArgs = [resolve(__dirname, "build_pairs.py"),
+    "--corpus", spec.leftCsv, "--id-col", spec.leftIdCol, "--text-col", spec.leftTextCol,
+    "--right", spec.rightCsv, "--right-id-col", spec.rightIdCol,
+    "--right-image-col", spec.rightImageCol,
+    ...(spec.imageDir ? ["--right-image-dir", spec.imageDir] : []),
+    "--clip-model", spec.clipModel,
+    ...(spec.top ? ["--top", String(spec.top)] : []),
+    "--out", out];
+  console.log(`\n[SemDB] [${query}] building cross-table pair frame `
+    + `(${spec.leftTextCol} x ${spec.rightImageCol})`);
+  const proc = spawnSync("python3", bpArgs, { stdio: "inherit" });
+  if (proc.status !== 0 || !existsSync(out)) {
+    console.warn(`[SemDB] [${query}] pair frame not built (build_pairs.py exited `
+      + `${proc.status}).`);
+    return null;
+  }
+  return out;
+}
+
+/** The column an AI call site reads for one alias, from predicate.py's `columns`
+ *  ("t.Track", "i.uri", …). This is what the predicate actually asks about, which a
+ *  header heuristic cannot recover. Null when the alias contributes no column. */
+export function predicateCol(site, alias) {
+  if (!site || !alias) return null;
+  const hit = (site.columns || []).find((c) => c.split(".")[0] === alias);
+  return hit ? hit.split(".").slice(1).join(".") : null;
+}
+
+/** All ordinary-text columns consumed by a per-row AI predicate, resolved against
+ * the actual corpus header. Supports both alias.column and unqualified columns.
+ * Header order is retained so the rendered row description is stable and natural. */
+export function predicateTextCols(site, header) {
+  if (!site || !header) return [];
+  const available = String(header).split(",").map((c) => c.trim()).filter(Boolean);
+  const wanted = new Set((site.columns || []).map((ref) => {
+    const parts = String(ref).split(".");
+    return parts[parts.length - 1].toLowerCase();
+  }));
+  return available.filter((c) => wanted.has(c.toLowerCase()));
+}
+
+/** The column a query SELECTs from its structured side — the left key of the pair, and
+ *  what SemBench's join ground truth lists (q2a -> ID, q7 -> Airlines). Null when the
+ *  SELECT does not project that alias. */
+export function selectedKeyCol(sql, alias) {
+  if (!sql || !alias) return null;
+  // Every SELECT..FROM segment, not just the first: a CTE query (mmqa q2b) opens with
+  // the CTE's own SELECT, whose aliases are not the outer query's. Take the first
+  // segment that actually projects this alias.
+  const col = new RegExp(`\\b${alias}\\.([A-Za-z_]\\w*)`);
+  for (const m of sql.matchAll(/\bselect\b([\s\S]*?)\bfrom\b/gi)) {
+    const hit = m[1].match(col);
+    if (hit) return hit[1];
+  }
+  return null;
+}
+
 export function runPreflight(paths, outPath) {
   const files = paths.filter((p) => p && existsSync(p));
   if (!files.length) return { ok: true, stage: "skipped", text: "", report: null };
@@ -649,8 +960,28 @@ export function renderFeedback(prev) {
     const rows = (prev.diff.mistakes || [])
       .map((r) => `  - id=${r.id} predicted=${r.predicted == null ? "MISSING" : r.predicted} expected=${r.expected}  text="${(r.text || "").slice(0, 160)}"`)
       .join("\n") || "  (none)";
+    // Accuracy alone is a bad objective at these base rates: with 2% positives,
+    // answering `false` everywhere scores 98%. Show the per-class numbers so the
+    // agent optimizes recall on the rare class rather than the majority label.
+    const q = pm.quality || null;
+    const num = (v) => (v == null ? "n/a" : v);
+    const qualityLine = q
+      ? `## CLASS BREAKDOWN — precision=${num(q.precision)} recall=${num(q.recall)} F1=${num(q.f1)}`
+        + `  (tp=${q.tp} fp=${q.fp} fn=${q.fn})`
+        + (pm.weighted
+            ? `\nThese are corpus estimates: the validation rows were drawn at UNEQUAL rates`
+              + ` (${pm.design?.weight_spread}x spread) and are weighted back to the`
+              + ` ${pm.design?.N ?? "?"}-row corpus. Raw counts over the labeled rows are`
+              + ` precision=${num(pm.unweighted?.precision)} recall=${num(pm.unweighted?.recall)}.`
+            : "")
+        + (q.recall === 0
+            ? `\nRECALL IS ZERO — the program finds none of the positives. A program that`
+              + ` always answers "no" would score the same accuracy. Fix this first.`
+            : "")
+      : "";
     return [
       `\n## LAST RUN — PER-ROW INFERENCE accuracy=${prev.f1} (${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)${timing}`,
+      qualityLine,
       `## MISLABELED ROWS — ${prev.diff.n_mistakes ?? 0} total, showing ${(prev.diff.mistakes || []).length}:`,
       rows,
       logBlock,
@@ -930,9 +1261,17 @@ async function scoreInference(args, query, iterDir, corpusCsv, valFile, diffPath
   if (ev.status !== 0) console.warn(`[SemDB] evaluate.py --score-inference exited ${ev.status}.`);
   const out = await readJSON(diffPath);
   if (!out) return { status: "ok", f1: null, metrics: null, diff: null };
+  // `estimates` is present only for an unequal-probability design; when it is, IT is
+  // the number that describes the corpus and the unweighted accuracy does not.
+  const est = out.estimates || out.unweighted || null;
+  const weighted = !!(out.design && out.design.weighted && out.estimates);
   return {
-    status: "ok", f1: out.accuracy,
-    metrics: { accuracy: out.accuracy, n: out.n, correct: out.correct },
+    status: "ok", f1: weighted ? (est.f1 ?? out.accuracy) : out.accuracy,
+    metrics: {
+      accuracy: out.accuracy, n: out.n, correct: out.correct,
+      quality: est, unweighted: out.unweighted || null,
+      design: out.design || null, weighted,
+    },
     diff: { mistakes: out.mistakes || [], n_mistakes: out.n_mistakes ?? 0, sampled: out.sampled },
   };
 }
@@ -1220,7 +1559,7 @@ function pickImageCols(header) {
  * then score its result CSV exactly like the compiled path.
  */
 async function runQueryDirect(args, planObj, csvPath) {
-  const { query, sql, nl, tables, corpus } = planObj;
+  const { query, sql, nl, tables, corpus, structured } = planObj;
   const wallStart = Date.now();
   const runDir = resolve(args.out, `${args.benchmark}-${query}`);
   await mkdir(runDir, { recursive: true });
@@ -1251,14 +1590,250 @@ async function runQueryDirect(args, planObj, csvPath) {
   const dataDir = args.tableDir || args.dataDir;
   const telePath = resolve(runDir, "telemetry.json");
 
-  // Per-row validation mode (text corpora only): a hand-labeled val.json is the only GT.
-  const valMode = !!args.valFile && !isImage && !args.noRefine;
-  const val = valMode ? await readJSON(args.valFile) : null;
+  // Per-row validation mode: a sampled, oracle-labeled val.json is the only GT the
+  // refinement loop reads. Either supplied with --val-file or built here from
+  // --val-rate. Image corpora are included: the solver honours --only-ids and writes
+  // trace_<q>.json in both modalities.
+  let valFile = args.valFile;
+  let valPairwise = false;      // the val set keys on "<left_id>-<image_id>"
+  let valPairKind = "";         // "cross" | "self"; affects the solver trace contract
+  let valPairIncludeDiagonal = false;
+  let valCorpusCsv = corpus.path;
+  let valRowIdCol = "";
+  let valLeftIdCol = "";        // structured-side key column of a pair id
+  let valKeyExample = "";       // a real pair id, shown to the solver verbatim
+  const buildsValidation = !valFile && !!args.valRate && !args.noRefine;
+  const validationStarted = Date.now();
+  if (!valFile && args.valRate && !args.noRefine) {
+    if (!args.endpoint && !args.valPlanOnly) {
+      console.warn(`[SemDB] [${query}] --val-rate needs --endpoint (the oracle is a `
+        + `model call); falling back to full ground-truth scoring.`);
+    } else if (!args.queryDir) {
+      console.warn(`[SemDB] [${query}] --val-rate needs --query-dir (the oracle labels `
+        + `against the query SQL); falling back to full ground-truth scoring.`);
+    } else {
+      // DIRECT mode never calls ensureCorpus, so the corpus id/text/image columns are
+      // not already resolved here — derive them the same way ensureCorpus does.
+      const { idCol, textCol, imageCol } = await corpusCols(corpus, args);
+      valRowIdCol = idCol;
+      const sqlPath = resolve(args.queryDir, `${query}.sql`);
+      const oracleModel = args.oracleModel
+        || (isImage ? defaults.extraction.strongImageModel : defaults.extraction.smallTextModel);
+      // A query whose AI predicate IS the join condition has no per-row label frame:
+      // the sampling unit is the (structured row, image) pair. Materialize that frame
+      // first, then sample it as an ordinary corpus keyed on "<id1>-<id2>".
+      const sites = callSites(sqlPath);
+      if (sites.length > 1 && args.valPlanOnly) {
+        const vplan = validationPlan(sqlPath, args.benchmark, query);
+        if (vplan.candidate?.unit === "tuple") {
+          const deterministic = buildDeterministicSelfJoinRows(
+            args, query, sqlPath);
+          const deterministicMeta = await readJSON(
+            deterministic + ".meta.json");
+          const rows = deterministicMeta?.output_rows;
+          const arity = vplan.candidate.arity;
+          if (!Number.isInteger(rows) || !Number.isInteger(arity)) {
+            throw new Error(`[SemDB] [${query}] tuple validation plan has no `
+              + `logical row count/arity.`);
+          }
+          const population = rows ** arity;
+          const sampleN = Math.ceil(population * args.valRate);
+          console.log(`[SemDB] [${query}] multi-site validation population: `
+            + `${rows}^${arity} = ${population} ordered candidate tuples; `
+            + `rate=${args.valRate} -> ${sampleN} validation tuples.`);
+          console.log(`[SemDB] [${query}] ${sites.length} AI sites compose via `
+            + `${vplan.candidate.composition?.kind || "typed composition"}.`);
+          console.log(`[SemDB] [${query}] validation plan complete; `
+            + `multi-site Oracle bundle/execution is the next implementation phase.`);
+          return {
+            query, validation_plan: vplan, deterministic_rows: rows,
+            candidate_population: population, sample_n: sampleN,
+          };
+        }
+        console.log(`[SemDB] [${query}] typed/grouped multi-site plan: `
+          + `${(vplan.candidate?.kinds || []).join(" + ")}. Candidate-frame `
+          + `materialization is deferred to the typed-operator phase.`);
+        return { query, validation_plan: vplan };
+      }
+      const pairSite = sites.find((s) => s.shape === "pairwise");
+      const selectedSite = args.valCallSite != null ? sites[args.valCallSite] : null;
+      const rowSite = selectedSite?.shape === "per_row"
+        ? selectedSite
+        : (sites.filter((s) => s.shape === "per_row").length === 1
+            ? sites.find((s) => s.shape === "per_row") : null);
+      const semanticTextCols = isImage ? [] :
+        predicateTextCols(rowSite, await headerOf(corpus.path));
+      // Cross-table vs SELF-join is decided by the call site's own `bases`, not by the
+      // plan's table list. ecomm q9 pairs p1/p2 which BOTH resolve to
+      // `product_selection`; the plan still offers `styles` as a structured side, so a
+      // path test would happily build a styles x IMAGES frame for a predicate that
+      // never looks at styles. Distinct bases is the real question.
+      const distinctBases = pairSite ? new Set(pairSite.bases || []).size : 0;
+      const crossTable = pairSite && isImage && distinctBases >= 2
+        && structured && structured.path && structured.path !== corpus.path;
+      if (pairSite && distinctBases < 2) {
+        const vplan = validationPlan(sqlPath, args.benchmark, query);
+        if (vplan.candidate?.unit !== "pair") {
+          throw new Error(`[SemDB] [${query}] validation plan did not produce a `
+            + `single pair candidate domain.`);
+        }
+        const deterministic = buildDeterministicSelfJoinRows(
+          args, query, sqlPath);
+        // The normalized description column contains embedded newlines, so the
+        // generic newline counter is not a CSV-record counter here. frame_builder
+        // writes the logical row count after DuckDB execution.
+        const deterministicMeta = await readJSON(deterministic + ".meta.json");
+        const filteredRows = deterministicMeta?.output_rows;
+        if (!Number.isInteger(filteredRows)) {
+          throw new Error(`[SemDB] [${query}] deterministic frame metadata has no `
+            + `logical output_rows count.`);
+        }
+        valPairIncludeDiagonal = !!vplan.candidate.include_diagonal;
+        const pairPopulation = valPairIncludeDiagonal
+          ? (filteredRows ?? 0) * (filteredRows ?? 0)
+          : (filteredRows ?? 0) * Math.max(0, (filteredRows ?? 0) - 1);
+        const pairSample = Math.ceil(pairPopulation * args.valRate);
+        console.log(`[SemDB] [${query}] self-join validation population: `
+          + `${filteredRows} filtered rows -> ${pairPopulation} ordered pairs `
+          + `(diagonal=${valPairIncludeDiagonal ? "included" : "excluded"}); `
+          + `rate=${args.valRate} -> ${pairSample} validation rows.`);
+        const frame = buildSelfPairFrame(args, query, {
+          corpusCsv: deterministic, idCol: "id",
+          ...(isImage ? { imageCol: "filename", imageDir }
+            : { textCol: "semantic_text" }),
+          clipModel, includeDiagonal: valPairIncludeDiagonal,
+        });
+        if (args.valPlanOnly) {
+          console.log(`[SemDB] [${query}] validation plan complete; `
+            + `--val-plan-only skips Oracle labeling and agent execution.`);
+          return {
+            query,
+            validation_plan: vplan,
+            deterministic_rows: filteredRows,
+            candidate_population: pairPopulation,
+            sample_n: pairSample,
+            frame,
+          };
+        }
+        valCorpusCsv = frame;
+        valFile = buildValSet(args, query, {
+          corpusCsv: frame, idCol: "pair_id", sqlPath,
+          isImage, pairwise: true,
+          pairImageCols: isImage ? ["file1", "file2"] : [],
+          textCols: isImage ? [] : ["text1", "text2"],
+          imageDir, clipModel, endpoint: args.endpoint, oracleModel,
+          importanceBy: "column:pair_score",
+          frameKey: `self-ordered-${valPairIncludeDiagonal ? "diag" : "nodiag"}`,
+        });
+        valPairwise = !!valFile;
+        valPairKind = "self";
+        valLeftIdCol = "id";
+        const firstRow = (await readFile(frame, "utf-8")).split(/\r?\n/)[1] || "";
+        valKeyExample = firstRow.split(",")[0] || "<left_id>-<right_id>";
+      } else if (crossTable) {
+        const leftAlias = (pairSite.aliases || [])[0];
+        // Pair/trace identity is a physical row identity, not necessarily a projected
+        // value. q7 projects Airlines, but 200 rows contain only 135 distinct airline
+        // names; using Airlines as the pair id makes keys collide. The configured key
+        // (or first column, row_id for q7) is unique while the solver may still project
+        // Airlines in its result CSV.
+        const leftPhysical = await corpusCols(structured, args);
+        const leftIdCol = leftPhysical.idCol;
+        // The text the predicate ASKS ABOUT, from the call site's own column list —
+        // not a header heuristic. q2a's predicate reads t.Track (the racetrack name);
+        // guessing from the header picks the last column, `Condition` ("Firm"/"Fast"),
+        // and CLIP then scores logos against track surface conditions.
+        const leftTextCol = predicateCol(pairSite, leftAlias)
+          || (await corpusCols(structured, args)).textCol;
+        console.log(`[SemDB] [${query}] pairwise call site (${pairSite.reason}) — `
+          + `pair frame ${structured.table}.${leftTextCol} x ${corpus.table}`);
+        // The validation population for a join is the complete Cartesian product.
+        // Pruning to a global CLIP top-K changes the estimand and made q7 look perfect
+        // on validation (40/40) while scoring 0.1569 F1 over all 40,000 pairs.
+        // `build_valset --rate r` therefore draws ceil(|L| * |R| * r) rows.
+        if (args.valPairTop) {
+          console.warn(`[SemDB] [${query}] ignoring deprecated --val-pair-top `
+            + `${args.valPairTop}: join validation samples the full pair population.`);
+        }
+        const leftRows = await countRows(structured.path);
+        const rightRows = await countRows(corpus.path);
+        const pairPopulation = (leftRows ?? 0) * (rightRows ?? 0);
+        const pairSample = Math.ceil(pairPopulation * args.valRate);
+        console.log(`[SemDB] [${query}] join validation population: ${leftRows} × `
+          + `${rightRows} = ${pairPopulation} pairs; rate=${args.valRate} -> `
+          + `${pairSample} validation rows.`);
+        const frame = buildPairFrame(args, query, {
+          leftCsv: structured.path, leftIdCol, leftTextCol,
+          rightCsv: corpus.path,
+          rightIdCol: imgFilenameCol || imageCol,
+          rightImageCol: imgFilepathCol || imgFilenameCol || imageCol,
+          imageDir, clipModel, top: null,
+        });
+        if (frame) {
+          valCorpusCsv = frame;
+          valFile = buildValSet(args, query, {
+            corpusCsv: frame, idCol: "pair_id", sqlPath, isImage: true,
+            pairwise: true, pairImageCols: ["file2"], textCols: ["text1"],
+            imageDir, clipModel, endpoint: args.endpoint, oracleModel,
+            importanceBy: "column:pair_score",
+            frameKey: "full-frame",
+          });
+          valPairwise = !!valFile;
+          valPairKind = "cross";
+          valLeftIdCol = leftIdCol;
+          // A real key from the frame beats a described one: the solver copies it.
+          const firstRow = (await readFile(frame, "utf-8")).split(/\r?\n/)[1] || "";
+          valKeyExample = firstRow.split(",")[0] || `<${leftIdCol}>-<image filename>`;
+        }
+      } else {
+        const textCols = semanticTextCols.length ? semanticTextCols : [textCol];
+        valFile = buildValSet(args, query, {
+          corpusCsv: corpus.path, idCol,
+          sqlPath, isImage,
+          imageCol: imgFilenameCol || imageCol, imageDir, clipModel,
+          textCols: isImage ? [] : textCols,
+          // Multi-field relational predicates need semantic relevance: TF-IDF cannot
+          // connect Frankfurt with Germany/Europe, while the local CLIP encoder can.
+          importanceBy: !isImage && textCols.length > 1
+            ? "clip-text-similarity" : undefined,
+          endpoint: args.endpoint, oracleModel,
+        });
+      }
+      // NO SILENT DEGRADATION. Without a val set the refinement loop scores against
+      // the full ground truth, and renderFeedback then shows the agent GT-derived
+      // FALSE POSITIVES / FALSE NEGATIVES rows verbatim — the agent would be reading
+      // the test set. Asking for --val-rate and getting GT-driven iteration instead is
+      // exactly the failure this must not have, so fail loudly instead.
+      if (!valFile) {
+        throw new Error(
+          `[SemDB] [${query}] --val-rate was given but NO validation set could be built.\n`
+          + `  Refusing to continue: without it every iteration would be scored against the\n`
+          + `  FULL ground truth and the agent's feedback would contain ground-truth rows.\n`
+          + `  Fix the val-set build above, or re-run WITHOUT --val-rate to accept\n`
+          + `  ground-truth-driven refinement deliberately.`);
+      }
+    }
+  }
+  const validationSamplingLlmMs = buildsValidation
+    ? Date.now() - validationStarted
+    : 0;
+  const valMode = !!valFile && !args.noRefine;
+  const val = valMode ? await readJSON(valFile) : null;
+  const validationTelemetry = valMode ? {
+    mode: valPairwise ? "pairwise" : "per_row",
+    pair_kind: valPairwise ? valPairKind : null,
+    population: val?.design?.N ?? null,
+    sampled_ids: val?.ids?.length ?? null,
+    labeled_rows: val?.labels ? Object.keys(val.labels).length : null,
+    oracle: val?.provenance?.oracle?.cost ?? null,
+    build_and_label_ms: validationSamplingLlmMs,
+  } : null;
   const valIdsPath = resolve(runDir, "_val_ids.txt");
   if (valMode) {
-    if (!val || !val.labels) throw new Error(`[SemDB] --val-file ${args.valFile} has no "labels"`);
+    if (!val || !val.labels) throw new Error(`[SemDB] --val-file ${valFile} has no "labels"`);
     await writeFile(valIdsPath, Object.keys(val.labels).join("\n") + "\n");
-    console.log(`[SemDB] [${query}] per-row validation mode: ${Object.keys(val.labels).length} labeled rows from ${args.valFile}`);
+    console.log(`[SemDB] [${query}] ${valPairwise ? "pairwise" : "per-row"} `
+      + `validation mode: ${Object.keys(val.labels).length} labeled rows from ${valFile}`);
   }
 
   // Text corpora select BOTH the text system prompt AND the text user prompt (the shared
@@ -1271,6 +1846,7 @@ async function runQueryDirect(args, planObj, csvPath) {
     ? {}
     : { sig: vadarSignatureConfig.userPromptPathText, api: vadarApiConfig.userPromptPathText, solver: vadarSolverConfig.userPromptPathText };
 
+  const codeExecutionRuns = [];
   const runSolver = (iterDir, iterCode, iterCsv, onlyIds = null) => {
     if (!existsSync(iterCode)) return { status: "empty", stderr: "" };
     const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
@@ -1291,12 +1867,24 @@ async function runQueryDirect(args, planObj, csvPath) {
     if (!doRun) return { status: "empty", stderr: "" };
     const sArgs = isImage
       ? [iterCode, iterCsv, "--data-dir", dataDir, ...(imageDir ? ["--image-dir", imageDir] : []),
-         "--clip-model", clipModel]
+         "--clip-model", clipModel,
+         // Without this an image solver runs the whole corpus every iteration and the
+         // validation set saves nothing.
+         ...(onlyIds ? ["--only-ids", onlyIds] : [])]
       : [iterCode, iterCsv, "--data-dir", dataDir,
          ...(onlyIds ? ["--only-ids", onlyIds] : [])];
     console.log(`\n[SemDB] Running direct solver: python3 ${sArgs.join(" ")}`);
     const { proc, stdout, stderr, execMs, logPath } =
       runPythonLogged(sArgs, resolve(iterDir, "run.log"), "direct solver");
+    const iterMatch = basename(iterDir).match(/^iter_(\d+)$/);
+    codeExecutionRuns.push({
+      iteration: iterMatch ? Number(iterMatch[1]) : null,
+      scope: onlyIds
+        ? "validation_iteration"
+        : (iterMatch ? "iteration_full_corpus" : "final_full_corpus"),
+      duration_ms: execMs,
+      status: proc.status === 0 ? "ok" : "crash",
+    });
     const out = { stderr, stdout, execMs, logPath };
     if (proc.status !== 0) {
       console.warn(`[SemDB] direct solver exited ${proc.status} (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
@@ -1306,15 +1894,90 @@ async function runQueryDirect(args, planObj, csvPath) {
     return { status: "ok", ...out };
   };
 
+  // The trace key follows the query's shape. A pairwise (join) query is scored per
+  // PAIR — a per-image trace cannot be matched against a pair-keyed val set at all —
+  // so the contract is stated explicitly rather than left to the agent to infer.
+  const crossPairTraceContract =
+    [`This query's AI predicate IS the join condition, so it is scored PER PAIR.`,
+       ``,
+       `- \`<key>\` is \`"<physical_row_id>-<image_filename>"\` — the structured row's`,
+       `  \`${valLeftIdCol}\` value, a literal \`-\`, then the image filename`,
+       `  (e.g. \`"${valKeyExample}"\`). This key is for sampled predicate validation;`,
+       `  the final result must still project the columns named by the SQL SELECT list.`,
+       `- Write ONE trace entry per (structured row, image) pair you evaluate, NOT one`,
+       `  per image. The same image paired with two structured rows is two entries.`,
+       `- \`--only-ids\` holds those pair keys. Apply it AFTER forming the pairs, not`,
+       `  when loading the manifest:`,
+       ``,
+       "```python",
+       `for srow in structured_rows:`,
+       `    for irow in image_rows:`,
+       `        key = f"{srow['${valLeftIdCol}']}-{irow['${imgFilenameCol}']}"`,
+       `        if only is not None and key not in only:`,
+       `            continue          # skip the visual call entirely`,
+       `        trace[key] = "true" if <predicate holds> else "false"`,
+       "```",
+       ``,
+       `  With \`--only-ids\` the loop must run the vision model ONLY for listed pairs —`,
+       `  that is the whole point of the sampled validation set.`].join("\n");
+  const selfPairTraceContract =
+    [`This query is a SEMANTIC SELF-JOIN and is scored PER ORDERED PAIR.`,
+     ``,
+     `- \`<key>\` is \`"<left_id>-<right_id>"\`, using the physical product \`id\``,
+     `  on both sides (e.g. \`"${valKeyExample}"\`). Do not use the loop index or`,
+     `  image path. The final result still follows the SQL SELECT projection.`,
+     `- The pair domain is ordered: \`a-b\` and \`b-a\` are distinct trace keys.`,
+     `- ${valPairIncludeDiagonal
+       ? "Diagonal keys such as `a-a` ARE part of this query and must be evaluated."
+       : "Diagonal keys such as `a-a` are excluded by the deterministic SQL predicate."}`,
+     `- Apply every ordinary CTE/join/filter first, then form pairs. Apply`,
+     `  \`--only-ids\` to the PAIR KEY after pair formation:`,
+     ``,
+     "```python",
+     `for left in filtered_rows:`,
+     `    for right in filtered_rows:`,
+     `        key = f"{left['id']}-{right['id']}"`,
+     `        if only is not None and key not in only:`,
+     `            continue`,
+     `        trace[key] = "true" if <semantic pair predicate holds> else "false"`,
+     "```",
+     ``,
+     `- Write one trace entry for every listed pair, including false decisions. With`,
+     `  \`--only-ids\`, do semantic inference only for listed pair keys.`].join("\n");
+  const rowTraceContract = isImage
+    ? [`This query is scored PER ROW.`,
+       ``,
+       `- \`<key>\` is the image manifest's primary-key value (a string) —`,
+       `  the \`${valRowIdCol || imgFilenameCol}\` column of \`${corpus.table}\`.`,
+       `- \`--only-ids\` holds those row ids; apply it as a membership filter right`,
+       `  after the manifest is loaded:`,
+       ``,
+       "```python",
+       `if only is not None:`,
+       `    rows = [r for r in rows if str(r["${valRowIdCol || imgFilenameCol}"]).strip() in only]`,
+       "```"].join("\n")
+    : [`This query is scored PER ROW.`,
+       ``,
+       `- \`<key>\` is the \`${valRowIdCol || "primary-key"}\` value of the text`,
+       `  corpus row, converted to a string.`,
+       `- Apply \`--only-ids\` immediately after loading rows, before semantic`,
+       `  inference, and write one true/false or extracted-value trace entry for`,
+       `  every listed row key.`].join("\n");
+  const traceContract = valPairwise
+    ? (valPairKind === "self" ? selfPairTraceContract : crossPairTraceContract)
+    : rowTraceContract;
+
   // Solver template vars differ by modality: image gets manifest cols, text does not.
   const solverVars = (iterCode, querySql, helpersPath) => isImage
     ? { query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
         tables_doc: tableLines.join("\n"),
         image_table: corpus.table, image_path: corpus.path,
         image_filename_col: imgFilenameCol, image_filepath_col: imgFilepathCol,
-        image_dir: imageDir, helpers_path: helpersPath, solve_path: iterCode }
+        image_dir: imageDir, helpers_path: helpersPath, solve_path: iterCode,
+        trace_contract: traceContract }
     : { query_id: query, query_sql: querySql, query_nl: nl || "(none)", semdb_dir: __dirname,
-        tables_doc: tableLines.join("\n"), helpers_path: helpersPath, solve_path: iterCode };
+        tables_doc: tableLines.join("\n"), helpers_path: helpersPath,
+        solve_path: iterCode, trace_contract: traceContract };
 
   // The 3 agents (Signature → API → Solver) generate iter_0's solve_<q>.py.
   const gen3Agents = async (iterDir, iterCode, querySql) => {
@@ -1359,7 +2022,9 @@ async function runQueryDirect(args, planObj, csvPath) {
   const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
     const diffPath = resolve(iterDir, "diff.json");
     if (valMode) {
-      const scored = await scoreInference(args, query, iterDir, corpus.path, args.valFile, diffPath);
+      // Pairwise: mistakes are looked up in the PAIR frame, not the image manifest —
+      // its ids are what the val file and the solver's trace key on.
+      const scored = await scoreInference(args, query, iterDir, valCorpusCsv, valFile, diffPath);
       // "ok" requires a trace to score; without one the agent must fix-first.
       const traceOk = existsSync(resolve(iterDir, `trace_${query}.json`));
       const status = run.status === "crash" ? "crash" : (traceOk ? "ok" : "empty");
@@ -1391,22 +2056,34 @@ async function runQueryDirect(args, planObj, csvPath) {
     runSolver(runDir, bestCode, resultsCsv, null);
   }
 
-  // Minimal telemetry (agent stages only — no extraction/compile split in DIRECT mode).
+  // DIRECT timing is measured at its actual boundaries. In particular, do not infer
+  // code execution as wall-agent: that residual also contains validation construction,
+  // scoring, preflight, and artifact I/O.
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
   const agentMs = phases.reduce((s, p) => s + p.duration_ms, 0);
   const agentCalls = phases.reduce((s, p) => s + p.llm_calls, 0);
   const agentCost = phases.reduce((s, p) => s + p.cost_usd, 0);
+  const wallMs = Date.now() - wallStart;
+  const timingBreakdown = directTimingBreakdown(
+    wallMs, agentMs, validationSamplingLlmMs, codeExecutionRuns);
   const report = {
     query, corpus: corpus.table, provider: args.agentProvider, operator: "direct",
-    mode: "direct", wall_clock_ms: Date.now() - wallStart,
+    mode: "direct", wall_clock_ms: wallMs,
     direct: { agent_stage_ms: agentMs, agent_calls: agentCalls,
-              agent_cost_usd: Number(agentCost.toFixed(4)) },
+              agent_cost_usd: Number(agentCost.toFixed(4)),
+              timing_breakdown_ms: timingBreakdown,
+              code_execution_runs: codeExecutionRuns },
     naive_llm_calls: planObj.plan.naive ?? null,
     total_estimated_cost_usd: Number(agentCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
-    refine: { mode: valMode ? "per_row_val" : "f1",
-              ...(valMode ? { objective: "inference_accuracy", val_file: args.valFile,
-                              val_n: Object.keys(val.labels).length } : {}),
+    validation: validationTelemetry,
+    // "f1_fallback" means a val set WAS asked for and could not be built, so every
+    // iteration was scored on the full ground truth — the tuning set was the test set.
+    refine: { mode: valMode ? "per_row_val" : (args.valRate ? "f1_fallback" : "f1"),
+              ...(valMode ? { objective: "inference_accuracy", val_file: valFile,
+                              val_n: Object.keys(val.labels).length,
+                              val_shape: valPairwise ? "pairwise" : "per_row",
+                              ...(valPairwise ? { pair_frame: valCorpusCsv } : {}) } : {}),
               iterations: history.length - 1, best_iteration: bestIter,
               max_iterations: args.noRefine ? 0 : args.maxIterations,
               f1_history: history },
@@ -1416,6 +2093,9 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   console.log(`\n[SemDB] === ${query} (DIRECT) ===`);
   console.log(`[SemDB]   3-agent solver     ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  $${agentCost.toFixed(4)}`);
+  console.log(`[SemDB]   validation build  ${(validationSamplingLlmMs / 1000).toFixed(1)}s  (sampling + oracle LLM)`);
+  console.log(`[SemDB]   code execution    ${(timingBreakdown.code_execution_ms / 1000).toFixed(1)}s  ${codeExecutionRuns.length} runs`);
+  console.log(`[SemDB]   other overhead    ${(timingBreakdown.other_overhead_ms / 1000).toFixed(1)}s  (preflight + scoring + I/O)`);
 
   // (3) finalize: score the promoted best CSV → merge metrics into telemetry + append results.csv row
   if (doRun) {
@@ -1441,6 +2121,10 @@ async function runQueryDirect(args, planObj, csvPath) {
 
 async function main() {
   const base = parseArgs(process.argv);
+  await validateDataDirectory(base);
+  if (base.valRate && !base.valPlanOnly && base.endpoint && base.oracleModel) {
+    await validateEndpointModel(base.endpoint, base.oracleModel, base.apiKey);
+  }
   setAgentProvider(base.agentProvider);
   const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
 
@@ -1465,8 +2149,18 @@ async function main() {
       ...(base.force ? ["--force"] : [])];
     console.log(`[SemDB] materializing parquet → CSV: python3 ${mArgs.join(" ")}`);
     const mp = spawnSync("python3", mArgs, { stdio: "inherit" });
-    if (mp.status !== 0) console.warn(`[SemDB] materialize.py exited ${mp.status} (needs pandas — run under gendb/sembench env).`);
-    else base.tableDir = matDir;
+    if (mp.status !== 0) {
+      throw new Error(`materialize.py exited ${mp.status} `
+        + `(verify the scale directory and pandas/pyarrow installation)`);
+    }
+    const required = [
+      "styles_details.csv", "styles.csv", "IMAGES.csv", "ecomm_products.csv",
+    ];
+    const missing = required.filter((name) => !existsSync(resolve(matDir, name)));
+    if (missing.length) {
+      throw new Error(`parquet materialization produced no ${missing.join(", ")} in ${matDir}`);
+    }
+    base.tableDir = matDir;
   }
 
   // 1) Plan every query and group by corpus (the extract-side table).
@@ -1478,14 +2172,26 @@ async function main() {
   // Skip queries we can't run: audio corpora, or a corpus whose table file didn't
   // resolve (usually a wrong/missing --benchmark so the SQL prefix matched nothing).
   const plans = allPlans.filter((p) => {
-    if (p.isAudio || p.corpus.modality === "audio") {
-      console.warn(`[SemDB] [${p.query}] SKIP: audio-modality corpus '${p.corpus.table}' is not supported.`);
+    const audioTables = p.tables.filter((table) => table.modality === "audio");
+    if (audioTables.length) {
+      console.warn(`[SemDB] [${p.query}] SKIP: query references unsupported audio `
+        + `table(s): ${audioTables.map((table) => table.table).join(", ")}.`);
       return false;
     }
     if (!p.corpus.path || !existsSync(p.corpus.path)) {
       console.warn(`[SemDB] [${p.query}] SKIP: corpus table not found ('${p.corpus.table}' → '${p.corpus.path || "<empty>"}'). `
         + `Check --benchmark (got '${base.benchmark}') and --sf so the SQL prefix '${benchPrefix(base.benchmark)}.' matches.`);
       return false;
+    }
+    if (base.valRate && base.valCallSite == null && base.queryDir) {
+      const sites = callSites(resolve(base.queryDir, `${p.query}.sql`));
+      if (sites.length > 1 && !base.valPlanOnly) {
+        console.warn(`[SemDB] [${p.query}] SKIP: query has ${sites.length} AI call `
+          + `sites but one per-predicate validation frame cannot score the complete `
+          + `multi-predicate query. Run it explicitly with --val-call-site N, or omit `
+          + `--val-rate.`);
+        return false;
+      }
     }
     return true;
   });
@@ -1559,8 +2265,21 @@ async function main() {
   console.log(`[SemDB]   metrics CSV -> ${csvPath}`);
 }
 
+/** Compare two paths as the FILESYSTEM sees them, not as strings.
+ *
+ *  `resolve()` normalizes but does not follow symlinks, while `import.meta.url` is
+ *  always the real path (node resolves the module specifier). When the repo is reached
+ *  through a symlinked prefix — /localhome/hza214 -> /local-scratch/localhome/hza214
+ *  here — invoking the file by its ABSOLUTE symlinked path made the two sides differ,
+ *  so main() silently never ran: no output, exit 0. A relative path happened to work
+ *  because process.cwd() is already resolved, which is what made this so easy to miss.
+ */
+function samePath(a, b) {
+  try { return realpathSync(a) === realpathSync(b); } catch { return resolve(a) === resolve(b); }
+}
+
 // Only run when invoked directly (not when imported by tests).
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && samePath(process.argv[1], fileURLToPath(import.meta.url))) {
   main().catch((err) => {
     console.error("[SemDB] Fatal:", err.message);
     process.exit(1);

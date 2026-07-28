@@ -232,11 +232,75 @@ def _norm(v):
     return None if v is None else str(v).strip().lower()
 
 
+TRUEISH = {"true", "yes", "1", "t", "y"}
+
+
+def _is_positive(value):
+    return _norm(value) in TRUEISH
+
+
+def _rate(num, den):
+    return round(num / den, 4) if den else None
+
+
+def weighted_quality(labels, pred_rows, weights):
+    """Horvitz-Thompson estimates of corpus accuracy and P/R/F1 from a weighted sample.
+
+    Each labeled row i carries w_i = 1/pi_i, the number of corpus rows it stands for,
+    so summing w_i over the rows with some property estimates how many corpus rows
+    have it. Under an unequal-probability design the UNWEIGHTED mean is not an
+    estimate of anything about the corpus: a validation set that deliberately
+    oversamples the score-dense region (which is the only way a 2%-positive predicate
+    becomes measurable at all) would otherwise report a number dominated by the
+    oversampled slice.
+
+    Precision/recall matter more than accuracy at these base rates. With 2% positives
+    a program that answers `false` everywhere scores 98% accuracy and 0 recall, and
+    only the second number tells the refinement loop anything.
+
+    Equal weights reduce this to the plain unweighted counts, so a val file without a
+    `weights` field keeps behaving exactly as before.
+    """
+    tp = fp = fn = tn = 0.0
+    for rid, expected in labels.items():
+        sid = str(rid)
+        w = float(weights.get(sid, weights.get(rid, 1.0)))
+        pred = pred_rows.get(sid, pred_rows.get(rid, None))
+        # An id the program never emitted is a negative prediction, not a skip: the
+        # program was asked about it and said nothing.
+        got, want = _is_positive(pred), _is_positive(expected)
+        if got and want:
+            tp += w
+        elif got and not want:
+            fp += w
+        elif want:
+            fn += w
+        else:
+            tn += w
+    precision, recall = _rate(tp, tp + fp), _rate(tp, tp + fn)
+    f1 = None
+    if precision is not None and recall is not None and (precision + recall) > 0:
+        f1 = round(2 * precision * recall / (precision + recall), 4)
+    return {
+        "tp": round(tp, 2), "fp": round(fp, 2), "fn": round(fn, 2), "tn": round(tn, 2),
+        "precision": precision, "recall": recall, "f1": f1,
+        "accuracy": _rate(tp + tn, tp + tn + fp + fn),
+        "positive_rate": _rate(tp + fn, tp + tn + fp + fn),
+    }
+
+
 def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None):
     """Per-row inference accuracy of a DIRECT solver's trace_<q>.json against a
-    hand-labeled val.json. Compares trace.rows[id] to val.labels[id] over the LABELED
+    labeled val.json. Compares trace.rows[id] to val.labels[id] over the LABELED
     ids only (normalized). A labeled id absent from the trace counts as wrong with
-    predicted=None. Returns accuracy + capped mistake samples (with a text snippet)."""
+    predicted=None.
+
+    Returns the unweighted accuracy (what the refinement loop has always read) plus,
+    under `estimates`, Horvitz-Thompson corpus estimates derived from val["weights"].
+    Both are reported because they answer different questions: the unweighted counts
+    describe the rows the agent can actually look at, while the weighted numbers are
+    the only ones that describe the corpus when the design is unequal-probability.
+    """
     attr = val.get("attr", trace.get("attr", ""))
     labels = val.get("labels", {})
     pred_rows = trace.get("rows", {}) if isinstance(trace.get("rows"), dict) else {}
@@ -254,13 +318,24 @@ def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None):
                              "predicted": None if raw_pred is None else str(raw_pred),
                              "expected": str(expected)})
     n = len(labels)
-    return {
+
+    weights = val.get("weights") or {}
+    design = val.get("design") or {}
+    out = {
         "query": val.get("query", trace.get("query", "")),
         "attr": attr, "n": n, "correct": correct,
-        "accuracy": round(correct / n, 4) if n else None,
+        "accuracy": _rate(correct, n),
         "mistakes": mistakes[:cap], "n_mistakes": len(mistakes),
         "sampled": len(mistakes) > cap,
+        "unweighted": weighted_quality(labels, pred_rows, {}),
     }
+    if weights:
+        out["estimates"] = weighted_quality(labels, pred_rows, weights)
+        spread = max(weights.values()) / min(weights.values()) if weights else 1.0
+        out["design"] = {"method": design.get("method"), "N": design.get("N"),
+                         "weight_spread": round(spread, 2),
+                         "weighted": spread > 1.0 + 1e-9}
+    return out
 
 
 def handler_id(query):
@@ -329,16 +404,152 @@ def model_of(tele, phase):
     return ""
 
 
+def direct_telemetry(tele):
+    """Flatten DIRECT-mode phase telemetry into the run-level CSV fields."""
+    phases = tele.get("phases", [])
+    direct = tele.get("direct", {}) if isinstance(tele.get("direct"), dict) else {}
+    timing = direct.get("timing_breakdown_ms", {})
+    timing = timing if isinstance(timing, dict) else {}
+    wall_ms = tele.get("wall_clock_ms", "")
+    agent_ms = timing.get(
+        "agent_stage_ms", direct.get("agent_stage_ms", tele.get("agent_stage_ms", "")))
+    validation_ms = timing.get("validation_sampling_llm_ms", "")
+    code_ms = timing.get(
+        "code_execution_ms", direct.get("code_execution_ms", tele.get("code_execution_ms", "")))
+    if code_ms == "" and isinstance(wall_ms, (int, float)) and isinstance(agent_ms, (int, float)):
+        # Backward compatibility for telemetry written before DIRECT stages were timed
+        # independently. This residual is not exact code execution because old runs
+        # also included validation construction, scoring, preflight, and artifact I/O.
+        code_ms = wall_ms - agent_ms
+
+    input_tokens = sum((p.get("tokens") or {}).get("input", 0) or 0 for p in phases)
+    output_tokens = sum((p.get("tokens") or {}).get("output", 0) or 0 for p in phases)
+    models = list(dict.fromkeys(p.get("model", "") for p in phases if p.get("model")))
+    calls = direct.get("agent_calls", "")
+    return {
+        "codegen_model": model_of(tele, "code_generator")
+            or model_of(tele, "vadar_solver") or "+".join(models),
+        "agent_stage_ms": agent_ms,
+        "validation_sampling_llm_ms": validation_ms,
+        "code_execution_ms": code_ms,
+        "total_agent_tokens": input_tokens + output_tokens,
+        "agent_input_tokens": input_tokens,
+        "agent_output_tokens": output_tokens,
+        "agent_calls": calls,
+        "extraction_calls": 0 if direct else "",
+        "residual_calls": 0 if direct else "",
+        "total_llm_calls": calls,
+    }
+
+
+F1_HISTORY_COLS = [f"val_f1_iter_{i}" for i in range(6)]
+
 CSV_COLS = [
     "query", "benchmark", "provider", "designer_model", "extractor_model", "codegen_model",
-    "wall_clock_ms", "agent_stage_ms", "code_execution_ms",
+    "wall_clock_ms", "agent_stage_ms", "validation_sampling_llm_ms", "code_execution_ms",
     "total_estimated_cost_usd", "total_agent_tokens",
+    "agent_input_tokens", "agent_output_tokens",
     "agent_calls", "extraction_calls", "residual_calls", "total_llm_calls",
     "naive_llm_calls", "compiled_execution_calls", "call_reduction",
+    "val_n", "refine_iterations", "best_iteration", "max_iterations",
+    *F1_HISTORY_COLS, "val_f1_history",
     "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
     # non-F1 metric families (blank unless that metric applies)
     "metric", "relative_error", "mape", "spearman", "kendall", "ari", "covered",
 ]
+
+
+def telemetry_row(tele, query="", benchmark=""):
+    """Flatten one telemetry.json into the stable results.csv schema.
+
+    `f1` remains the final full-corpus score. `val_f1_iter_N` records the validation
+    signal used by the refinement loop, and `val_f1_history` preserves every value
+    even when a run uses more than the six conventional iter_0..iter_5 slots.
+    """
+    tele = tele if isinstance(tele, dict) else {}
+    llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
+    direct = direct_telemetry(tele)
+    refine = tele.get("refine", {}) if isinstance(tele.get("refine"), dict) else {}
+    history = refine.get("f1_history", [])
+    history = history if isinstance(history, list) else []
+
+    row = {c: "" for c in CSV_COLS}
+    row.update(
+        query=query or tele.get("query", ""),
+        benchmark=benchmark or tele.get("benchmark", ""),
+        provider=tele.get("provider", ""),
+        designer_model=model_of(tele, "schema_designer"),
+        extractor_model=model_of(tele, "extractor"),
+        codegen_model=direct["codegen_model"],
+        wall_clock_ms=tele.get("wall_clock_ms", ""),
+        agent_stage_ms=direct["agent_stage_ms"],
+        validation_sampling_llm_ms=direct["validation_sampling_llm_ms"],
+        code_execution_ms=direct["code_execution_ms"],
+        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
+        total_agent_tokens=tele.get("total_agent_tokens", direct["total_agent_tokens"]),
+        agent_input_tokens=direct["agent_input_tokens"],
+        agent_output_tokens=direct["agent_output_tokens"],
+        agent_calls=llm.get("agent_stage", direct["agent_calls"]),
+        extraction_calls=llm.get("extraction", direct["extraction_calls"]),
+        residual_calls=llm.get("residual", direct["residual_calls"]),
+        total_llm_calls=llm.get("total", direct["total_llm_calls"]),
+        naive_llm_calls=tele.get("naive_llm_calls", ""),
+        compiled_execution_calls=tele.get("compiled_execution_calls", ""),
+        call_reduction=tele.get("call_reduction", ""),
+        val_n=refine.get("val_n", ""),
+        refine_iterations=refine.get("iterations", ""),
+        best_iteration=refine.get("best_iteration", ""),
+        max_iterations=refine.get("max_iterations", ""),
+        val_f1_history=json.dumps(
+            [h.get("f1") if isinstance(h, dict) else None for h in history],
+            separators=(",", ":")),
+    )
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        try:
+            iteration = int(item.get("iter"))
+        except (TypeError, ValueError):
+            continue
+        column = f"val_f1_iter_{iteration}"
+        if column in row:
+            row[column] = item.get("f1", "")
+
+    metrics = tele.get("metrics")
+    if isinstance(metrics, dict):
+        for column in (
+            "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
+            "metric", "relative_error", "mape", "spearman", "kendall", "ari", "covered",
+        ):
+            if metrics.get(column) is not None:
+                row[column] = metrics[column]
+    return row
+
+
+def upsert_result_row(path, row):
+    """Write one authoritative row per (benchmark, query), migrating old headers.
+
+    A query rerun updates its telemetry.json, so appending another CSV row leaves a
+    stale duplicate. Rewriting also upgrades older results.csv files that predate the
+    iteration-history columns.
+    """
+    existing = []
+    if os.path.exists(path) and os.path.getsize(path):
+        with open(path, newline="", encoding="utf-8") as handle:
+            existing = list(csv.DictReader(handle))
+    key = (str(row.get("benchmark", "")), str(row.get("query", "")))
+    kept = [
+        {column: old.get(column, "") for column in CSV_COLS}
+        for old in existing
+        if (str(old.get("benchmark", "")), str(old.get("query", ""))) != key
+    ]
+    kept.append({column: row.get(column, "") for column in CSV_COLS})
+    temporary = path + ".tmp"
+    with open(temporary, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLS)
+        writer.writeheader()
+        writer.writerows(kept)
+    os.replace(temporary, path)
 
 
 def eval_scenario(benchmark, query, pred_path, gt_dir, sf):
@@ -440,29 +651,7 @@ def main():
         ap.error("--csv is required unless --score-inference is set")
 
     tele = json.load(open(args.telemetry)) if args.telemetry and os.path.exists(args.telemetry) else {}
-    llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
-
-    row = {c: "" for c in CSV_COLS}
-    row.update(
-        query=args.query or tele.get("query", ""),
-        benchmark=args.benchmark or tele.get("benchmark", ""),
-        provider=tele.get("provider", ""),
-        designer_model=model_of(tele, "schema_designer"),
-        extractor_model=model_of(tele, "extractor"),
-        codegen_model=model_of(tele, "code_generator"),
-        wall_clock_ms=tele.get("wall_clock_ms", ""),
-        agent_stage_ms=tele.get("agent_stage_ms", ""),
-        code_execution_ms=tele.get("code_execution_ms", ""),
-        total_estimated_cost_usd=tele.get("total_estimated_cost_usd", ""),
-        total_agent_tokens=tele.get("total_agent_tokens", ""),
-        agent_calls=llm.get("agent_stage", ""),
-        extraction_calls=llm.get("extraction", ""),
-        residual_calls=llm.get("residual", ""),
-        total_llm_calls=llm.get("total", ""),
-        naive_llm_calls=tele.get("naive_llm_calls", ""),
-        compiled_execution_calls=tele.get("compiled_execution_calls", ""),
-        call_reduction=tele.get("call_reduction", ""),
-    )
+    row = telemetry_row(tele, query=args.query, benchmark=args.benchmark)
 
     gt_path = args.ground_truth or (
         resolve_gt_file(args.ground_truth_dir, args.query)
@@ -527,13 +716,8 @@ def main():
     else:
         print("[eval] telemetry-only row (no --pred/ground truth).")
 
-    new = not os.path.exists(args.csv) or os.path.getsize(args.csv) == 0
-    with open(args.csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_COLS)
-        if new:
-            w.writeheader()
-        w.writerow(row)
-    print(f"[eval] appended row -> {args.csv}")
+    upsert_result_row(args.csv, row)
+    print(f"[eval] updated row -> {args.csv}")
 
 
 if __name__ == "__main__":

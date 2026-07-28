@@ -15,6 +15,9 @@ Read: `{{helpers_path}}`
 ## Offline text API
 Read `MODULES_SIGNATURES_TEXT` in `{{semdb_dir}}/vadar/predefined_text.py`.
 
+## TRACE CONTRACT — the key `trace_{{query_id}}.json` and `--only-ids` use
+{{trace_contract}}
+
 ## Output contract
 - Write a CSV whose header columns are exactly the query's SELECT list, in order.
 - Read closed value spaces from structured CSV columns at runtime.

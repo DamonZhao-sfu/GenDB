@@ -24,10 +24,10 @@ export const defaults = {
   extraction: {
     clipModel: "openai/clip-vit-base-patch32",   // tier-② CLIP for non-VLM image extraction (semvision)
     smallImageModel: "HuggingFaceTB/SmolVLM-256M-Instruct",
-    strongImageModel: "Qwen/Qwen3-VL-2B-Instruct",
+    strongImageModel: "Qwen/Qwen3.6-35B-A3B",
     smallTextModel: "Qwen/Qwen2.5-0.5B-Instruct",
-    escalationImageModel: "Qwen/Qwen3-VL-2B-Instruct",
-    captionModel: "Qwen/Qwen3-VL-2B-Instruct",   // OpImgCap — one caption per corpus image
+    escalationImageModel: "Qwen/Qwen3.6-35B-A3B",
+    captionModel: "Qwen/Qwen3.6-35B-A3B",   // OpImgCap — one caption per corpus image
     theta: 0.5,               // residual confidence floor, cut on OpImgVQA's logprob score
   },
 

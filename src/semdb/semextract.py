@@ -321,14 +321,19 @@ class _Cfg:
 
 
 def gen_endpoint_full(cfg, json_schema, prompt, modality, image_path=None, text=None,
-                      logprobs=False):
+                      logprobs=False, image_paths=None):
     """POST one chat completion to an OpenAI-compatible server with guided_json.
     Returns the whole `choices[0]` object — message plus, when `logprobs=True`, the
-    per-token logprobs a caller needs to derive a CALIBRATED confidence (see semvqa)."""
+    per-token logprobs a caller needs to derive a CALIBRATED confidence (see semvqa).
+
+    `image_paths` attaches several images in order, for predicates that compare two
+    rows (a pairwise join condition). `image_path` remains the single-image form."""
     import urllib.request
     content = [{"type": "text", "text": prompt}]
     if modality == "image":
-        content.append({"type": "image_url", "image_url": {"url": _data_url(image_path)}})
+        paths = image_paths if image_paths is not None else [image_path]
+        for path in paths:
+            content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
     else:
         content[0]["text"] = prompt + "\n\nINPUT:\n" + (text or "")
     body = {
@@ -339,6 +344,15 @@ def gen_endpoint_full(cfg, json_schema, prompt, modality, image_path=None, text=
         "guided_json": json_schema,
         "response_format": {"type": "json_schema",
                             "json_schema": {"name": "extract", "schema": json_schema}},
+        # Every call here is a structured extraction whose answer is a label, a field
+        # value or a boolean — there is nothing to reason about, and on a reasoning
+        # model the chain of thought lands INSIDE the JSON `answer` string and eats the
+        # token budget. Measured on Qwen3.6-35B-A3B: with thinking on, a yes/no question
+        # hits max_tokens at 512 with the JSON still unterminated (at the default 64 the
+        # response has no `content` at all, so every oracle label abstains); with
+        # thinking off the same question finishes in 35 tokens with clean JSON.
+        # Chat templates that do not define this kwarg ignore it.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if logprobs:
         body["logprobs"] = True

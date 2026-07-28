@@ -139,6 +139,9 @@ if (!pf.ok) return { status: "crash", stage: "compile", preflight: pf, stderr: p
 **这正是 §5 要修的判据缺陷的实物证据**：循环在 n=60 上看到点估计 1.0 就宣布完美并提前停机，
 而程序在语料上漏掉了 2 个正例。
 
+当前实现已经移除这个 early-stop：`--max-iterations N` 会固定执行
+`iter_0 + iter_1 ... iter_N`，F1=1 或连续不提升只影响 best-candidate 选择。
+
 - 60/60 全对时，单侧 95% Clopper–Pearson 下界是 **0.9513**，不是 1.0。
   `shouldContinueSemdb` 若按 `quality.lcb >= target` 判定，target=0.98 时会继续迭代而不是停。
 - 两个数字口径不同（SELECT 是 60 行的 per-row accuracy，全语料是 13 条 gold 上的集合 F1），

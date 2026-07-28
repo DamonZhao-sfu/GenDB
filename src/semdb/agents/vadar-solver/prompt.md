@@ -42,3 +42,69 @@ Rules:
 - Resolve image paths with `semextract.resolve_image_path(uri, image_dir)`.
 - Read the predefined API in `{{semdb_dir}}/vadar/predefined.py` and the generated helpers.
 - The program must be runnable EXACTLY as the orchestrator invokes it (see the skeleton).
+
+### ADDITIONAL OUTPUT (per-row validation support) — REQUIRED
+
+Besides the result CSV and `solve_<q>.meta.json`, the program MUST also write
+`trace_<q>.json` next to the result CSV. It records, for EVERY image you ran visual
+inference on, the value you inferred for the query's KEY semantic attribute (the one
+the WHERE/label depends on) — BEFORE any relational filter drops the row:
+
+```json
+{ "attr": "<key attribute name>", "rows": { "<key>": "<inferred value>", ... } }
+```
+
+- For a boolean predicate (AI.IF), the value is the string `"true"` or `"false"`.
+- For a classify/extract attribute, the value is the inferred label / field value.
+- Accumulate into a dict as you iterate; `json.dump` it once at the end.
+
+The program MUST also accept an OPTIONAL CLI arg `--only-ids <path>`: when given,
+`<path>` is a newline-separated list of keys; restrict visual inference (and the trace
++ result rows) to ONLY those keys. When absent, process the whole corpus. This is what
+lets a run be scored against a small labeled sample instead of every image.
+
+**What `<key>` is, and where the `--only-ids` filter goes, depend on the query's shape.
+The TRACE CONTRACT section of the task prompt states both exactly — follow it
+literally; a trace keyed on anything else scores as all-wrong.**
+
+### DIAGNOSTIC LOGGING — REQUIRED
+
+The program MUST report on its own execution to **stderr**. These lines are captured
+and shown to you verbatim on the next iteration; a silent program gives you nothing to
+debug with, so treat this as part of the output contract.
+
+Label every decision path with a short `snake_case` branch name (at most 8 distinct
+names, ≤ 20 chars each) describing HOW the image was decided — `clip_hit`,
+`detect_miss`, `region_fallback` — not what the answer was (never `is_yellow_shoe`).
+
+```python
+import sys, time, collections
+_branch = collections.Counter()
+_warn = collections.Counter()
+_t0 = time.time()
+
+# ... inside the image loop, after deciding a row:
+_branch[branch] += 1
+# when an image falls through to a default / matched nothing:
+_warn[reason] += 1
+if _warn[reason] <= 5:                       # first few only; the rest are counted
+    print(f"[solve] WARN {reason} id={row_id}", file=sys.stderr)
+# wrap each image's inference so ONE unreadable file cannot kill the whole run:
+try:
+    ...
+except Exception as e:
+    print(f"[solve] ERROR {type(e).__name__}: {e} id={row_id}", file=sys.stderr)
+    errors[row_id] = f"{type(e).__name__}: {e}"
+    continue
+
+# ... after the loop:
+for name, n in _branch.most_common():
+    print(f"[solve] branch={name} n={n}", file=sys.stderr)
+for reason, n in _warn.most_common():
+    print(f"[solve] WARN-TOTAL {reason} n={n}", file=sys.stderr)
+print(f"[solve] rows_in={len(rows)} rows_out={len(out)} "
+      f"elapsed={time.time()-_t0:.1f}s", file=sys.stderr)
+```
+
+Keep it bounded: per-row WARN lines are capped at 5 per reason and the totals carry the
+rest. Do NOT print a line for every image that succeeds.

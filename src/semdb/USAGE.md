@@ -115,7 +115,170 @@ LLM/VLM endpoint.
 
 ---
 
-## Refining against a sampled validation set (`--val-file`)
+## Oracle-labeled validation sets in one command (`--val-rate`)
+
+The orchestrator can build the validation set itself: sample the corpus at a rate you
+pick, label those rows with a local model over `--endpoint`, and refine against them.
+
+```bash
+node src/semdb/orchestrator.mjs --benchmark ecomm --direct --image-only \
+  --query-dir /localhome/hza214/SemBench/files/ecomm/queries/dialects/bigquery \
+  --data-dir  /localhome/hza214/SemBench/files/ecomm/data/sf_250 \
+  --ground-truth-dir /localhome/hza214/SemBench/files/ecomm/raw_results/ground_truth \
+  --endpoint http://localhost:8000/v1 \
+  --val-rate 0.25 --val-cert-rate 0.1 --max-iterations 3
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--val-rate` | off | SELECT size as a fraction of the corpus. Requires `--endpoint`. |
+| `--val-cert-rate` | 0 | Sealed CERT half; the loop never reads it. |
+| `--val-method` | `stratified` | `uniform` / `stratified` / `importance` |
+| `--val-strata-k` | 5 | Score-decile bucket count |
+| `--val-score-tilt` | 2 | How hard to oversample high-score strata (0 = proportional) |
+| `--val-call-site` | auto | Which `AI.IF`/`AI.GENERATE` call to label, for a multi-predicate query |
+| `--val-pair-top` | deprecated | Ignored: join validation samples the complete pair population. |
+| `--oracle-model` | strong image/text model | The labeling model |
+
+### Why this matters: the loop must not read the ground truth
+
+With a validation set the loop scores each iteration with `scoreInference` against the
+oracle-labeled sample, runs the solver over only those rows (`--only-ids`), and does one
+full-corpus pass **after** the loop stops. Without one it scores against the full ground
+truth, and `renderFeedback` then shows the agent `FALSE POSITIVES` / `FALSE NEGATIVES`
+rows taken straight from it — the agent reads the test set and the reported F1 is the
+number the loop selected on.
+
+Because that failure is silent and easy to miss, **passing `--val-rate` and failing to
+build a val set is a hard error**, not a downgrade: the orchestrator aborts rather than
+quietly iterate against the ground truth. Drop `--val-rate` if you want ground-truth
+refinement deliberately.
+
+### Join queries are handled automatically
+
+When `predicate.py` reports the query's AI call site is **pairwise** and the two sides
+are different tables (mmqa q2a/q2b/q7), `--val-rate` builds a cross-table pair frame
+first, then samples it — no manual `build_pairs.py` step. The val set keys on
+`"<structured_id>-<image_filename>"`, and the solver is told to key `trace_<q>.json` the
+same way. The frame is the complete Cartesian product, and its validation size is
+`ceil(left_rows × right_rows × val_rate)`. For q7 at sf=200 and rate 0.1 this means
+`ceil(200 × 200 × 0.1) = 4,000` labeled pairs:
+
+```bash
+node src/semdb/orchestrator.mjs --benchmark mmqa --direct --query q2a \
+  --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
+  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200 \
+  --ground-truth-dir /localhome/hza214/SemBench/files/mmqa/raw_results/ground_truth \
+  --endpoint http://localhost:8000/v1 --oracle-model <vlm> \
+  --val-rate 0.1 --max-iterations 5
+```
+| `--val-seed` | 7 | Draw seed |
+
+The question is read from the query's own `AI.IF` / `AI.GENERATE` / `AI.CLASSIFY` call,
+so nothing is retyped. Val sets are cached under `runs/_val/<bench>-<query>/<design>/`
+and labels under `runs/_val/<bench>-<query>/labels.json`, so raising the rate re-pays
+only for rows never labeled before. Without `--endpoint` the run falls back to full
+ground-truth scoring instead of failing.
+
+**Why `--val-score-tilt` defaults to 2.** These predicates are highly selective — ecomm
+Q2 has 5 positives in 250 rows. A uniform 20% draw expects ~1 positive, and a val set
+with one positive scores `return false` at 98%: it cannot rank programs. CLIP ranks Q2's
+five positives at 1, 2, 3, 4 and 6 of 250, and the tilt spends labels there — capturing
+4 of 5 instead of 1 of 5. The cost is a ~16× spread in the Horvitz–Thompson weights,
+which `evaluate.py` divides back out, so the reported precision/recall/F1 are corpus
+estimates rather than sample averages.
+
+Inspect a query's call sites before committing labels:
+
+```bash
+python3 src/semdb/predicate.py /path/to/q10.sql
+```
+
+Join queries such as q8/q9/q10/q11/q14 contain **pairwise** call sites, whose label is
+over a pair of rows. Those need a pair frame (below); their **per-row** call sites —
+q10 and q11 have 3 and 4 of them — get ordinary val sets.
+
+### Pairwise (join) validation sets
+
+EComm q7/q9 self-join frames are now automatic. The orchestrator first materializes a
+flat `ecomm_products.csv`, executes the query's deterministic CTE/filter in an
+in-memory DuckDB connection, and only then forms the ordered pair population:
+
+```bash
+# No Oracle or agents: inspect population/sample cardinalities and build cached frames.
+node src/semdb/orchestrator.mjs \
+  --benchmark ecomm --sembench-dir /localhome/hza214/SemBench --sf 250 \
+  --query q7,q9 --direct --val-rate 0.05 --val-plan-only \
+  --out src/semdb/runs/ecomm
+```
+
+At sf250, q7 has 41 filtered rows and includes diagonal pairs, so its population is
+`41² = 1,681`; q9 has 18 filtered rows and explicitly requires `p1 != p2`, so its
+ordered population is `18 × 17 = 306`. At 5%, the validation samples contain 85 and
+16 pair rows respectively.
+
+For a manual frame, build it **after** the query's deterministic predicates and treat
+it as an ordinary corpus whose ids are `"<id1>-<id2>"`:
+
+```bash
+# ids surviving q9's CTE (baseColour IN ... AND colour1='' AND price<800) -> keep.txt
+python3 src/semdb/build_pairs.py --corpus IMAGES.csv --id-col id --image-col filename \
+  --image-dir .../images --only-ids keep.txt --ordered --out pairs_q9.csv
+
+python3 src/semdb/build_valset.py --corpus pairs_q9.csv --id-col pair_id --pairwise \
+  --query q9 --attr same_outfit --sql .../q9.sql \
+  --method stratified --strata-by score-decile --importance-by column:pair_score \
+  --rate 0.6 --cert-rate 0.2 --label-source oracle \
+  --endpoint http://localhost:8000/v1 --oracle-model <vlm> --out runs/_val/ecomm-q9
+```
+
+`--only-ids` is not a tuning knob. Pairing all 250 ecomm images gives 62,250 ordered
+non-self pairs. q9's own filter leaves 18 rows → 306 ordered pairs containing the
+same six symmetric matches in both directions (12 positive output ids). q7 does not
+exclude equal aliases and therefore additionally needs `--include-diagonal`.
+
+`--val-plan-only` also reports q10/q11 multi-site root cardinalities without paying for
+labels. At sf250 these are `60³ = 216,000` and `250⁴ = 3,906,250,000`, making the
+cost boundary visible before the multi-site Oracle bundle is built.
+
+### Cross-table pair frames (a structured table joined to images)
+
+mmqa q2a/q2b/q7 join a structured table to the image table with the AI predicate itself
+as the join condition, so the pair is (structured row, image) rather than (image,
+image). `--right` switches `build_pairs.py` to that mode and scores the frame by CLIP
+**text↔image** similarity:
+
+```bash
+python3 src/semdb/build_pairs.py \
+  --corpus .../ap_warrior.csv --id-col ID --text-col Track \
+  --right .../images.csv --right-id-col image_filename --right-image-col image_filepath \
+  --out pairs_q2a.csv
+
+python3 src/semdb/build_valset.py --corpus pairs_q2a.csv --id-col pair_id \
+  --pairwise --pair-image-cols file2 --text-col text1 \
+  --query q2a --attr answer --sql .../q2a.sql \
+  --method stratified --strata-by score-decile --importance-by column:pair_score \
+  --rate 0.1 --label-source oracle --endpoint http://localhost:8000/v1 \
+  --oracle-model <vlm> --out runs/_val/mmqa-q2a
+```
+
+The left id must be the column the query SELECTs (q2a → `ID`, q7 → `Airlines`), because
+that is what SemBench's join ground truth lists.
+
+**Text↔image ranks far better than image↔image.** On mmqa q7 the five ground-truth
+pairs rank 18, 31, 95, 107 and 187 of 40,000 — all inside the top 0.47%, a ~200×
+lift. Logo recognition is what CLIP is strongest at, unlike ecomm q9's "same category
+and colour" where the image↔image lift is only ~2×.
+
+Similarity is used only for stratification and score-ranked certainty anchors. It no
+longer prunes the validation population: every pair retains non-zero inclusion
+probability, and the requested rate is applied to the complete join.
+
+`--max-iterations N` is an exact refinement budget whenever a validation signal
+exists: the system runs `iter_0` followed by `iter_1` through `iter_N`. Perfect or
+stalled validation F1 selects the best candidate but does not stop the run early.
+
+## Refining against a pre-built validation set (`--val-file`)
 
 Instead of scoring each iteration against the full ground truth, draw a probability
 sample of the corpus, label it, and refine against **that**. Two steps.

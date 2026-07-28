@@ -44,7 +44,8 @@ def _schema(choices=None):
 
 
 def _prompt(question, choices=None):
-    p = ("Answer the question about this image. Respond with STRICT JSON only, no prose:\n"
+    p = ("Answer the question about the provided input. Respond with STRICT JSON only, "
+         "no prose:\n"
          '{"answer": <string>, "conf": <0.0-1.0>}\n'
          f"- question: {question}\n")
     if choices:
@@ -90,16 +91,20 @@ def _score_from_logprobs(choice, content, answer):
 
 
 def vqa_detail(question, choices=None, *, cfg, image_path=None, text=None,
-               default=DEFAULT_SCORE):
-    """One typed QA call over an image (`image_path`) or a text (`text`). Returns
+               default=DEFAULT_SCORE, image_paths=None):
+    """One typed QA call over an image (`image_path`), several images (`image_paths`,
+    for a predicate comparing two rows), or a text (`text`). Returns
     {"answer", "score", "score_source": "logprobs"|"self"|"default", "raw", "error"}."""
-    modality = "image" if image_path is not None else "text"
+    modality = "image" if (image_path is not None or image_paths) else "text"
     schema = _schema(choices)
     out = {"answer": "none", "score": 0.0, "score_source": "default", "raw": "", "error": None}
+    # Only pass image_paths when there is one: the single-image call signature stays
+    # byte-identical for every existing caller (and test stub) of gen_endpoint_full.
+    extra = {"image_paths": list(image_paths)} if image_paths else {}
     try:
         choice = semextract.gen_endpoint_full(cfg, schema, _prompt(question, choices),
                                               modality, image_path=image_path, text=text,
-                                              logprobs=True)
+                                              logprobs=True, **extra)
     except Exception as e:  # noqa: BLE001 — a residual miss must not kill the batch
         out["error"] = str(e)
         return out
@@ -131,6 +136,14 @@ def vqa_detail(question, choices=None, *, cfg, image_path=None, text=None,
 def img_vqa_detail(image_path, question, choices=None, *, cfg, default=DEFAULT_SCORE):
     """OpImgVQA over one image."""
     return vqa_detail(question, choices, cfg=cfg, image_path=image_path, default=default)
+
+
+def imgs_vqa_detail(image_paths, question, choices=None, *, cfg, default=DEFAULT_SCORE):
+    """OpImgVQA over SEVERAL images in one call — the shape a pairwise join predicate
+    needs ("do these two products share a colour and a brand?"). Image order is the
+    order the question refers to them in, so callers must not sort it."""
+    return vqa_detail(question, choices, cfg=cfg, image_paths=list(image_paths),
+                      default=default)
 
 
 def txt_vqa_detail(text, question, choices=None, *, cfg, default=DEFAULT_SCORE):

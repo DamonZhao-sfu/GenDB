@@ -19,6 +19,9 @@ Read: `{{helpers_path}}`
 ## Predefined API
 Read `MODULES_SIGNATURES` in `{{semdb_dir}}/vadar/predefined.py`.
 
+## TRACE CONTRACT — the key `trace_{{query_id}}.json` and `--only-ids` use
+{{trace_contract}}
+
 ## Output contract (so the evaluator can score it)
 - Write a CSV whose header columns are EXACTLY the query's SELECT list, in order.
 - For an image-identity output column, write the image FILENAME (the evaluator takes its

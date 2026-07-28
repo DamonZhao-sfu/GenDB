@@ -23,16 +23,17 @@ Hard offline contract:
 ### ADDITIONAL OUTPUT (per-row validation support) — REQUIRED
 
 Besides the result CSV and `solve_<q>.meta.json`, the program MUST also write
-`trace_<q>.json` next to the result CSV. It records, for EVERY row you ran
-semantic inference on, the value you inferred for the query's KEY semantic
-attribute (the attribute the WHERE/label depends on) — BEFORE any relational
-filter drops the row:
+`trace_<q>.json` next to the result CSV. It records, for EVERY validation candidate
+you ran semantic inference on, the value you inferred for the query's KEY semantic
+attribute — before a semantic filter drops the candidate. A candidate is normally a
+row, but it is an ordered pair for a semantic self-join; the user prompt's TRACE
+CONTRACT is authoritative:
 
 ```json
 { "attr": "<key attribute name>", "rows": { "<row_id>": "<inferred value>", ... } }
 ```
 
-- `<row_id>` is the corpus primary-key value (a string) for that row.
+- `<row_id>` is the exact key specified by the TRACE CONTRACT.
 - For a boolean predicate (AI.IF / judge), the value is the string `"true"` or
   `"false"`.
 - For a classify/extract attribute, the value is the inferred label / field value.
@@ -83,9 +84,9 @@ Keep it bounded: the per-row WARN lines are capped at 5 per reason and the total
 carry the rest. Do NOT print a line for every row that succeeds.
 
 The program MUST also accept an OPTIONAL CLI arg `--only-ids <path>`: when given,
-`<path>` is a newline-separated list of row ids; restrict semantic inference (and
-the trace + result rows) to ONLY those ids. When absent, process the whole corpus.
-Implement it as a simple membership filter right after you load the corpus rows:
+`<path>` is a newline-separated list of validation candidate keys; restrict semantic
+inference and trace entries to ONLY those keys. When absent, process the full query.
+For a per-row query this is a simple membership filter after loading rows:
 
 ```python
 import argparse
@@ -98,9 +99,12 @@ if a.only_ids:
     with open(a.only_ids) as f:
         only = {ln.strip() for ln in f if ln.strip()}
 # after loading corpus rows:
-if only is not None:
+if only is not None:  # per-row queries only; pair queries filter after forming pairs
     rows = [r for r in rows if str(r[<id_col>]).strip() in only]
 ```
+
+For a semantic join, do not apply pair keys to individual rows. Form the candidate
+pair exactly as stated by the TRACE CONTRACT, then test the composite pair key.
 
 Use `normalize`, phrase/keyword predicates, lexical matching, regex extraction, and
 structured parsing from `{{semdb_dir}}/vadar/predefined_text.py`. Write the program to
@@ -123,6 +127,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--only-ids")
     a = ap.parse_args()
     # Read tables, apply deterministic helpers, then form SELECT-shaped tuples.
     out_rows = []
