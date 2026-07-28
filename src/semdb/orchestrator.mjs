@@ -2094,7 +2094,12 @@ async function runQueryDirect(args, planObj, csvPath) {
   console.log(`\n[SemDB] === ${query} (DIRECT) ===`);
   console.log(`[SemDB]   3-agent solver     ${(agentMs / 1000).toFixed(1)}s  ${agentCalls} calls  $${agentCost.toFixed(4)}`);
   console.log(`[SemDB]   validation build  ${(validationSamplingLlmMs / 1000).toFixed(1)}s  (sampling + oracle LLM)`);
-  console.log(`[SemDB]   code execution    ${(timingBreakdown.code_execution_ms / 1000).toFixed(1)}s  ${codeExecutionRuns.length} runs`);
+  console.log(`[SemDB]   code execution total  ${(timingBreakdown.code_execution_ms / 1000).toFixed(1)}s  ${codeExecutionRuns.length} runs`);
+  for (const run of codeExecutionRuns) {
+    const iter = run.iteration == null ? "final" : `iter_${run.iteration}`;
+    console.log(`[SemDB]     ${iter.padEnd(8)} ${run.scope.padEnd(24)} `
+      + `${(run.duration_ms / 1000).toFixed(3)}s  ${run.status}`);
+  }
   console.log(`[SemDB]   other overhead    ${(timingBreakdown.other_overhead_ms / 1000).toFixed(1)}s  (preflight + scoring + I/O)`);
 
   // (3) finalize: score the promoted best CSV → merge metrics into telemetry + append results.csv row

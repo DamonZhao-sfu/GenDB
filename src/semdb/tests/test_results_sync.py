@@ -82,3 +82,30 @@ def test_direct_timing_breakdown_is_flattened_without_wall_residual():
     assert row["agent_stage_ms"] == 700
     assert row["validation_sampling_llm_ms"] == 40
     assert row["code_execution_ms"] == 200
+
+
+def test_code_execution_runs_are_flattened_per_iteration_and_final_run():
+    tele = telemetry("q13", [0.8, 1.0], 0.7)
+    runs = [
+        {"iteration": 0, "scope": "validation_iteration",
+         "duration_ms": 30, "status": "ok"},
+        {"iteration": 1, "scope": "validation_iteration",
+         "duration_ms": 40, "status": "ok"},
+        {"iteration": None, "scope": "final_full_corpus",
+         "duration_ms": 90, "status": "ok"},
+    ]
+    tele["direct"]["code_execution_runs"] = runs
+    row = E.telemetry_row(tele, query="q13", benchmark="ecomm")
+    assert row["code_execution_ms_iter_0"] == 30
+    assert row["code_execution_ms_iter_1"] == 40
+    assert row["code_execution_ms_final"] == 90
+    assert json.loads(row["code_execution_runs"]) == runs
+
+
+def test_missing_code_execution_runs_are_not_inferred():
+    tele = telemetry("q13", [0.8, 1.0], 0.7)
+    row = E.telemetry_row(tele, query="q13", benchmark="ecomm")
+    assert row["code_execution_ms_iter_0"] == ""
+    assert row["code_execution_ms_iter_1"] == ""
+    assert row["code_execution_ms_final"] == ""
+    assert row["code_execution_runs"] == ""

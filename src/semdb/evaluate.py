@@ -443,10 +443,12 @@ def direct_telemetry(tele):
 
 
 F1_HISTORY_COLS = [f"val_f1_iter_{i}" for i in range(6)]
+CODE_EXECUTION_HISTORY_COLS = [f"code_execution_ms_iter_{i}" for i in range(6)]
 
 CSV_COLS = [
     "query", "benchmark", "provider", "designer_model", "extractor_model", "codegen_model",
     "wall_clock_ms", "agent_stage_ms", "validation_sampling_llm_ms", "code_execution_ms",
+    *CODE_EXECUTION_HISTORY_COLS, "code_execution_ms_final", "code_execution_runs",
     "total_estimated_cost_usd", "total_agent_tokens",
     "agent_input_tokens", "agent_output_tokens",
     "agent_calls", "extraction_calls", "residual_calls", "total_llm_calls",
@@ -472,6 +474,9 @@ def telemetry_row(tele, query="", benchmark=""):
     refine = tele.get("refine", {}) if isinstance(tele.get("refine"), dict) else {}
     history = refine.get("f1_history", [])
     history = history if isinstance(history, list) else []
+    direct_block = tele.get("direct", {}) if isinstance(tele.get("direct"), dict) else {}
+    execution_runs = direct_block.get("code_execution_runs")
+    execution_runs = execution_runs if isinstance(execution_runs, list) else []
 
     row = {c: "" for c in CSV_COLS}
     row.update(
@@ -504,6 +509,21 @@ def telemetry_row(tele, query="", benchmark=""):
             [h.get("f1") if isinstance(h, dict) else None for h in history],
             separators=(",", ":")),
     )
+    if execution_runs:
+        row["code_execution_runs"] = json.dumps(execution_runs, separators=(",", ":"))
+        for run in execution_runs:
+            if not isinstance(run, dict) or run.get("duration_ms") is None:
+                continue
+            iteration = run.get("iteration")
+            try:
+                iteration = int(iteration)
+            except (TypeError, ValueError):
+                iteration = None
+            column = f"code_execution_ms_iter_{iteration}"
+            if iteration is not None and column in row:
+                row[column] = run["duration_ms"]
+            elif run.get("scope") == "final_full_corpus":
+                row["code_execution_ms_final"] = run["duration_ms"]
     for item in history:
         if not isinstance(item, dict):
             continue
