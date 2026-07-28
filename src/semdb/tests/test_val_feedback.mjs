@@ -23,4 +23,23 @@ const f1out = renderFeedback({
   history: [],
 });
 assert.ok(f1out.includes("FALSE POSITIVES"), "F1 block preserved");
+
+const ariOut = renderFeedback({
+  status: "ok", f1: null,
+  objective: {
+    name: "adjusted_rand_index", value: 0.7, direction: "maximize",
+    details: { metric_type: "adjusted-rand-index", accuracy: 0.7, n: 20 },
+  },
+  metrics: {
+    metric: "adjusted-rand-index", metric_family: "SingleAccuracyScore",
+    metric_type: "adjusted-rand-index", accuracy: 0.7, adjusted_rand_index: 0.7,
+  },
+  diff: { fp_total: 0, false_positives: [], fn_total: 0, false_negatives: [] },
+  history: [],
+});
+assert.ok(ariOut.includes("QUERY METRIC adjusted_rand_index=0.7"),
+  "shows the true non-F1 objective");
+assert.ok(ariOut.includes('"metric_type": "adjusted-rand-index"'),
+  "shows the SemBench metric type");
+assert.ok(!ariOut.includes("FALSE POSITIVES"), "does not render meaningless id-set F1 feedback");
 console.log("test_val_feedback OK");

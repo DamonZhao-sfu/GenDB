@@ -245,16 +245,56 @@ export async function validateEndpointModel(endpoint, model, apiKey = "EMPTY") {
   }
 }
 
+/** Normalize old F1-only outcomes and new metric-aware outcomes. */
+export function semdbObjective(outcome) {
+  const candidate = outcome?.objective;
+  const hasNumber = (value) => value !== null && value !== undefined && value !== ""
+    && Number.isFinite(Number(value));
+  if (candidate && hasNumber(candidate.value)) {
+    return {
+      name: candidate.name || "objective",
+      value: Number(candidate.value),
+      direction: candidate.direction === "minimize" ? "minimize" : "maximize",
+      details: candidate.details || null,
+    };
+  }
+  if (hasNumber(outcome?.f1)) {
+    return { name: "f1", value: Number(outcome.f1), direction: "maximize", details: null };
+  }
+  return { name: candidate?.name || "objective", value: null,
+           direction: candidate?.direction === "minimize" ? "minimize" : "maximize",
+           details: candidate?.details || null };
+}
+
 /**
- * Improvement selector — correctness-first, then F1 (mirrors GenDB behavior).
- * `prev`/`next` are { status: "ok"|"crash"|"empty", f1: number|null }.
+ * Improvement selector — correctness-first, then the query's typed objective.
+ * Legacy callers with only `f1` remain supported.
  */
 export function checkSemdbImprovement(prev, next) {
   const prevOk = prev && prev.status === "ok";
   const nextOk = next && next.status === "ok";
   if (prevOk && !nextOk) return false;     // regressed to a crash/empty
   if (!prevOk && nextOk) return true;      // fixed a crash/empty
-  if (prevOk && nextOk) return (next.f1 ?? -1) > (prev.f1 ?? -1);
+  if (prevOk && nextOk) {
+    const before = semdbObjective(prev);
+    const after = semdbObjective(next);
+    if (before.value == null) return after.value != null;
+    if (after.value == null || before.name !== after.name
+        || before.direction !== after.direction) return false;
+    const improved = before.direction === "minimize"
+      ? after.value < before.value
+      : after.value > before.value;
+    if (improved) return true;
+    // Query-level objectives such as top1 are coarse. On an exact tie, prefer the
+    // candidate with better operator fidelity; never let the surrogate override a
+    // genuine query-metric regression.
+    if (after.value === before.value
+        && prev.f1 != null && next.f1 != null
+        && Number.isFinite(Number(prev.f1)) && Number.isFinite(Number(next.f1))) {
+      return Number(next.f1) > Number(prev.f1);
+    }
+    return false;
+  }
   return false;                            // both broken → no improvement
 }
 
@@ -923,8 +963,17 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
 /** Render the per-iteration feedback block appended to a generating agent's prompt.
  *  Runtime failures short-circuit to a fix-first block; otherwise metrics + FP/FN. */
 export function renderFeedback(prev) {
+  const currentObjective = semdbObjective(prev);
+  const objectiveLabel = currentObjective.name === "f1" ? "F1" : currentObjective.name;
+  const objectiveText = currentObjective.value == null
+    ? `${objectiveLabel}=n/a`
+    : `${objectiveLabel}=${currentObjective.value} (${currentObjective.direction})`;
   const histLines = (prev.history || [])
-    .map((h) => `  iter ${h.iter}: F1=${h.f1 == null ? "n/a" : h.f1} ${h.status.toUpperCase()}${h.improved ? " (improved)" : ""}`)
+    .map((h) => {
+      const objective = semdbObjective(h);
+      return `  iter ${h.iter}: ${objective.name}=${objective.value == null ? "n/a" : objective.value}`
+        + ` ${h.status.toUpperCase()}${h.improved ? " (improved)" : ""}`;
+    })
     .join("\n");
   // What the program itself reported while running. Empty for a program that
   // printed nothing, in which case the section is dropped rather than shown blank.
@@ -965,6 +1014,11 @@ export function renderFeedback(prev) {
     // agent optimizes recall on the rare class rather than the majority label.
     const q = pm.quality || null;
     const num = (v) => (v == null ? "n/a" : v);
+    const fidelityAccuracy = pm.accuracy ?? (
+      Number.isFinite(Number(pm.correct)) && Number.isFinite(Number(pm.n)) && Number(pm.n) > 0
+        ? Number((Number(pm.correct) / Number(pm.n)).toFixed(4))
+        : null
+    );
     const qualityLine = q
       ? `## CLASS BREAKDOWN — precision=${num(q.precision)} recall=${num(q.recall)} F1=${num(q.f1)}`
         + `  (tp=${q.tp} fp=${q.fp} fn=${q.fn})`
@@ -980,7 +1034,9 @@ export function renderFeedback(prev) {
             : "")
       : "";
     return [
-      `\n## LAST RUN — PER-ROW INFERENCE accuracy=${prev.f1} (${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)${timing}`,
+      `\n## LAST RUN — VALIDATION OBJECTIVE ${objectiveText}${timing}`,
+      `## PER-ROW INFERENCE accuracy=${fidelityAccuracy ?? "n/a"} — FIDELITY `
+        + `(${pm.correct ?? "?"}/${pm.n ?? "?"} labeled rows correct)`,
       qualityLine,
       `## MISLABELED ROWS — ${prev.diff.n_mistakes ?? 0} total, showing ${(prev.diff.mistakes || []).length}:`,
       rows,
@@ -994,11 +1050,31 @@ export function renderFeedback(prev) {
   }
   const m = prev.metrics || {};
   const d = prev.diff || {};
+  if ([
+    "ari", "adjusted_rand_index", "top1", "macro_f1",
+    "relative_error", "mape", "spearman", "spearman_correlation",
+  ].includes(currentObjective.name)) {
+    const detail = currentObjective.details
+      ? `\n## OBJECTIVE DETAILS\n${JSON.stringify(currentObjective.details, null, 2)}`
+      : "";
+    return [
+      `\n## LAST RUN — QUERY METRIC ${objectiveText}${timing}`,
+      `## QUERY METRICS\n${JSON.stringify(m, null, 2)}`,
+      detail,
+      logBlock,
+      histLines ? `## HISTORY\n${histLines}` : "",
+      `Improve the query's ${currentObjective.name} objective. `
+        + (currentObjective.direction === "minimize"
+          ? "A smaller value is better."
+          : "A larger value is better."),
+      "Use the metric details and runtime log to revise the generated program.",
+    ].filter(Boolean).join("\n");
+  }
   const fmt = (rows) => (rows && rows.length)
     ? rows.map((r) => `  - ${typeof r === "object" ? JSON.stringify(r) : r}`).join("\n")
     : "  (none)";
   return [
-    `\n## LAST RUN — F1=${prev.f1} (P=${m.precision} R=${m.recall}, tp=${m.tp} fp=${m.fp} fn=${m.fn})${timing}`,
+    `\n## LAST RUN — ${objectiveText} (P=${m.precision} R=${m.recall}, tp=${m.tp} fp=${m.fp} fn=${m.fn})${timing}`,
     `## FALSE POSITIVES (predicted, but wrong) — ${d.fp_total ?? 0} total, showing ${(d.false_positives || []).length}:`,
     fmt(d.false_positives),
     `## FALSE NEGATIVES (missed) — ${d.fn_total ?? 0} total, showing ${(d.false_negatives || []).length}:`,
@@ -1248,13 +1324,14 @@ async function ensureCorpus(args, corpus, corpusQueries) {
 }
 
 /** Per-row validation scoring for one iteration: run evaluate.py --score-inference on
- *  the solver's trace_<q>.json vs val.json, read accuracy + mistakes back. The loop's
- *  generic `f1` field carries accuracy here. status "ok" requires a trace file. */
+ *  the solver's trace_<q>.json vs val.json, read a typed query objective plus fidelity
+ *  diagnostics. status "ok" requires a trace file. */
 async function scoreInference(args, query, iterDir, corpusCsv, valFile, diffPath) {
   const tracePath = resolve(iterDir, `trace_${query}.json`);
   if (!existsSync(tracePath)) return { status: "empty", f1: null, metrics: null, diff: null };
   const evArgs = [resolve(__dirname, "evaluate.py"), "--score-inference",
     "--trace", tracePath, "--val-file", valFile,
+    "--query", query, "--benchmark", args.benchmark,
     "--emit-diff", diffPath, "--diff-cap", String(defaults.refineSampleCap),
     ...(corpusCsv ? ["--corpus-csv", corpusCsv] : [])];
   const ev = spawnSync("python3", evArgs, { stdio: "inherit" });
@@ -1267,6 +1344,7 @@ async function scoreInference(args, query, iterDir, corpusCsv, valFile, diffPath
   const weighted = !!(out.design && out.design.weighted && out.estimates);
   return {
     status: "ok", f1: weighted ? (est.f1 ?? out.accuracy) : out.accuracy,
+    objective: out.objective || null,
     metrics: {
       accuracy: out.accuracy, n: out.n, correct: out.correct,
       quality: est, unweighted: out.unweighted || null,
@@ -1299,10 +1377,13 @@ async function scoreWithDiff(args, query, planObj, telePath, resultsCsv, diffPat
   const diff = await readJSON(diffPath);
   if (!diff) return { status: "ok", f1: null, metrics: null, diff: null };
   const metrics = {
-    f1: diff.f1 ?? null, precision: diff.precision ?? null, recall: diff.recall ?? null,
+    ...(diff.query_metrics || {}),
+    f1: diff.f1 ?? diff.query_metrics?.f1 ?? null,
+    precision: diff.precision ?? diff.query_metrics?.precision ?? null,
+    recall: diff.recall ?? diff.query_metrics?.recall ?? null,
     tp: diff.tp ?? null, fp: diff.fp ?? diff.fp_total ?? null, fn: diff.fn ?? diff.fn_total ?? null,
   };
-  return { status: "ok", f1: metrics.f1, metrics, diff };
+  return { status: "ok", f1: metrics.f1, objective: diff.objective || null, metrics, diff };
 }
 
 /**
@@ -1326,20 +1407,29 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
   const run0 = await genFirst(iter0Dir, iter0Code, iter0Csv);
   let best = { iter: 0, dir: iter0Dir, code: iter0Code, csv: iter0Csv,
                outcome: await scoreIter(iter0Dir, iter0Code, iter0Csv, run0) };
-  const history = [{ iter: 0, f1: best.outcome.f1, status: best.outcome.status, improved: true }];
+  const historyEntry = (iteration, outcome, improved) => {
+    const objective = semdbObjective(outcome);
+    return {
+      iter: iteration, f1: outcome.f1, objective,
+      objective_name: objective.name, objective_value: objective.value,
+      objective_direction: objective.direction,
+      status: outcome.status, improved,
+    };
+  };
+  const history = [historyEntry(0, best.outcome, true)];
 
-  // GLOBAL CONSTRAINT: refinement engages ONLY with a measurable F1 signal (ground truth
-  // present and the query scored). Without it, iter_0's f1 is null — behave as single-shot.
-  // Single-shot ONLY when there is genuinely no F1 signal: iter_0 RAN OK but could not be
-  // scored (no ground truth). A crash/empty WITH ground truth keeps iterating (fix-first),
+  // GLOBAL CONSTRAINT: refinement engages only with a measurable typed objective.
+  // Single-shot when iter_0 ran successfully but no validation/final metric is available.
+  // A crash/empty WITH an evaluator keeps iterating (fix-first),
   // matching shouldContinueSemdb, which returns "continue" when the last run is not "ok".
   // --dry-run never actually executes iter_0 (genFirst/runCompiled are no-ops), so its
   // status is "empty" rather than "ok" — treat that as no-signal too, otherwise the loop
   // would try to seed iter_1 from a compiled_<query>.py that dry-run never wrote.
-  const noSignal = args.dryRun || (best.outcome.status === "ok" && best.outcome.f1 == null);
+  const noSignal = args.dryRun
+    || (best.outcome.status === "ok" && semdbObjective(best.outcome).value == null);
   const effectiveMaxIter = noSignal ? 0 : maxIter;
   if (noSignal && maxIter > 0) {
-    console.log(`[SemDB] [${query}] no F1 signal (no ground truth) — single-shot, skipping refinement.`);
+    console.log(`[SemDB] [${query}] no measurable objective — single-shot, skipping refinement.`);
   }
 
   for (let iteration = 1; iteration <= effectiveMaxIter; iteration++) {
@@ -1355,16 +1445,20 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
     await writeFile(itCode, await readFile(best.code, "utf-8"));
 
     const feedback = renderFeedback({
-      status: best.outcome.status, f1: best.outcome.f1, metrics: best.outcome.metrics,
+      status: best.outcome.status, f1: best.outcome.f1, objective: best.outcome.objective,
+      metrics: best.outcome.metrics,
       diff: best.outcome.diff, stderrTail: best.outcome.stderrTail,
       stage: best.outcome.stage, history,
     });
     const run = await regen(itDir, itCode, itCsv, feedback);
     const outcome = await scoreIter(itDir, itCode, itCsv, run);
     const improved = checkSemdbImprovement(best.outcome, outcome);
-    history.push({ iter: iteration, f1: outcome.f1, status: outcome.status, improved });
+    history.push(historyEntry(iteration, outcome, improved));
     if (improved) {
-      console.log(`[SemDB] [${query}] iter ${iteration} improved (F1 ${best.outcome.f1} → ${outcome.f1}). Keeping.`);
+      const before = semdbObjective(best.outcome);
+      const after = semdbObjective(outcome);
+      console.log(`[SemDB] [${query}] iter ${iteration} improved `
+        + `(${before.name} ${before.value} → ${after.value}). Keeping.`);
       best = { iter: iteration, dir: itDir, code: itCode, csv: itCsv, outcome };
     } else {
       console.log(`[SemDB] [${query}] iter ${iteration} did not improve. Rolling back.`);
@@ -1373,7 +1467,8 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
   // Promote the best iteration's artifacts to the run root.
   if (existsSync(best.code)) await writeFile(resolve(runDir, codeBasename), await readFile(best.code, "utf-8"));
   if (existsSync(best.csv)) await writeFile(resultsCsv, await readFile(best.csv, "utf-8"));
-  return { bestIter: best.iter, bestF1: best.outcome.f1, stopReason: history, history };
+  return { bestIter: best.iter, bestF1: best.outcome.f1,
+           bestObjective: semdbObjective(best.outcome), stopReason: history, history };
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,7 +1539,7 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
              stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
   };
 
-  const { bestIter, bestF1, history } = await refineLoop({
+  const { bestIter, bestF1, bestObjective, history } = await refineLoop({
     args, query, runDir, codeBasename, resultsCsv,
     genFirst, regen, scoreIter,
   });
@@ -1505,6 +1600,9 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
     refine: { iterations: history.length - 1, best_iteration: bestIter,
               max_iterations: args.noRefine ? 0 : args.maxIterations,
+              objective: bestObjective.name,
+              objective_direction: bestObjective.direction,
+              objective_history: history.map((item) => item.objective),
               f1_history: history },
     phases,
   };
@@ -2043,7 +2141,7 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   if (args.dryRun) { await gen3Agents(runDir, solvePath, sql); return null; }
 
-  const { bestIter, bestF1, history } = await refineLoop({
+  const { bestIter, bestF1, bestObjective, history } = await refineLoop({
     args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter,
   });
 
@@ -2079,8 +2177,11 @@ async function runQueryDirect(args, planObj, csvPath) {
     validation: validationTelemetry,
     // "f1_fallback" means a val set WAS asked for and could not be built, so every
     // iteration was scored on the full ground truth — the tuning set was the test set.
-    refine: { mode: valMode ? "per_row_val" : (args.valRate ? "f1_fallback" : "f1"),
-              ...(valMode ? { objective: "inference_accuracy", val_file: valFile,
+    refine: { mode: valMode ? "per_row_val" : (args.valRate ? "metric_fallback" : "metric"),
+              objective: bestObjective.name,
+              objective_direction: bestObjective.direction,
+              objective_history: history.map((item) => item.objective),
+              ...(valMode ? { val_file: valFile,
                               val_n: Object.keys(val.labels).length,
                               val_shape: valPairwise ? "pairwise" : "per_row",
                               ...(valPairwise ? { pair_frame: valCorpusCsv } : {}) } : {}),

@@ -10,6 +10,26 @@ assert.equal(checkSemdbImprovement({ status: "ok", f1: 0.4 }, { status: "ok", f1
 assert.equal(checkSemdbImprovement({ status: "ok", f1: 0.6 }, { status: "ok", f1: 0.6 }), false);
 assert.equal(checkSemdbImprovement({ status: "ok", f1: 0.6 }, { status: "crash", f1: null }), false);
 assert.equal(checkSemdbImprovement({ status: "crash", f1: null }, { status: "ok", f1: 0.1 }), true);
+assert.equal(checkSemdbImprovement(
+  { status: "ok", objective: { name: "relative_error", value: 0.4, direction: "minimize" } },
+  { status: "ok", objective: { name: "relative_error", value: 0.2, direction: "minimize" } },
+), true, "a lower minimization objective improves");
+assert.equal(checkSemdbImprovement(
+  { status: "ok", objective: { name: "ari", value: 0.4, direction: "maximize" } },
+  { status: "ok", objective: { name: "ari", value: 0.2, direction: "maximize" } },
+), false, "a lower maximization objective regresses");
+assert.equal(checkSemdbImprovement(
+  { status: "ok", objective: { name: "ari", value: 0.4, direction: "maximize" } },
+  { status: "ok", objective: { name: "f1", value: 0.9, direction: "maximize" } },
+), false, "objectives with different semantics are never compared");
+assert.equal(checkSemdbImprovement(
+  { status: "ok", f1: 0.8, objective: { name: "top1", value: 1, direction: "maximize" } },
+  { status: "ok", f1: 1.0, objective: { name: "top1", value: 1, direction: "maximize" } },
+), true, "operator fidelity breaks an exact query-objective tie");
+assert.equal(checkSemdbImprovement(
+  { status: "ok", f1: null, objective: { name: "ari", value: null, direction: "maximize" } },
+  { status: "ok", f1: null, objective: { name: "ari", value: null, direction: "maximize" } },
+), false, "null is not a numeric objective");
 
 // stop logic
 assert.equal(shouldContinueSemdb([{ iter: 0, f1: 1.0, status: "ok", improved: true }], 1, 5, 2).action, "continue",

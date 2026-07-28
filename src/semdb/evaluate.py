@@ -289,7 +289,265 @@ def weighted_quality(labels, pred_rows, weights):
     }
 
 
-def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None):
+AGGREGATION_REFINEMENT = {
+    ("movie", 3): ("count", None),
+    ("movie", 4): ("ratio", None),
+    ("animals", 1): ("count", None),
+    ("animals", 2): ("count", None),
+    ("cars", 4): ("mean_age_2026", "year"),
+    ("medical", 4): ("mean", "age"),
+}
+EXACT_SINGLE_RESULT_RETRIEVAL = {
+    ("animals", 3): ("city",),
+    ("animals", 4): ("city",),
+    ("animals", 10): ("city", "stationid"),
+}
+ARI_REFINEMENT = {("ecomm", q) for q in (3, 4, 5, 6)}
+MACRO_F1_REFINEMENT = {("cars", 10), ("medical", 10)}
+RANKING_REFINEMENT = {("movie", 9), ("movie", 10)}
+MULTISITE_QUERY_OBJECTIVE_UNAVAILABLE = {
+    ("movie", 8), ("cars", 5), ("medical", 5),
+}
+
+
+def _query_number(query):
+    match = re.match(r"(\d+)", str(query).lower().lstrip("q"))
+    return int(match.group(1)) if match else None
+
+
+def _objective(name, value, direction="maximize", **details):
+    return {
+        "name": name,
+        "value": None if value is None else round(float(value), 6),
+        "direction": direction,
+        **({"details": details} if details else {}),
+    }
+
+
+def _corpus_index(corpus_rows, id_col=None):
+    if not corpus_rows:
+        return {}
+    keys = list(corpus_rows[0].keys())
+    idc = id_col or ("id" if "id" in keys else keys[0])
+    return {
+        str(row.get(idc, "")).strip(): row
+        for row in corpus_rows
+        if str(row.get(idc, "")).strip()
+    }
+
+
+def _column(row, wanted):
+    if not row:
+        return None
+    actual = next((key for key in row if key.lower() == wanted.lower()), None)
+    return row.get(actual) if actual else None
+
+
+def _sample_weight(weights, rid):
+    return float(weights.get(str(rid), weights.get(rid, 1.0)))
+
+
+def _top_group(labels, pred_rows, weights, corpus_rows, group_columns, id_col):
+    rows = _corpus_index(corpus_rows, id_col)
+
+    def counts(values):
+        totals = {}
+        for rid in labels:
+            value = values.get(str(rid), values.get(rid))
+            if not _is_positive(value):
+                continue
+            row = rows.get(str(rid))
+            if not row:
+                continue
+            key = tuple(str(_column(row, col)).strip().lower() for col in group_columns)
+            totals[key] = totals.get(key, 0.0) + _sample_weight(weights, rid)
+        return totals
+
+    expected_counts = counts(labels)
+    predicted_counts = counts(pred_rows)
+    choose = lambda values: (sorted(values, key=lambda k: (-values[k], k))[0]
+                             if values else None)
+    return choose(expected_counts), choose(predicted_counts), expected_counts, predicted_counts
+
+
+def _relative_error(predicted, expected):
+    if expected == 0:
+        return 0.0 if predicted == 0 else 1.0
+    return abs(predicted - expected) / abs(expected)
+
+
+def _aggregation_objective(kind, field, labels, pred_rows, weights, corpus_rows, id_col):
+    rows = _corpus_index(corpus_rows, id_col)
+
+    def result(expected, predicted, aggregate):
+        absolute_error = abs(predicted - expected)
+        relative_error = _relative_error(predicted, expected)
+        return _objective(
+            "relative_error", relative_error, "minimize",
+            expected=round(expected, 6),
+            predicted=round(predicted, 6),
+            absolute_error=round(absolute_error, 6),
+            mean_absolute_percentage_error=round(relative_error * 100.0, 6),
+            validation_aggregate=aggregate)
+
+    def positive_total(values):
+        return sum(
+            _sample_weight(weights, rid)
+            for rid in labels
+            if _is_positive(values.get(str(rid), values.get(rid)))
+        )
+
+    if kind in {"count", "ratio"}:
+        expected = positive_total(labels)
+        predicted = positive_total(pred_rows)
+        if kind == "ratio":
+            denominator = sum(_sample_weight(weights, rid) for rid in labels) or 1.0
+            expected, predicted = expected / denominator, predicted / denominator
+        return result(expected, predicted, kind)
+
+    if kind in {"mean", "mean_age_2026"}:
+        def mean(values):
+            numerator = denominator = 0.0
+            for rid in labels:
+                if not _is_positive(values.get(str(rid), values.get(rid))):
+                    continue
+                try:
+                    number = float(_column(rows.get(str(rid)), field))
+                except (TypeError, ValueError):
+                    continue
+                weight = _sample_weight(weights, rid)
+                numerator += weight * number
+                denominator += weight
+            return numerator / denominator if denominator else None
+
+        expected, predicted = mean(labels), mean(pred_rows)
+        if expected is None or predicted is None:
+            return _objective("relative_error", None, "minimize",
+                              validation_aggregate=f"mean({field})")
+        if kind == "mean_age_2026":
+            expected, predicted = 2026.0 - expected, 2026.0 - predicted
+        return result(expected, predicted, f"mean({field})")
+
+    def group_counts(values, by_label=False):
+        totals = {}
+        for rid, expected_label in labels.items():
+            value = values.get(str(rid), values.get(rid))
+            if by_label:
+                group = _norm(value)
+                if group is None:
+                    continue
+            else:
+                if not _is_positive(value):
+                    continue
+                group = _norm(_column(rows.get(str(rid)), field))
+            totals[group] = totals.get(group, 0.0) + _sample_weight(weights, rid)
+        return totals
+
+    expected_counts = group_counts(labels, kind == "label_counts")
+    predicted_counts = group_counts(pred_rows, kind == "label_counts")
+    groups = set(expected_counts) | set(predicted_counts)
+    errors = [
+        _relative_error(predicted_counts.get(group, 0.0), expected_counts.get(group, 0.0))
+        for group in groups
+    ]
+    return _objective(
+        "mape", (sum(errors) / len(errors) * 100.0) if errors else 0.0, "minimize",
+        expected=expected_counts, predicted=predicted_counts,
+        validation_aggregate=kind)
+
+
+def inference_objective(benchmark, query, labels, pred_rows, weights,
+                        corpus_rows, id_col, quality):
+    """Metric-aware SELECT objective, computed only from oracle-labeled rows.
+
+    This deliberately does not use SemBench's held-out full-query ground truth.
+    Non-decomposable query metrics are reconstructed on the weighted validation
+    population whenever the trace and corpus columns make that possible.
+    """
+    key = (str(benchmark or "").lower(), _query_number(query))
+    if key in MULTISITE_QUERY_OBJECTIVE_UNAVAILABLE:
+        return _objective(
+            "query_metric_unavailable", None, "maximize",
+            reason="final aggregate depends on multiple semantic call sites, "
+                   "but the current validation trace labels only one call site")
+    if key in ARI_REFINEMENT:
+        from sklearn.metrics import adjusted_rand_score
+        expected = [_norm(labels[rid]) for rid in labels]
+        predicted = [_norm(pred_rows.get(str(rid), pred_rows.get(rid, "__missing__")))
+                     for rid in labels]
+        value = adjusted_rand_score(expected, predicted)
+        return _objective(
+            "adjusted_rand_index", value, "maximize",
+            metric_type="adjusted-rand-index", accuracy=round(float(value), 6),
+            n=len(expected))
+    if key in MACRO_F1_REFINEMENT:
+        from sklearn.metrics import precision_recall_fscore_support
+        expected = [_norm(labels[rid]) for rid in labels]
+        predicted = [_norm(pred_rows.get(str(rid), pred_rows.get(rid, "__missing__")))
+                     for rid in labels]
+        sample_weights = [_sample_weight(weights, rid) for rid in labels]
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            expected, predicted, average="macro", zero_division=0,
+            sample_weight=sample_weights)
+        return _objective(
+            "macro_f1", f1, "maximize",
+            precision=round(float(precision), 6),
+            recall=round(float(recall), 6),
+            f1_score=round(float(f1), 6),
+            average="macro", n=len(expected))
+    if key in RANKING_REFINEMENT:
+        from scipy.stats import kendalltau, spearmanr
+        pairs = []
+        for rid, expected in labels.items():
+            try:
+                pairs.append((float(expected), float(
+                    pred_rows.get(str(rid), pred_rows.get(rid)))))
+            except (TypeError, ValueError):
+                continue
+        if len(pairs) >= 2:
+            expected_scores = [pair[0] for pair in pairs]
+            predicted_scores = [pair[1] for pair in pairs]
+            spearman = spearmanr(expected_scores, predicted_scores).correlation
+            kendall = kendalltau(expected_scores, predicted_scores).correlation
+        else:
+            spearman = kendall = None
+        spearman = 0.0 if spearman is None else spearman
+        kendall = 0.0 if kendall is None else kendall
+        return _objective(
+            "spearman_correlation", spearman, "maximize",
+            kendall_tau=round(float(kendall), 6), n_common=len(pairs))
+    if key in EXACT_SINGLE_RESULT_RETRIEVAL:
+        expected, predicted, expected_counts, predicted_counts = _top_group(
+            labels, pred_rows, weights, corpus_rows,
+            EXACT_SINGLE_RESULT_RETRIEVAL[key], id_col)
+        value = None if expected is None else float(predicted == expected)
+        return _objective(
+            "f1", value, "maximize",
+            metric_family="QueryMetricRetrieval",
+            variant=("exactly_one_top_city_station"
+                     if len(EXACT_SINGLE_RESULT_RETRIEVAL[key]) == 2
+                     else "exactly_one_top_city"),
+            precision=value, recall=value, f1_score=value,
+            expected=list(expected) if expected else None,
+            predicted=list(predicted) if predicted else None,
+            expected_counts={"|".join(k): v for k, v in expected_counts.items()},
+            predicted_counts={"|".join(k): v for k, v in predicted_counts.items()})
+    if key in AGGREGATION_REFINEMENT:
+        kind, field = AGGREGATION_REFINEMENT[key]
+        return _aggregation_objective(
+            kind, field, labels, pred_rows, weights, corpus_rows, id_col)
+
+    # Membership queries optimize the same F1 family as their final evaluator.
+    # For generic/unmapped queries the name explicitly says this is operator-level
+    # fidelity, preventing it from being mistaken for a query-level metric.
+    value = quality.get("f1")
+    if value is None:
+        value = quality.get("accuracy")
+    return _objective("predicate_fidelity_f1", value, "maximize")
+
+
+def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None,
+                    benchmark=""):
     """Per-row inference accuracy of a DIRECT solver's trace_<q>.json against a
     labeled val.json. Compares trace.rows[id] to val.labels[id] over the LABELED
     ids only (normalized). A labeled id absent from the trace counts as wrong with
@@ -335,6 +593,10 @@ def score_inference(trace, val, corpus_rows, cap, id_col=None, text_col=None):
         out["design"] = {"method": design.get("method"), "N": design.get("N"),
                          "weight_spread": round(spread, 2),
                          "weighted": spread > 1.0 + 1e-9}
+    quality = out.get("estimates") or out["unweighted"]
+    out["objective"] = inference_objective(
+        benchmark, val.get("query", trace.get("query", "")),
+        labels, pred_rows, weights, corpus_rows, id_col, quality)
     return out
 
 
@@ -372,7 +634,22 @@ def eval_mmqa(query, pred_path, gt_path):
     rows, fields = load_pred_rows(pred_path)
     gt = json.load(open(gt_path)).get("ground_truth")
     results, gold = MMQA_HANDLERS[hid](rows, fields, gt)
-    return score_pair(results, gold)
+    result = score_pair(results, gold)
+    result.update(
+        metric="retrieval_f1",
+        metric_family="QueryMetricRetrieval",
+        metric_variant={
+            1: "director_membership",
+            2: "tuple_membership",
+            3: "title_membership",
+            4: "genre_movie_membership",
+            5: "actor_membership",
+            6: "airline_membership",
+            7: "airline_image_tuple_membership",
+        }[hid],
+        f1_score=result["f1"],
+    )
+    return result
 
 
 def eval_mmqa_diff(query, pred_path, gt_path, cap):
@@ -443,6 +720,7 @@ def direct_telemetry(tele):
 
 
 F1_HISTORY_COLS = [f"val_f1_iter_{i}" for i in range(6)]
+OBJECTIVE_HISTORY_COLS = [f"val_objective_iter_{i}" for i in range(6)]
 CODE_EXECUTION_HISTORY_COLS = [f"code_execution_ms_iter_{i}" for i in range(6)]
 
 CSV_COLS = [
@@ -455,18 +733,24 @@ CSV_COLS = [
     "naive_llm_calls", "compiled_execution_calls", "call_reduction",
     "val_n", "refine_iterations", "best_iteration", "max_iterations",
     *F1_HISTORY_COLS, "val_f1_history",
+    "val_objective_name", "val_objective_direction",
+    *OBJECTIVE_HISTORY_COLS, "val_objective_history",
     "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
     # non-F1 metric families (blank unless that metric applies)
-    "metric", "relative_error", "mape", "spearman", "kendall", "ari", "covered",
+    "metric", "metric_family", "metric_type", "metric_variant",
+    "f1_score", "accuracy",
+    "relative_error", "absolute_error", "mape", "mean_absolute_percentage_error",
+    "spearman", "kendall", "spearman_correlation", "kendall_tau",
+    "ari", "adjusted_rand_index", "covered",
 ]
 
 
 def telemetry_row(tele, query="", benchmark=""):
     """Flatten one telemetry.json into the stable results.csv schema.
 
-    `f1` remains the final full-corpus score. `val_f1_iter_N` records the validation
-    signal used by the refinement loop, and `val_f1_history` preserves every value
-    even when a run uses more than the six conventional iter_0..iter_5 slots.
+    `f1` remains the final full-corpus score. `val_f1_iter_N` is retained as the
+    operator-fidelity diagnostic. The typed `val_objective_*` fields record the
+    metric that actually selected iterations, including its optimization direction.
     """
     tele = tele if isinstance(tele, dict) else {}
     llm = tele.get("llm_calls", {}) if isinstance(tele.get("llm_calls"), dict) else {}
@@ -474,6 +758,12 @@ def telemetry_row(tele, query="", benchmark=""):
     refine = tele.get("refine", {}) if isinstance(tele.get("refine"), dict) else {}
     history = refine.get("f1_history", [])
     history = history if isinstance(history, list) else []
+    objective_history = refine.get("objective_history", [])
+    if not isinstance(objective_history, list) or not objective_history:
+        objective_history = [
+            item.get("objective") if isinstance(item, dict) else None
+            for item in history
+        ]
     direct_block = tele.get("direct", {}) if isinstance(tele.get("direct"), dict) else {}
     execution_runs = direct_block.get("code_execution_runs")
     execution_runs = execution_runs if isinstance(execution_runs, list) else []
@@ -505,6 +795,9 @@ def telemetry_row(tele, query="", benchmark=""):
         refine_iterations=refine.get("iterations", ""),
         best_iteration=refine.get("best_iteration", ""),
         max_iterations=refine.get("max_iterations", ""),
+        val_objective_name=refine.get("objective", ""),
+        val_objective_direction=refine.get("objective_direction", ""),
+        val_objective_history=json.dumps(objective_history, separators=(",", ":")),
         val_f1_history=json.dumps(
             [h.get("f1") if isinstance(h, dict) else None for h in history],
             separators=(",", ":")),
@@ -534,15 +827,25 @@ def telemetry_row(tele, query="", benchmark=""):
         column = f"val_f1_iter_{iteration}"
         if column in row:
             row[column] = item.get("f1", "")
+    for iteration, objective in enumerate(objective_history):
+        column = f"val_objective_iter_{iteration}"
+        if column in row and isinstance(objective, dict):
+            row[column] = objective.get("value", "")
 
     metrics = tele.get("metrics")
     if isinstance(metrics, dict):
         for column in (
             "gt_count", "pred_count", "tp", "fp", "fn", "precision", "recall", "f1",
-            "metric", "relative_error", "mape", "spearman", "kendall", "ari", "covered",
+            "metric", "metric_family", "metric_type", "f1_score", "accuracy",
+            "relative_error", "absolute_error", "mape",
+            "mean_absolute_percentage_error",
+            "spearman", "kendall", "spearman_correlation", "kendall_tau",
+            "ari", "adjusted_rand_index", "covered",
         ):
             if metrics.get(column) is not None:
                 row[column] = metrics[column]
+        if metrics.get("variant") is not None:
+            row["metric_variant"] = metrics["variant"]
     return row
 
 
@@ -583,13 +886,54 @@ def eval_scenario(benchmark, query, pred_path, gt_dir, sf):
             f"[eval] scenario '{benchmark}' needs scenario_metrics (pandas/sklearn/scipy). "
             f"Run evaluate.py under the sembench conda env. ({e})")
     r = sm.score(benchmark, query, pred_path, gt_dir, int(sf) if sf else None)
-    keep = ("precision", "recall", "f1", "tp", "fp", "fn", "gt_count", "pred_count",
-            "relative_error", "mape", "spearman", "kendall", "ari", "covered")
+    keep = (
+        "metric_family", "metric_type", "variant",
+        "precision", "recall", "f1", "f1_score", "tp", "fp", "fn",
+        "gt_count", "pred_count", "accuracy",
+        "relative_error", "absolute_error", "mape",
+        "mean_absolute_percentage_error",
+        "spearman", "kendall", "spearman_correlation", "kendall_tau",
+        "ari", "adjusted_rand_index", "covered",
+    )
     row = {"metric": r.get("metric", "")}
     for k in keep:
         if r.get(k) is not None:
             row[k] = round(r[k], 4) if isinstance(r[k], float) else r[k]
     return row, r
+
+
+def metric_objective(metrics):
+    """Translate a final SemBench metric dict into a typed optimization objective."""
+    metric = str((metrics or {}).get("metric", "")).lower()
+    if metric == "aggregation":
+        return _objective(
+            "relative_error", metrics.get("relative_error"), "minimize",
+            absolute_error=metrics.get("absolute_error"),
+            mean_absolute_percentage_error=metrics.get(
+                "mean_absolute_percentage_error", metrics.get("mape")))
+    if metric == "ranking":
+        return _objective(
+            "spearman_correlation",
+            metrics.get("spearman_correlation", metrics.get("spearman")),
+            "maximize",
+            kendall_tau=metrics.get("kendall_tau", metrics.get("kendall")))
+    if metric in {"ari", "adjusted-rand-index"}:
+        return _objective(
+            "adjusted_rand_index",
+            metrics.get("adjusted_rand_index", metrics.get("ari")),
+            "maximize",
+            metric_type="adjusted-rand-index",
+            accuracy=metrics.get("accuracy"))
+    if metric == "top1":
+        # Compatibility with telemetry produced before animals Q3/Q4/Q10 were
+        # correctly identified as QueryMetricRetrieval.
+        return _objective("f1", metrics.get("f1", metrics.get("precision")), "maximize")
+    return _objective(
+        "macro_f1" if metrics.get("variant") == "macro_classification"
+        or metric == "macro_f1" else "f1",
+        metrics.get("f1_score", metrics.get("f1")), "maximize",
+        precision=metrics.get("precision"), recall=metrics.get("recall"),
+        f1_score=metrics.get("f1_score", metrics.get("f1")))
 
 
 def _scenario_diff(pred_path, gt_dir, bench, query, sf, cap):
@@ -661,10 +1005,14 @@ def main():
         corpus_rows = None
         if args.corpus_csv and os.path.exists(args.corpus_csv):
             corpus_rows, _ = load_pred_rows(args.corpus_csv)
-        out = score_inference(trace, val, corpus_rows, args.diff_cap, args.id_col, args.text_col)
+        out = score_inference(
+            trace, val, corpus_rows, args.diff_cap, args.id_col, args.text_col,
+            benchmark=args.benchmark)
         if args.emit_diff:
             json.dump(out, open(args.emit_diff, "w"), indent=2)
+        objective = out.get("objective") or {}
         print(f"[eval] inference accuracy {out['accuracy']} "
+              f"objective={objective.get('name')}:{objective.get('value')} "
               f"({out['correct']}/{out['n']}, {out['n_mistakes']} wrong) -> {args.emit_diff}")
         return
     if not args.csv:
@@ -693,6 +1041,8 @@ def main():
                     diff["query"] = args.query
                     diff.update(f1=metrics.get("f1"), precision=metrics.get("precision"),
                                 recall=metrics.get("recall"))
+                    diff["objective"] = metric_objective(metrics)
+                    diff["query_metrics"] = metrics
                     json.dump(diff, open(args.emit_diff, "w"), indent=2)
                     print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
                 except Exception as e:  # noqa: BLE001
@@ -721,6 +1071,8 @@ def main():
                 diff.update(f1=metrics["f1"], precision=metrics["precision"],
                             recall=metrics["recall"], tp=metrics["tp"],
                             fp=metrics["fp"], fn=metrics["fn"])
+                diff["objective"] = metric_objective(metrics)
+                diff["query_metrics"] = metrics
                 json.dump(diff, open(args.emit_diff, "w"), indent=2)
                 print(f"[eval] wrote FP/FN diff -> {args.emit_diff}")
             except Exception as e:  # noqa: BLE001

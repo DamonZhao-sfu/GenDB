@@ -109,3 +109,21 @@ def test_missing_code_execution_runs_are_not_inferred():
     assert row["code_execution_ms_iter_1"] == ""
     assert row["code_execution_ms_final"] == ""
     assert row["code_execution_runs"] == ""
+
+
+def test_typed_refinement_objective_is_written_separately_from_f1():
+    tele = telemetry("q3", [0.8, 0.7], 0.0)
+    tele["refine"].update({
+        "objective": "top1",
+        "objective_direction": "maximize",
+        "objective_history": [
+            {"name": "top1", "value": 0.0, "direction": "maximize"},
+            {"name": "top1", "value": 1.0, "direction": "maximize"},
+        ],
+    })
+    row = E.telemetry_row(tele, query="Q3", benchmark="animals")
+    assert row["val_objective_name"] == "top1"
+    assert row["val_objective_direction"] == "maximize"
+    assert row["val_objective_iter_0"] == 0.0
+    assert row["val_objective_iter_1"] == 1.0
+    assert row["val_f1_iter_0"] == 0.8

@@ -158,9 +158,13 @@ def _f1(precision: float, recall: float) -> float:
 def _retrieval_result(precision: float, recall: float, f1: float, **extra) -> Dict[str, Any]:
     out = {
         "metric": "retrieval_f1",
+        "metric_family": "QueryMetricRetrieval",
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
+        # SemBench's dataclass field is named f1_score.  Keep SemDB's historical
+        # `f1` alias as well so existing telemetry/results.csv readers do not break.
+        "f1_score": float(f1),
     }
     out.update(extra)
     return out
@@ -169,9 +173,12 @@ def _retrieval_result(precision: float, recall: float, f1: float, **extra) -> Di
 def _agg_result(rel: float, abs_: float, mape: float, **extra) -> Dict[str, Any]:
     out = {
         "metric": "aggregation",
+        "metric_family": "QueryMetricAggregation",
         "relative_error": float(rel),
         "absolute_error": float(abs_),
         "mape": float(mape),
+        # Exact SemBench dataclass field name; `mape` is the compatibility alias.
+        "mean_absolute_percentage_error": float(mape),
     }
     out.update(extra)
     return out
@@ -239,7 +246,6 @@ def _id_set_f1(ground_truth: pd.DataFrame, system_results: pd.DataFrame, id_colu
     recall = _compute_recall(ground_truth, system_results, id_column=id_column)
     f1 = _f1(precision, recall)
     out = _retrieval_result(precision, recall, f1, variant="id_set_f1")
-    out["metric"] = "id_set_f1"
     out.update(_id_set_extras(ground_truth, system_results, id_column))
     return out
 
@@ -309,7 +315,15 @@ def _generic_retrieval_evaluation(system_results: pd.DataFrame, ground_truth: pd
 
 def _generic_ranking_evaluation(system_results: pd.DataFrame, ground_truth: pd.DataFrame) -> Dict[str, Any]:
     def _empty():
-        return {"metric": "ranking", "spearman": 0.0, "kendall": 0.0, "n_common": 0}
+        return {
+            "metric": "ranking",
+            "metric_family": "QueryMetricRank",
+            "spearman": 0.0,
+            "kendall": 0.0,
+            "spearman_correlation": 0.0,
+            "kendall_tau": 0.0,
+            "n_common": 0,
+        }
 
     if len(system_results) == 0 or len(ground_truth) == 0:
         return _empty()
@@ -357,8 +371,11 @@ def _generic_ranking_evaluation(system_results: pd.DataFrame, ground_truth: pd.D
 
     return {
         "metric": "ranking",
+        "metric_family": "QueryMetricRank",
         "spearman": float(spearman_corr),
         "kendall": float(kendall_corr),
+        "spearman_correlation": float(spearman_corr),
+        "kendall_tau": float(kendall_corr),
         "n_common": len(common_ids),
     }
 
@@ -504,24 +521,26 @@ def _movie_sentiment_counts(system_results, ground_truth) -> Dict[str, Any]:
 def _animals_top_city(system_results, ground_truth) -> Dict[str, Any]:
     if len(ground_truth) == 0:
         p = 1.0 if len(system_results) == 0 else 0.0
-        return {"metric": "top1", "precision": p, "recall": 0.0, "f1": 0.0, "variant": "top1_city"}
+        return _retrieval_result(p, 0.0, 0.0, variant="exactly_one_top_city")
     if len(system_results) == 0:
-        return {"metric": "top1", "precision": 0.0, "recall": 0.0, "f1": 0.0, "variant": "top1_city"}
+        return _retrieval_result(0.0, 0.0, 0.0, variant="exactly_one_top_city")
 
     gt_cities = set(ground_truth.iloc[:, 0]) if len(ground_truth.columns) > 0 else set()
     if len(system_results) == 1:
         sys_city = system_results.iloc[0, 0] if len(system_results.columns) > 0 else None
         if sys_city in gt_cities:
-            return {"metric": "top1", "precision": 1.0, "recall": 1.0, "f1": 1.0, "variant": "top1_city"}
-    return {"metric": "top1", "precision": 0.0, "recall": 0.0, "f1": 0.0, "variant": "top1_city"}
+            return _retrieval_result(1.0, 1.0, 1.0, variant="exactly_one_top_city")
+    return _retrieval_result(0.0, 0.0, 0.0, variant="exactly_one_top_city")
 
 
 def _animals_top_city_station(system_results, ground_truth) -> Dict[str, Any]:
     if len(ground_truth) == 0:
         p = 1.0 if len(system_results) == 0 else 0.0
-        return {"metric": "top1", "precision": p, "recall": 0.0, "f1": 0.0, "variant": "top1_city_station"}
+        return _retrieval_result(
+            p, 0.0, 0.0, variant="exactly_one_top_city_station")
     if len(system_results) == 0:
-        return {"metric": "top1", "precision": 0.0, "recall": 0.0, "f1": 0.0, "variant": "top1_city_station"}
+        return _retrieval_result(
+            0.0, 0.0, 0.0, variant="exactly_one_top_city_station")
 
     sys_col_map = {col.lower(): col for col in system_results.columns}
     gt_tuples = set()
@@ -543,8 +562,10 @@ def _animals_top_city_station(system_results, ground_truth) -> Dict[str, Any]:
         if city_col and station_col:
             sys_tuple = (sys_row[city_col], sys_row[station_col])
             if sys_tuple in gt_tuples:
-                return {"metric": "top1", "precision": 1.0, "recall": 1.0, "f1": 1.0, "variant": "top1_city_station"}
-    return {"metric": "top1", "precision": 0.0, "recall": 0.0, "f1": 0.0, "variant": "top1_city_station"}
+                return _retrieval_result(
+                    1.0, 1.0, 1.0, variant="exactly_one_top_city_station")
+    return _retrieval_result(
+        0.0, 0.0, 0.0, variant="exactly_one_top_city_station")
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +626,6 @@ def _limit_balanced_id_set(
     recall = _compute_recall(ground_truth_sample, system_results, id_column=id_column)
     f1 = _f1(precision, recall)
     out = _retrieval_result(precision, recall, f1, variant="id_set_f1_limit_balanced", limit=limit)
-    out["metric"] = "id_set_f1"
     out.update(_id_set_extras(ground_truth_sample, system_results, id_column))
     return out
 
@@ -616,28 +636,28 @@ def _limit_balanced_id_set(
 
 
 def _macro_f1(system_results: pd.DataFrame, ground_truth: pd.DataFrame, id_column: str, result_column: str) -> Dict[str, Any]:
-    # SemBench sorts both frames by id and feeds them to sklearn, which REQUIRES
-    # equal length. We instead reindex the system's labels onto the GT ids: this is
-    # identical to SemBench when the id sets match (the validated case), but robust to
-    # a partial/oversized prediction — a GT id with no prediction counts as a wrong
-    # label instead of raising `inconsistent numbers of samples`. `covered` surfaces
-    # under-production / scale mismatch (few covered ⇒ the GT scale ≠ the data scale).
-    gt_s = (ground_truth.assign(**{id_column: ground_truth[id_column].astype(str)})
-            .drop_duplicates(id_column).set_index(id_column)[result_column])
-    q_s = (system_results.assign(**{id_column: system_results[id_column].astype(str)})
-           .drop_duplicates(id_column).set_index(id_column)[result_column])
-    y_true = gt_s.tolist()
-    y_pred = [q_s.get(i, "__missing__") for i in gt_s.index]
+    # Faithful SemBench Q10 behavior: sort each frame independently by id and feed
+    # the label vectors to sklearn.  In particular, unequal result lengths raise
+    # ValueError instead of being silently padded or intersected.
+    gt_sorted = ground_truth.sort_values(by=id_column)
+    query_sorted = system_results.sort_values(by=id_column)
+    y_true = gt_sorted[result_column]
+    y_pred = query_sorted[result_column]
     precision, recall, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro", zero_division=0)
-    covered = int(sum(1 for i in gt_s.index if i in q_s.index))
+        y_true, y_pred, average="macro")
+    gt_ids = set(ground_truth[id_column])
+    query_ids = set(system_results[id_column])
+    covered = len(gt_ids & query_ids)
     return {
-        "metric": "macro_f1",
+        "metric": "retrieval_f1",
+        "metric_family": "QueryMetricRetrieval",
+        "variant": "macro_classification",
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
-        "gt_count": int(len(gt_s)),
-        "pred_count": int(len(q_s)),
+        "f1_score": float(f1),
+        "gt_count": int(len(ground_truth)),
+        "pred_count": int(len(system_results)),
         "covered": covered,
     }
 
@@ -651,8 +671,10 @@ def _ecomm_f1(ground_truth: pd.DataFrame, system_results: pd.DataFrame) -> Dict[
     precision = _compute_precision(ground_truth, system_results, id_column="id")
     recall = _compute_recall(ground_truth, system_results, id_column="id")
     f1 = _f1(precision, recall)  # compute_f1_score
-    out = _retrieval_result(f1, recall, f1, variant="ecomm_f1")
-    out["metric"] = "id_set_f1"
+    out = _retrieval_result(precision, recall, f1, variant="ecomm_f1")
+    out["metric"] = "f1-score"
+    out["metric_family"] = "SingleAccuracyScoreWithRetrievalDetails"
+    out["metric_type"] = "f1-score"
     # compute_accuracy_score("f1-score") returns accuracy=f1_score, precision, recall, f1_score
     out["precision"] = float(precision)
     out["recall"] = float(recall)
@@ -664,17 +686,41 @@ def _ecomm_f1(ground_truth: pd.DataFrame, system_results: pd.DataFrame) -> Dict[
 
 def _ecomm_ari(ground_truth: pd.DataFrame, query_result: pd.DataFrame) -> Dict[str, Any]:
     if query_result is None:
-        return {"metric": "ari", "ari": 0.0, "accuracy": 0.0, "n_common": 0}
+        return {
+            "metric": "adjusted-rand-index",
+            "metric_family": "SingleAccuracyScore",
+            "metric_type": "adjusted-rand-index",
+            "ari": 0.0,
+            "adjusted_rand_index": 0.0,
+            "accuracy": 0.0,
+            "n_common": 0,
+        }
 
     gt_groups = ground_truth.set_index("id")["category"]
     qr_groups = query_result.set_index("id")["category"]
     common_ids = set(gt_groups.index) & set(qr_groups.index)
     if not common_ids:
-        return {"metric": "ari", "ari": 0.0, "accuracy": 0.0, "n_common": 0}
+        return {
+            "metric": "adjusted-rand-index",
+            "metric_family": "SingleAccuracyScore",
+            "metric_type": "adjusted-rand-index",
+            "ari": 0.0,
+            "adjusted_rand_index": 0.0,
+            "accuracy": 0.0,
+            "n_common": 0,
+        }
     gt_labels = [gt_groups[i] for i in common_ids]
     qr_labels = [qr_groups[i] for i in common_ids]
     ari = float(adjusted_rand_score(gt_labels, qr_labels))
-    return {"metric": "ari", "ari": ari, "accuracy": ari, "n_common": len(common_ids)}
+    return {
+        "metric": "adjusted-rand-index",
+        "metric_family": "SingleAccuracyScore",
+        "metric_type": "adjusted-rand-index",
+        "ari": ari,
+        "adjusted_rand_index": ari,
+        "accuracy": ari,
+        "n_common": len(common_ids),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -902,10 +948,10 @@ def score(
     Returns
     -------
     dict
-        Always contains ``"metric"`` (one of ``retrieval_f1``, ``id_set_f1``,
-        ``aggregation``, ``ranking``, ``ari``, ``macro_f1``, ``top1``) plus the
-        metric's numbers.  ``"scenario"``, ``"query_id"`` and ``"audio_only"``
-        are always present.
+        Always contains ``"metric"`` plus ``"metric_family"`` using SemBench's
+        evaluator dataclass name.  Exact SemBench field names are emitted together
+        with SemDB's historical short aliases (for example ``f1_score`` + ``f1``).
+        ``"scenario"``, ``"query_id"`` and ``"audio_only"`` are always present.
     """
     scenario = scenario.lower().strip()
     if scenario not in SCENARIOS:

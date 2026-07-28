@@ -44,6 +44,74 @@ def test_corpus_text_snippet_lookup():
     assert len(d["mistakes"][0]["text"]) <= 220   # truncated
 
 
+def test_animals_special_retrieval_f1_uses_weighted_group_counts():
+    val = {
+        "query": "Q3",
+        "labels": {"a": "true", "b": "true", "c": "false"},
+        "weights": {"a": 5, "b": 1, "c": 1},
+    }
+    rows = [
+        {"ImagePath": "a", "City": "Nairobi"},
+        {"ImagePath": "b", "City": "Kisumu"},
+        {"ImagePath": "c", "City": "Kisumu"},
+    ]
+    good = E.score_inference(
+        {"rows": {"a": "true", "b": "false", "c": "false"}},
+        val, rows, 15, benchmark="animals")
+    assert good["objective"]["name"] == "f1"
+    assert good["objective"]["value"] == 1.0
+    assert good["objective"]["details"]["metric_family"] == "QueryMetricRetrieval"
+    assert good["objective"]["details"]["variant"] == "exactly_one_top_city"
+    assert good["objective"]["details"]["f1_score"] == 1.0
+    assert good["objective"]["details"]["expected"] == ["nairobi"]
+
+    bad = E.score_inference(
+        {"rows": {"a": "false", "b": "true", "c": "true"}},
+        val, rows, 15, benchmark="animals")
+    assert bad["objective"]["value"] == 0.0
+    assert bad["objective"]["details"]["predicted"] == ["kisumu"]
+
+
+def test_ecomm_ari_objective_is_not_row_accuracy_or_f1():
+    val = {"query": "q3", "labels": {
+        "1": "nike", "2": "nike", "3": "adidas", "4": "adidas"}}
+    # Labels are renamed, so exact row accuracy is zero but clustering is identical.
+    trace = {"rows": {"1": "a", "2": "a", "3": "b", "4": "b"}}
+    result = E.score_inference(trace, val, None, 15, benchmark="ecomm")
+    assert result["accuracy"] == 0.0
+    assert result["objective"] == {
+        "name": "adjusted_rand_index", "value": 1.0, "direction": "maximize",
+        "details": {
+            "metric_type": "adjusted-rand-index",
+            "accuracy": 1.0,
+            "n": 4,
+        },
+    }
+
+
+def test_aggregation_objective_minimizes_relative_error():
+    val = {"query": "Q1", "labels": {
+        "a": "true", "b": "true", "c": "false"}}
+    result = E.score_inference(
+        {"rows": {"a": "true", "b": "false", "c": "false"}},
+        val, None, 15, benchmark="animals")
+    assert result["objective"]["name"] == "relative_error"
+    assert result["objective"]["direction"] == "minimize"
+    assert result["objective"]["value"] == 0.5
+    assert result["objective"]["details"]["absolute_error"] == 1.0
+    assert result["objective"]["details"]["mean_absolute_percentage_error"] == 50.0
+
+
+def test_multisite_aggregate_does_not_fall_back_to_wrong_f1_objective():
+    val = {"query": "Q5", "labels": {"a": "true", "b": "false"}}
+    result = E.score_inference(
+        {"rows": {"a": "true", "b": "false"}},
+        val, None, 15, benchmark="cars")
+    assert result["objective"]["name"] == "query_metric_unavailable"
+    assert result["objective"]["value"] is None
+    assert "multiple semantic call sites" in result["objective"]["details"]["reason"]
+
+
 def test_cli_score_inference_writes_json(tmp_path):
     import json, subprocess, sys as _sys
     trace = tmp_path / "trace.json"
