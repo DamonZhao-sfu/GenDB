@@ -25,7 +25,7 @@
  * rendered prompts. GPU-free demos live in ./poc/ and ./examples/.
  */
 
-import { readFile, writeFile, mkdir, readdir } from "fs/promises";
+import { readFile, writeFile, mkdir, readdir, copyFile } from "fs/promises";
 import { existsSync, readFileSync, writeFileSync, realpathSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
@@ -45,6 +45,19 @@ import { config as vadarSignatureConfig } from "./agents/vadar-signature/index.m
 import { config as vadarApiConfig } from "./agents/vadar-api/index.mjs";
 import { config as vadarProgramConfig } from "./agents/vadar-program/index.mjs";
 import { config as vadarSolverConfig } from "./agents/vadar-solver/index.mjs";
+import { config as queryPlannerConfig } from "./agents/query-planner/index.mjs";
+import { config as semanticCodeGeneratorConfig } from "./agents/semantic-code-generator/index.mjs";
+import { config as semanticOptimizerConfig } from "./agents/semantic-optimizer/index.mjs";
+import { loadBoundAgentSkill } from "./agent-runtime/skill-loader.mjs";
+import {
+  assertPlanGeneratable,
+  finalizeCandidateManifest,
+  readAndValidateOptimizerAction,
+  readAndValidatePlan,
+  writeJsonAtomic,
+} from "./agent-runtime/contracts.mjs";
+import { runPgoLoop } from "./agent-runtime/pgo-loop.mjs";
+import { assertSelectValidationPayload } from "./agent-runtime/feedback.mjs";
 
 /** SQL table-qualifier prefix for a benchmark (e.g. mmqa, cars_dataset). */
 function benchPrefix(bench) { return (BENCHMARKS[bench] && BENCHMARKS[bench].prefix) || bench; }
@@ -89,6 +102,10 @@ export function parseArgs(argv) {
     direct: false,         // DIRECT mode: skip Schema Designer + extract/compile split;
                            // VADAR 3 agents (Signature→API→Solver) write ONE end-to-end
                            // solve_<q>.py that calls the local vision API and answers the query.
+    agentArchitecture: defaults.directAgentArchitecture,
+    maxReplans: defaults.maxReplans,
+    enableAgentSkills: defaults.enableAgentSkills,
+    directOptionsSpecified: false,
     maxIterations: defaults.maxRefineIterations,
     noRefine: false,
     valFile: null,
@@ -135,6 +152,18 @@ export function parseArgs(argv) {
     else if (a === "--force") args.force = true;
     else if (a === "--image-only") args.imageOnly = true;
     else if (a === "--direct") args.direct = true;
+    else if (a === "--agent-architecture" && argv[i + 1]) {
+      args.agentArchitecture = argv[++i];
+      args.directOptionsSpecified = true;
+    }
+    else if (a === "--max-replans" && argv[i + 1]) {
+      args.maxReplans = Number(argv[++i]);
+      args.directOptionsSpecified = true;
+    }
+    else if (a === "--no-agent-skills") {
+      args.enableAgentSkills = false;
+      args.directOptionsSpecified = true;
+    }
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--max-iterations" && argv[i + 1]) args.maxIterations = parseInt(argv[++i], 10);
     else if (a === "--val-file" && argv[i + 1]) args.valFile = resolve(argv[++i]);
@@ -149,6 +178,14 @@ export function parseArgs(argv) {
     else if (a === "--val-plan-only") args.valPlanOnly = true;
     else if (a === "--val-pair-top" && argv[i + 1]) args.valPairTop = parseInt(argv[++i], 10);
     else if (a === "--no-refine") args.noRefine = true;
+  }
+  if (!["legacy", "pgo"].includes(args.agentArchitecture)) {
+    throw new Error(
+      `--agent-architecture must be "legacy" or "pgo" (got "${args.agentArchitecture}")`,
+    );
+  }
+  if (!Number.isInteger(args.maxReplans) || args.maxReplans < 0) {
+    throw new Error("--max-replans must be a non-negative integer");
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
   // `--data-dir .../files/cars/data/sf_9836` works WITHOUT --benchmark/--sf.
@@ -938,9 +975,18 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
   const systemPrompt = await readFile(systemPromptPath, "utf-8");
   const template = await readFile(userPromptPath, "utf-8");
   const userPrompt = renderTemplate(template, vars);
+  const skillRequested = args.enableAgentSkills === false
+    ? false
+    : (opts.useSkills ?? agentConfig.useSkills ?? args.enableAgentSkills ?? false);
+  const skillEnabled = Boolean(agentConfig.skillPath && skillRequested);
+  const boundSkill = skillEnabled && agentConfig.skillPath
+    ? await loadBoundAgentSkill(agentConfig, true)
+    : null;
+  const domainSkillsPrompt = boundSkill?.prompt;
 
   if (args.dryRun) {
     console.log(`\n[SemDB] --- ${agentConfig.name} (dry-run) ---`);
+    console.log(`[SemDB] bound skill: ${boundSkill?.name || "(disabled)"}`);
     console.log(userPrompt);
     return { dryRun: true };
   }
@@ -954,7 +1000,8 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
     configName: agentConfig.configKey,
     cwd: runDir,
     timeoutMs: defaults.agentTimeoutMs,
-    useSkills: false,
+    useSkills: skillEnabled,
+    domainSkillsPrompt,
   });
   if (result.error) throw new Error(`${agentConfig.name} failed: ${result.error}`);
   return result;
@@ -1656,7 +1703,7 @@ function pickImageCols(header) {
  * (join/filter included) — NO Schema Designer, NO extract/attrs/compile split. Execute it,
  * then score its result CSV exactly like the compiled path.
  */
-async function runQueryDirect(args, planObj, csvPath) {
+async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const { query, sql, nl, tables, corpus, structured } = planObj;
   const wallStart = Date.now();
   const runDir = resolve(args.out, `${args.benchmark}-${query}`);
@@ -1667,7 +1714,7 @@ async function runQueryDirect(args, planObj, csvPath) {
 
   const phases = [];
   const record = makeRecorder(args, phases);
-  console.log(`\n[SemDB] ---- ${query}  (DIRECT: 3-agent solver over ${corpus.table}) ----`);
+  console.log(`\n[SemDB] ---- ${query}  (DIRECT ${architecture}: solver over ${corpus.table}) ----`);
 
   // Describe every referenced table (header + path) for the solver.
   const tableLines = [];
@@ -1676,6 +1723,14 @@ async function runQueryDirect(args, planObj, csvPath) {
     tableLines.push(`- ${t.table} (${kind}): path=${t.path}\n    columns: ${await headerOf(t.path)}`);
   }
   const isImage = corpus.isImage || corpus.modality === "image";
+  const directSqlPath = args.queryDir
+    ? resolve(args.queryDir, `${query}.sql`)
+    : null;
+  const directSites = directSqlPath ? callSites(directSqlPath) : [];
+  const directPairSite = directSites.find((site) => site.shape === "pairwise");
+  const queryPairKind = directPairSite
+    ? (new Set(directPairSite.bases || []).size < 2 ? "self" : "cross")
+    : "";
   let imgFilenameCol = "", imgFilepathCol = "", imageDir = "";
   if (isImage) {
     const imgHeader = await headerOf(corpus.path);
@@ -1917,6 +1972,9 @@ async function runQueryDirect(args, planObj, csvPath) {
     : 0;
   const valMode = !!valFile && !args.noRefine;
   const val = valMode ? await readJSON(valFile) : null;
+  if (architecture === "pgo" && valMode) {
+    assertSelectValidationPayload(val, valFile);
+  }
   const validationTelemetry = valMode ? {
     mode: valPairwise ? "pairwise" : "per_row",
     pair_kind: valPairwise ? valPairKind : null,
@@ -1933,6 +1991,20 @@ async function runQueryDirect(args, planObj, csvPath) {
     console.log(`[SemDB] [${query}] ${valPairwise ? "pairwise" : "per-row"} `
       + `validation mode: ${Object.keys(val.labels).length} labeled rows from ${valFile}`);
   }
+  const tracePairKind = valPairKind || queryPairKind;
+  if (tracePairKind === "cross" && !valLeftIdCol && structured) {
+    valLeftIdCol = (await corpusCols(structured, args)).idCol;
+  }
+  if (tracePairKind === "self" && !valPairKind && directSqlPath) {
+    try {
+      valPairIncludeDiagonal = Boolean(
+        validationPlan(directSqlPath, args.benchmark, query).candidate?.include_diagonal,
+      );
+    } catch {
+      // The Planner still receives the ordered-pair contract; unresolved diagonal
+      // semantics must then be made explicit in plan.json.
+    }
+  }
 
   // Text corpora select BOTH the text system prompt AND the text user prompt (the shared
   // user prompts are image-specific and would otherwise make the text solver emit image
@@ -1945,9 +2017,16 @@ async function runQueryDirect(args, planObj, csvPath) {
     : { sig: vadarSignatureConfig.userPromptPathText, api: vadarApiConfig.userPromptPathText, solver: vadarSolverConfig.userPromptPathText };
 
   const codeExecutionRuns = [];
-  const runSolver = (iterDir, iterCode, iterCsv, onlyIds = null) => {
+  const runSolver = (
+    iterDir,
+    iterCode,
+    iterCsv,
+    onlyIds = null,
+    candidateHelpersPath = null,
+  ) => {
     if (!existsSync(iterCode)) return { status: "empty", stderr: "" };
-    const helpersPath = resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
+    const helpersPath = candidateHelpersPath
+      || resolve(runDir, "iter_0", `_vadar_helpers_${query}.py`);
     try {
       validateOfflineVadarFile(iterCode);
       if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
@@ -2061,9 +2140,16 @@ async function runQueryDirect(args, planObj, csvPath) {
        `- Apply \`--only-ids\` immediately after loading rows, before semantic`,
        `  inference, and write one true/false or extracted-value trace entry for`,
        `  every listed row key.`].join("\n");
-  const traceContract = valPairwise
-    ? (valPairKind === "self" ? selfPairTraceContract : crossPairTraceContract)
+  const traceContract = tracePairKind
+    ? (tracePairKind === "self" ? selfPairTraceContract : crossPairTraceContract)
     : rowTraceContract;
+  const agentTraceContract = valKeyExample
+    ? traceContract.split(valKeyExample).join(
+        tracePairKind === "self"
+          ? "<left_id>-<right_id>"
+          : "<physical_row_id>-<image_filename>",
+      )
+    : traceContract;
 
   // Solver template vars differ by modality: image gets manifest cols, text does not.
   const solverVars = (iterCode, querySql, helpersPath) => isImage
@@ -2139,11 +2225,304 @@ async function runQueryDirect(args, planObj, csvPath) {
              stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
   };
 
-  if (args.dryRun) { await gen3Agents(runDir, solvePath, sql); return null; }
-
-  const { bestIter, bestF1, bestObjective, history } = await refineLoop({
-    args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter,
+  const primitiveFiles = isImage
+    ? [resolve(__dirname, "vadar", "predefined.py")]
+    : [resolve(__dirname, "vadar", "predefined_text.py")];
+  const plannerVars = (planPath, previousPlanPath = "", optimizerActionPath = "") => ({
+    query_id: query,
+    query_sql: sql,
+    query_nl: nl || "(none)",
+    modality: isImage ? "image" : "text",
+    tables_doc: tableLines.join("\n"),
+    local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
+    trace_contract: agentTraceContract,
+    plan_path: planPath,
+    previous_plan_path: previousPlanPath,
+    optimizer_action_path: optimizerActionPath,
   });
+  const generatorVars = ({
+    planPath,
+    parentManifestPath = "",
+    actionPath = "",
+    helpersPath,
+    solverPath,
+    manifestPath,
+  }) => ({
+    query_id: query,
+    plan_path: planPath,
+    parent_candidate_manifest_path: parentManifestPath,
+    optimizer_action_path: actionPath,
+    helpers_path: helpersPath,
+    solve_path: solverPath,
+    manifest_draft_path: manifestPath,
+    tables_doc: tableLines.join("\n"),
+    semdb_dir: __dirname,
+    runtime_args: isImage ? " --image-dir <dir> --clip-model <model>" : "",
+  });
+
+  const createInitialPlan = async ({ iterDir, planPath }) => {
+    record("query_planner", await runPhase(
+      queryPlannerConfig,
+      plannerVars(planPath),
+      iterDir,
+      args,
+    ));
+    const plan = await readAndValidatePlan(planPath, { queryId: query });
+    if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
+      throw new Error(
+        `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
+      );
+    }
+    return { plan, planPath };
+  };
+  const replan = async ({
+    iterDir,
+    planPath,
+    previousPlan,
+    previousPlanPath,
+    actionPath,
+  }) => {
+    record("query_planner", await runPhase(
+      queryPlannerConfig,
+      plannerVars(planPath, previousPlanPath, actionPath),
+      iterDir,
+      args,
+    ));
+    const plan = await readAndValidatePlan(planPath, {
+      queryId: query,
+      previousPlan,
+    });
+    return { plan, planPath };
+  };
+  const generateCandidate = async ({
+    iteration,
+    iterDir,
+    plan,
+    planPath,
+    action,
+    actionPath = "",
+    parentCandidate,
+  }) => {
+    assertPlanGeneratable(plan);
+    const helperPath = resolve(iterDir, `_semantic_helpers_${query}.py`);
+    const solverPath = resolve(iterDir, codeBasename);
+    const manifestPath = resolve(iterDir, "candidate_manifest.json");
+    if (action?.action === "PATCH_CODE" && parentCandidate) {
+      await copyFile(parentCandidate.helperPath, helperPath);
+      await copyFile(parentCandidate.solverPath, solverPath);
+    }
+    record("semantic_code_generator", await runPhase(
+      semanticCodeGeneratorConfig,
+      generatorVars({
+        planPath,
+        parentManifestPath: parentCandidate?.manifestPath || "",
+        actionPath,
+        helpersPath: helperPath,
+        solverPath,
+        manifestPath,
+      }),
+      iterDir,
+      args,
+    ));
+    if (!existsSync(helperPath) || !existsSync(solverPath) || !existsSync(manifestPath)) {
+      throw new Error(
+        `[SemDB] [${query}] Generator did not create a complete candidate in ${iterDir}`,
+      );
+    }
+    validateOfflineVadarFile(helperPath);
+    validateOfflineVadarFile(solverPath);
+    const manifestDraft = await readJSON(manifestPath);
+    if (!manifestDraft || typeof manifestDraft !== "object") {
+      throw new Error(`[SemDB] [${query}] Generator wrote an invalid manifest draft`);
+    }
+    const candidateId = `${query}-iter-${iteration}`;
+    const manifest = await finalizeCandidateManifest(manifestPath, {
+      ...manifestDraft,
+      candidate_id: candidateId,
+      query_id: query,
+      iteration,
+      plan_version: plan.plan_version,
+      parent_candidate_id: parentCandidate?.candidate_id || null,
+      trigger_action: action?.action || "INITIAL",
+      artifacts: {
+        plan: basename(planPath),
+        helpers: basename(helperPath),
+        solver: basename(solverPath),
+      },
+    }, {
+      queryId: query,
+      candidateId,
+      iteration,
+      planVersion: plan.plan_version,
+      parentCandidateId: parentCandidate?.candidate_id || null,
+      triggerAction: action?.action || "INITIAL",
+    });
+    return {
+      candidate_id: candidateId,
+      iteration,
+      iterDir,
+      plan,
+      planPath,
+      helperPath,
+      solverPath,
+      manifest,
+      manifestPath,
+      csvPath: resolve(iterDir, basename(resultsCsv)),
+    };
+  };
+  const optimize = async ({
+    iteration,
+    planPath,
+    candidate,
+    feedbackPath,
+    history: optimizerHistory,
+    remainingIterationBudget,
+    remainingReplanBudget,
+  }) => {
+    const iterDir = resolve(runDir, `iter_${iteration}`);
+    const actionPath = resolve(iterDir, "optimizer_action.json");
+    const historyManifestPaths = optimizerHistory
+      .map((entry) => entry.manifest_path)
+      .filter(Boolean)
+      .map((path) => `- ${path}`)
+      .join("\n") || "(none)";
+    record("semantic_optimizer", await runPhase(
+      semanticOptimizerConfig,
+      {
+        query_id: query,
+        plan_path: candidate.planPath || planPath,
+        candidate_manifest_path: candidate.manifestPath,
+        iteration_feedback_path: feedbackPath,
+        history_manifest_paths: historyManifestPaths,
+        optimizer_action_path: actionPath,
+        remaining_iteration_budget: remainingIterationBudget,
+        remaining_replan_budget: remainingReplanBudget,
+      },
+      iterDir,
+      args,
+    ));
+    const actionObject = await readAndValidateOptimizerAction(actionPath, {
+      queryId: query,
+      candidateId: candidate.candidate_id,
+    });
+    return { actionObject, actionPath };
+  };
+  const executePgoCandidate = async (candidate) => runSolver(
+    candidate.iterDir,
+    candidate.solverPath,
+    candidate.csvPath,
+    valMode ? valIdsPath : null,
+    candidate.helperPath,
+  );
+  const scorePgoCandidate = async (candidate, run) => {
+    if (valMode) {
+      return scoreIter(
+        candidate.iterDir,
+        candidate.solverPath,
+        candidate.csvPath,
+        run,
+      );
+    }
+    const status = run.status === "crash"
+      ? "crash"
+      : (existsSync(candidate.csvPath) ? "ok" : "empty");
+    return {
+      status,
+      stage: run.stage ?? null,
+      execMs: run.execMs ?? null,
+      f1: null,
+      objective: { name: "f1", value: null, direction: "maximize" },
+      metrics: null,
+      diff: null,
+      runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
+      stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n"),
+    };
+  };
+  const promotePgoCandidate = async (candidate) => {
+    const promotions = [
+      [candidate.planPath, resolve(runDir, "plan.json")],
+      [candidate.helperPath, resolve(runDir, basename(candidate.helperPath))],
+      [candidate.solverPath, solvePath],
+      [candidate.manifestPath, resolve(runDir, "candidate_manifest.json")],
+    ];
+    if (existsSync(candidate.csvPath)) promotions.push([candidate.csvPath, resultsCsv]);
+    for (const [source, target] of promotions) await copyFile(source, target);
+  };
+
+  let loopResult;
+  if (architecture === "pgo") {
+    if (args.dryRun) {
+      const iter0Dir = resolve(runDir, "iter_0");
+      const iter1Dir = resolve(runDir, "iter_1");
+      await mkdir(iter0Dir, { recursive: true });
+      await mkdir(iter1Dir, { recursive: true });
+      const dryPlanPath = resolve(iter0Dir, "plan.json");
+      const dryHelperPath = resolve(iter0Dir, `_semantic_helpers_${query}.py`);
+      const drySolverPath = resolve(iter0Dir, codeBasename);
+      const dryManifestPath = resolve(iter0Dir, "candidate_manifest.json");
+      record("query_planner", await runPhase(
+        queryPlannerConfig,
+        plannerVars(dryPlanPath),
+        iter0Dir,
+        args,
+      ));
+      record("semantic_code_generator", await runPhase(
+        semanticCodeGeneratorConfig,
+        generatorVars({
+          planPath: dryPlanPath,
+          helpersPath: dryHelperPath,
+          solverPath: drySolverPath,
+          manifestPath: dryManifestPath,
+        }),
+        iter0Dir,
+        args,
+      ));
+      record("semantic_optimizer", await runPhase(
+        semanticOptimizerConfig,
+        {
+          query_id: query,
+          plan_path: dryPlanPath,
+          candidate_manifest_path: dryManifestPath,
+          iteration_feedback_path: resolve(iter0Dir, "iteration_feedback.json"),
+          history_manifest_paths: `- ${dryManifestPath}`,
+          optimizer_action_path: resolve(iter1Dir, "optimizer_action.json"),
+          remaining_iteration_budget: args.maxIterations,
+          remaining_replan_budget: args.maxReplans,
+        },
+        iter1Dir,
+        args,
+      ));
+      return null;
+    }
+    loopResult = await runPgoLoop({
+      args: { ...args, refineSampleCap: defaults.refineSampleCap },
+      query: { query_id: query },
+      runDir,
+      createInitialPlan,
+      replan,
+      generateCandidate,
+      optimize,
+      executeCandidate: executePgoCandidate,
+      scoreCandidate: scorePgoCandidate,
+      promoteCandidate: promotePgoCandidate,
+      isImprovement: checkSemdbImprovement,
+      hasValidationSignal: valMode && doRun,
+    });
+  } else {
+    if (args.dryRun) { await gen3Agents(runDir, solvePath, sql); return null; }
+    loopResult = await refineLoop({
+      args, query, runDir, codeBasename, resultsCsv, genFirst, regen, scoreIter,
+    });
+  }
+  const {
+    bestIter,
+    bestObjective,
+    history,
+    replansUsed = 0,
+    actionCounts = { PATCH_CODE: 0, REPLAN: 0, STOP: 0 },
+    planVersions = architecture === "pgo" ? 1 : 0,
+    bestCandidate = null,
+  } = loopResult;
 
   // Val mode: the loop scored the frozen solver on the LABELED sub-corpus only. Now run
   // the promoted best solver over the FULL corpus (NO --only-ids) to produce the real
@@ -2151,7 +2530,10 @@ async function runQueryDirect(args, planObj, csvPath) {
   if (valMode && doRun) {
     const bestCode = resolve(runDir, codeBasename);
     console.log(`[SemDB] [${query}] val mode: final full-corpus run of the frozen solver.`);
-    runSolver(runDir, bestCode, resultsCsv, null);
+    const promotedHelpers = architecture === "pgo"
+      ? resolve(runDir, `_semantic_helpers_${query}.py`)
+      : null;
+    runSolver(runDir, bestCode, resultsCsv, null, promotedHelpers);
   }
 
   // DIRECT timing is measured at its actual boundaries. In particular, do not infer
@@ -2167,6 +2549,11 @@ async function runQueryDirect(args, planObj, csvPath) {
   const report = {
     query, corpus: corpus.table, provider: args.agentProvider, operator: "direct",
     mode: "direct", wall_clock_ms: wallMs,
+    agent_architecture: architecture,
+    plan_versions: planVersions,
+    replans: replansUsed,
+    optimizer_actions: actionCounts,
+    best_candidate_id: bestCandidate?.candidate_id ?? null,
     direct: { agent_stage_ms: agentMs, agent_calls: agentCalls,
               agent_cost_usd: Number(agentCost.toFixed(4)),
               timing_breakdown_ms: timingBreakdown,
@@ -2175,9 +2562,17 @@ async function runQueryDirect(args, planObj, csvPath) {
     total_estimated_cost_usd: Number(agentCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
     validation: validationTelemetry,
+    optimizer_data_boundary: architecture === "pgo" ? {
+      source: valMode && doRun ? "select_validation" : "none",
+      cert_accessed: false,
+      full_ground_truth_accessed: false,
+    } : null,
     // "f1_fallback" means a val set WAS asked for and could not be built, so every
     // iteration was scored on the full ground truth — the tuning set was the test set.
-    refine: { mode: valMode ? "per_row_val" : (args.valRate ? "metric_fallback" : "metric"),
+    refine: { mode: valMode
+                ? "per_row_val"
+                : (architecture === "pgo" ? "single_shot_no_select"
+                  : (args.valRate ? "metric_fallback" : "metric")),
               objective: bestObjective.name,
               objective_direction: bestObjective.direction,
               objective_history: history.map((item) => item.objective),
@@ -2225,9 +2620,29 @@ async function runQueryDirect(args, planObj, csvPath) {
   return report;
 }
 
+export async function runQueryDirectLegacy(args, planObj, csvPath) {
+  return runQueryDirectCore(args, planObj, csvPath, "legacy");
+}
+
+export async function runQueryDirectPgo(args, planObj, csvPath) {
+  return runQueryDirectCore(args, planObj, csvPath, "pgo");
+}
+
+async function runQueryDirect(args, planObj, csvPath) {
+  return args.agentArchitecture === "legacy"
+    ? runQueryDirectLegacy(args, planObj, csvPath)
+    : runQueryDirectPgo(args, planObj, csvPath);
+}
+
 async function main() {
   const base = parseArgs(process.argv);
   await validateDataDirectory(base);
+  if (!base.direct && base.directOptionsSpecified) {
+    console.warn(
+      "[SemDB] --agent-architecture/--max-replans/--no-agent-skills "
+      + "only affect --direct and are ignored.",
+    );
+  }
   if (base.valRate && !base.valPlanOnly && base.endpoint && base.oracleModel) {
     await validateEndpointModel(base.endpoint, base.oracleModel, base.apiKey);
   }
@@ -2320,7 +2735,10 @@ async function main() {
   // end-to-end solver per query. Otherwise: Schema Designer + Extractor once per corpus.
   const summary = [];
   if (base.direct) {
-    console.log(`[SemDB] DIRECT mode: 3-agent solver per query (no schema design, no extract/compile split).`);
+    console.log(
+      `[SemDB] DIRECT mode (${base.agentArchitecture}): agent solver per query `
+      + "(no schema design, no extract/compile split).",
+    );
     for (const p of runPlans) {
       console.log(`\n[SemDB] ==================== ${p.query} ====================`);
       try {

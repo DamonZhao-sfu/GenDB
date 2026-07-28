@@ -24,6 +24,7 @@
     "@anthropic-ai/claude-code": "^2.1.81",
     "@anthropic-ai/sdk": "^0.80.0",
     "@openai/codex-sdk": "^0.114.0",
+    "ajv": "^8.17.1",
     "openai": "^6.33.0"
   }
 }

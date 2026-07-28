@@ -37,6 +37,9 @@ export const defaults = {
   maxRefineIterations: 5,     // per-query optimize→run→score iterations (0 = single-shot)
   refineStallThreshold: 2,    // stop after this many consecutive non-improving iterations
   refineSampleCap: 15,        // max FP and FN rows shown to the agent per iteration
+  directAgentArchitecture: "pgo", // pgo | legacy; only affects --direct
+  enableAgentSkills: true,    // inject one fixed repository-local skill per PGO role
+  maxReplans: 1,              // evidence-backed Planner revisions per query
 
   // --- Provider-specific settings for the three compiler agents ---
   providers: {
@@ -46,12 +49,18 @@ export const defaults = {
         schema_designer: "opus",   // decomposition is the hard judgement call
         extractor: "sonnet",       // mostly driver plumbing
         code_generator: "opus",    // must be result-equivalent to the oracle
+        query_planner: "opus",
+        semantic_code_generator: "opus",
+        semantic_optimizer: "opus",
       },
       // Claude effort: "low" | "medium" | "high" | "max"
       agentEffortLevels: {
         schema_designer: "high",
         extractor: "low",
         code_generator: "medium",
+        query_planner: "high",
+        semantic_code_generator: "medium",
+        semantic_optimizer: "high",
       },
       escalationModel: "opus",
     },
@@ -65,12 +74,18 @@ export const defaults = {
         schema_designer: "gpt-5.6-luna",
         extractor: "gpt-5.6-luna",
         code_generator: "gpt-5.6-luna",
+        query_planner: "gpt-5.6-luna",
+        semantic_code_generator: "gpt-5.6-luna",
+        semantic_optimizer: "gpt-5.6-luna",
       },
       // Codex effort: "minimal" | "low" | "medium" | "high" | "xhigh"
       agentEffortLevels: {
         schema_designer: "medium",
         extractor: "low",
         code_generator: "medium",
+        query_planner: "high",
+        semantic_code_generator: "medium",
+        semantic_optimizer: "high",
       },
       escalationModel: "gpt-5.6-luna",
     },

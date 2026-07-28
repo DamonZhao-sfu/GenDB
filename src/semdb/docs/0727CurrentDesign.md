@@ -1,3 +1,45 @@
+# SemDB current design
+
+The default DIRECT architecture is now Planner–Generator–Optimizer (PGO):
+
+```text
+SQL + table metadata + local primitives
+          │
+          ▼
+  Query Planner → typed plan.json
+          │
+          ▼
+  Code Generator → complete helper + solver + candidate manifest
+          │
+          ▼
+  deterministic preflight → run → SELECT validation score
+          │
+          ▼
+  iteration_feedback.json → Optimizer
+          │
+          ├── PATCH_CODE → Generator
+          ├── REPLAN     → Planner → Generator
+          └── STOP       → promote historical best
+```
+
+Enable it with `--direct --agent-architecture pgo` (the branch default). Each
+role receives one fixed repository-local procedural skill. Planner and Optimizer
+write JSON only; Generator writes a complete helper and solver for every
+candidate. Runtime schemas validate all four JSON artifacts, and the
+orchestrator computes candidate hashes before execution.
+
+PGO optimization requires measurable SELECT-validation feedback. Without
+`--val-file` or a successfully built `--val-rate` sample, it performs one
+Planner → Generator run and freezes that candidate. CERT and final ground truth
+never enter `iteration_feedback.json`; final ground-truth evaluation occurs only
+after promotion. Each promoted candidate includes `plan.json`, helper, solver,
+and `candidate_manifest.json`.
+
+The non-DIRECT Schema Designer → Extractor → Code Generator pipeline is
+unchanged. The previous DIRECT flow remains available with
+`--agent-architecture legacy`:
+
+```text
 SQL + table metadata
           │
           ▼

@@ -1,3 +1,20 @@
+# Compilability 与 PGO 实现边界
+
+当前 DIRECT PGO 架构已把“能否生成”与“是否值得认证”分开：
+
+- Planner 在 `plan.json` 中输出 `exact`、`bounded_approximation` 或
+  `not_compilable`，并明确 obligations 与 unresolved requirements。
+- `not_compilable` 会在 Generator 前 fail closed，不会被静默改写成启发式程序。
+- 每轮候选都绑定 plan/helper/solver 的 SHA-256；回滚和最终 promotion
+  以完整 candidate 为单位。
+- Optimizer 只读取 preflight、运行结果和 SELECT validation 的结构化反馈；
+  `data_boundary` 明确记录 CERT 与 full ground truth 均未访问。
+- 无 SELECT signal 时只生成一次，不使用最终 ground truth 做自适应搜索。
+
+本次没有实现 statistical certification、CERT 读取策略、confidence
+interval 或跨查询 Memory。下面的研究计划仍描述后续认证层；它不属于
+当前 PGO optimizer 的权限或反馈路径。
+
 结论：BARGAIN 的统计认证机制可以迁移，但不能直接套用。它适合作为“生成代码是否值得信任”的认证内核；要用于本项目，还需要解决代码自适应生成、缺少逐样本置信分数、LLM oracle 噪声和多算子
   组合四个问题。
 

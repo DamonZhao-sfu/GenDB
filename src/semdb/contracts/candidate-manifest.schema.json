@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gendb.local/semdb/candidate-manifest.schema.json",
+  "title": "SemDB candidate manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "query_id",
+    "iteration",
+    "plan_version",
+    "parent_candidate_id",
+    "trigger_action",
+    "artifacts",
+    "hashes"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "query_id": { "type": "string", "minLength": 1 },
+    "iteration": { "type": "integer", "minimum": 0 },
+    "plan_version": { "type": "integer", "minimum": 1 },
+    "parent_candidate_id": {
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "trigger_action": { "enum": ["INITIAL", "PATCH_CODE", "REPLAN"] },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan", "helpers", "solver"],
+      "properties": {
+        "plan": { "type": "string", "minLength": 1 },
+        "helpers": { "type": "string", "minLength": 1 },
+        "solver": { "type": "string", "minLength": 1 }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_sha256", "helpers_sha256", "solver_sha256"],
+      "properties": {
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "helpers_sha256": { "$ref": "#/$defs/sha256" },
+        "solver_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

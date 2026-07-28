@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gendb.local/semdb/iteration-feedback.schema.json",
+  "title": "SemDB iteration feedback",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "query_id",
+    "candidate_id",
+    "iteration",
+    "execution",
+    "objective",
+    "errors",
+    "runtime_branches",
+    "history",
+    "data_boundary"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "query_id": { "type": "string", "minLength": 1 },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "iteration": { "type": "integer", "minimum": 0 },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "stage", "preflight", "stderr_tail", "runtime_ms"],
+      "properties": {
+        "status": { "enum": ["ok", "crash", "empty"] },
+        "stage": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }]
+        },
+        "preflight": {
+          "anyOf": [{ "type": "object" }, { "type": "null" }]
+        },
+        "stderr_tail": { "type": "string" },
+        "runtime_ms": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        }
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "value", "precision", "recall", "weighted"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "precision": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "recall": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "weighted": { "type": "boolean" },
+        "direction": { "enum": ["maximize", "minimize"] }
+      }
+    },
+    "errors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["false_positive_total", "false_negative_total", "mistakes"],
+      "properties": {
+        "false_positive_total": { "type": "integer", "minimum": 0 },
+        "false_negative_total": { "type": "integer", "minimum": 0 },
+        "mistakes": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      }
+    },
+    "runtime_branches": { "type": "object" },
+    "history": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "data_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "cert_accessed", "full_ground_truth_accessed"],
+      "properties": {
+        "source": {
+          "enum": ["select_validation", "none"]
+        },
+        "cert_accessed": { "const": false },
+        "full_ground_truth_accessed": { "const": false }
+      }
+    }
+  }
+}
