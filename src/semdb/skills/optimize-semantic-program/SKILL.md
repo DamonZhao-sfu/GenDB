@@ -52,6 +52,27 @@ Choose `PATCH_CODE` when the plan is sound and the defect is in implementation, 
 
 Choose `REPLAN` only when evidence shows a plan-level defect such as a wrong sampling unit, missing semantic input, invalid primitive choice, wrong value space, impossible helper type, or incorrect relational placement. Require remaining replan budget.
 
+Full recall with near-zero precision on an image predicate is an **invalid primitive
+choice**, not an imprecise prompt. When the site is bound to a single `verify_property`
+over a named entity, choose `REPLAN` while budget remains; the fix is a discriminative
+step (OCR or closed-set classify over the runtime value space), a cheap gate, a
+`*_detail` threshold, or an assignment/dedup rule.
+
+Never ask the Generator to lengthen a CLIP phrase, add exclusions, or add "reject X"
+wording: CLIP reads ~77 tokens, compares phrases rather than sentences, and does not
+process negation, so a longer prompt lowers precision. Treat a repeated "make the prompt
+stricter" request as already shown to regress once precision has failed to rise.
+
+`execution.selected_rows == 0` is the emergency case, and it outranks every other
+diagnosis. An empty result scores F1 0 and freezes the branch counters, so every later
+iteration sees identical evidence and the loop learns nothing. Remove or loosen the most
+arbitrary rejection rule immediately — an absolute CLIP cutoff such as `>= 0.5` is
+almost always the cause, because CLIP scores are not calibrated across images or prompts.
+Restoring output outranks preserving strictness: a permissive candidate can be tightened
+from its false positives, an empty one cannot be tightened from anything. Identical
+`runtime_branches` across two iterations likewise mean the previous action had no effect;
+change a different factor and name the counter you expect to move.
+
 Choose `STOP` when no evidence-supported safe change remains, the candidate satisfies the configured goal, the budget is exhausted, or the query is not compilable with available primitives.
 
 ## Bound the proposed change

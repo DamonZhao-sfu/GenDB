@@ -49,16 +49,33 @@ For image sites, select primitives using the same rules as the legacy VADAR agen
 
 - Use `classify` for a small visual enum, `classify_multi` when one image can contain
   several enum values, and `domain_classify` when a documented domain specialist fits.
-- Use `best_ocr_match` or `read_text` for legible names and wordmarks. For a large
-  runtime value space, use `topk_text` to shortlist candidates before verification.
+- Use `best_ocr_match` or `read_text` for legible names and wordmarks. A large value
+  space of names PRINTED in the image — airlines, brands, venues, logos — is an OCR
+  problem, not a CLIP problem. For a large runtime value space, use `topk_text` to
+  shortlist candidates before verification.
 - Use `dominant_colors` for colors. Use `detect` only for its documented closed
   vocabulary and `detect_open` for an open-vocabulary object. A `detect` result is a
   sub-image that may be classified, scored, cropped, or OCRed; use `bbox` only when
   coordinates are part of the physical plan.
-- Use `verify_property` for a boolean visual property. Use the corresponding
-  `classify_detail`, `verify_detail`, `detect_detail`, `ocr_detail`, or
-  `best_ocr_match_detail` primitive only when the plan needs a comparable confidence
-  for gating, ranking, or threshold optimization.
+- Use `verify_property` ONLY as a coarse gate on a generic visual property, always
+  beside a discriminative step. It asks CLIP whether the image matches `prop` better
+  than `not prop` and is positively biased: bound to a named-entity property such as
+  `"the logo of " + X` it answers true for nearly every image, scoring recall 1.0 at
+  precision near zero. Never bind a whole named-entity, multi-clause, or
+  identity-of-a-specific-thing predicate to a single `verify_property` call.
+- Give every row-filtering image site a discriminative step (OCR or closed-set
+  `classify` over the runtime value space), a cheap gate evaluated first, and a
+  comparable confidence. Bind the `classify_detail`, `verify_detail`, `detect_detail`,
+  `ocr_detail`, or `best_ocr_match_detail` variant and record the gating threshold in
+  `confidence_signal`; a filter site with `confidence_signal: null` leaves the
+  optimizer nothing to tune.
+- When the SQL implies a near one-to-one correspondence — one logo per airline, one
+  portrait per person — plan the assignment or dedup step explicitly. Independent
+  per-pair matching multiplies false positives.
+- Prefer several small, generally named helpers over one helper that hides the whole
+  predicate, so the optimizer can patch one factor at a time.
+- Record in `compilability.obligations` which primitive you rejected for each image
+  site and why, so a replan does not silently reintroduce it.
 - Use `regions_center` for product-photo margins, `regions_grid` for a systematic
   scan, and `regions_propose` for several distinct foreground objects. Use `crop` for
   a known layout. Plan region work only when whole-image evidence is too coarse.
@@ -67,9 +84,11 @@ For image sites, select primitives using the same rules as the legacy VADAR agen
   relevance and `embed` when the plan benefits from reusable image vectors.
 - When one target is rare among many images, plan a cheap kind/property gate before
   expensive OCR, open-vocabulary detection, or region decomposition.
-- Keep CLIP prompts short and visual. Decompose long natural-language predicates into
-  category, color, presence, OCR, and relational checks instead of passing the whole
-  query to one primitive.
+- Keep CLIP prompts short and visual. CLIP reads only ~77 tokens, compares phrases
+  rather than sentences, and does not process negation, so appending exclusions or a
+  "reject X, Y, Z" clause lowers precision instead of raising it. Decompose long
+  natural-language predicates into category, color, presence, OCR, and relational
+  checks instead of passing the whole query to one primitive.
 - Resolve image references through the supplied offline image adapter and reuse one
   encoder context per process.
 

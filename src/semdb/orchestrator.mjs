@@ -53,6 +53,7 @@ import { loadBoundAgentSkill } from "./agent-runtime/skill-loader.mjs";
 import {
   assertPlanGeneratable,
   finalizeCandidateManifest,
+  lintImagePlan,
   readAndValidateOptimizerAction,
   readAndValidatePlan,
   writeJsonAtomic,
@@ -316,6 +317,70 @@ export function semdbObjective(outcome) {
            details: candidate?.details || null };
 }
 
+/** Render a scored query's OWN metric family.
+ *
+ *  SemBench does not score every query with precision/recall/F1: a grouping query is
+ *  scored by adjusted Rand index, an aggregate by relative error, a top-k by Spearman.
+ *  The summary used to print a hardcoded `P=… R=… F1=…`, so those queries reported
+ *  `P=undefined R=undefined F1=undefined` even though telemetry held their real score.
+ *  Dispatch on `metric` the same way `metric_objective()` does in evaluate.py.
+ *
+ *  Returns { key, label, value } — `key` groups queries that share a metric so the
+ *  workload mean is taken WITHIN a family instead of averaging an ARI against an F1.
+ */
+export function formatQueryMetric(m) {
+  const num = (v, d = 4) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v))
+    ? null
+    : Number(Number(v).toFixed(d)));
+  const metric = String(m?.metric || "").toLowerCase();
+  const pick = (...keys) => {
+    for (const k of keys) { const v = num(m?.[k]); if (v !== null) return v; }
+    return null;
+  };
+  if (metric === "adjusted-rand-index" || metric === "ari") {
+    const ari = pick("adjusted_rand_index", "ari");
+    return { key: "ari", label: `ARI=${ari ?? "n/a"}`, value: ari };
+  }
+  if (metric === "aggregation") {
+    const rel = pick("relative_error");
+    const mape = pick("mape", "mean_absolute_percentage_error");
+    const abs = pick("absolute_error");
+    return {
+      key: "relative_error",
+      label: `rel_err=${rel ?? "n/a"}`
+        + (mape === null ? "" : ` MAPE=${mape}%`)
+        + (abs === null ? "" : ` abs_err=${abs}`),
+      value: rel,
+    };
+  }
+  if (metric === "ranking") {
+    const sp = pick("spearman_correlation", "spearman");
+    const kt = pick("kendall_tau", "kendall");
+    return {
+      key: "spearman",
+      label: `spearman=${sp ?? "n/a"}` + (kt === null ? "" : ` kendall=${kt}`),
+      value: sp,
+    };
+  }
+  // Retrieval / classification families (retrieval_f1, f1-score, id_set_f1) —
+  // the macro_classification variant is a macro F1 over classes, not a retrieval F1.
+  const variant = String(m?.metric_variant || m?.variant || "");
+  const f1 = pick("f1", "f1_score");
+  if (f1 === null && metric === "") {
+    return { key: "unscored", label: "no metric recorded", value: null };
+  }
+  const name = variant === "macro_classification" || metric === "macro_f1" ? "macroF1" : "F1";
+  const p = pick("precision");
+  const r = pick("recall");
+  const counts = [m?.tp, m?.fp, m?.fn].every((v) => v !== null && v !== undefined)
+    ? `  (tp=${m.tp} fp=${m.fp} fn=${m.fn})` : "";
+  return {
+    key: name === "macroF1" ? "macro_f1" : "f1",
+    label: `P=${p ?? "n/a"} R=${r ?? "n/a"} ${name}=${f1 ?? "n/a"}${counts}`,
+    value: f1,
+  };
+}
+
 /**
  * Improvement selector — correctness-first, then the query's typed objective.
  * Legacy callers with only `f1` remain supported.
@@ -470,6 +535,39 @@ export function validationCorpusFingerprint(corpusPath) {
   }
 }
 
+/** Count data rows (excluding the header) in a solver's result CSV.
+ *
+ *  Returns null when the file is missing or unreadable, which the caller reports as
+ *  "unknown" rather than as zero — a missing file is a crash, not an empty predicate.
+ */
+export function countCsvDataRows(path) {
+  try {
+    if (!path || !existsSync(path)) return null;
+    const text = readFileSync(path, "utf-8");
+    if (!text.trim()) return 0;
+    const lines = text.split("\n").filter((line) => line.trim() !== "");
+    return Math.max(0, lines.length - 1);      // drop the header
+  } catch { return null; }
+}
+
+/** Make a validation-design key safe to use as a directory name.
+ *
+ *  The key concatenates every component of the sampling design, including the oracle's
+ *  answer choices. mmqa q2b's choices are the 14-colour value space, which pushed the
+ *  name past the 255-byte filename limit and crashed build_valset.py with ENAMETOOLONG
+ *  — the query then failed outright, because --val-rate refuses to fall back to
+ *  ground-truth scoring.
+ *
+ *  Long keys keep a readable prefix and carry their identity in a hash of the WHOLE key,
+ *  so two designs still never collide. Keys that already fit are returned untouched, so
+ *  validation sets cached before this change still hit.
+ */
+export function valDesignDirName(key, maxLength = 150) {
+  if (key.length <= maxLength) return key;
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return `${key.slice(0, maxLength - digest.length - 1)}-${digest}`;
+}
+
 export function buildValSet(args, query, spec, attempt = {}) {
   const valRate = Math.max(
     attempt.rate ?? args.valRate,
@@ -491,7 +589,7 @@ export function buildValSet(args, query, spec, attempt = {}) {
     ...(spec.oracleQuestion ? ["joint-oracle-v1", spec.oracleLabelType || "text",
       ...(spec.oracleChoices || [])] : []),
   ].join("_").replace(/[^\w.-]/g, "");
-  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`, key);
+  const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`, valDesignDirName(key));
   const selectPath = resolve(dir, "select.json");
   if (existsSync(selectPath)) {
     console.log(`[SemDB] [${query}] reusing cached validation set ${selectPath}`);
@@ -1890,7 +1988,8 @@ async function runQueryCodegen(args, planObj, art, csvPath) {
     const scored = await readJSON(telePath);
     const m = scored?.metrics;
     if (m) {
-      console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+      const shown = formatQueryMetric(m);
+      console.log(`[SemDB]   METRICS            ${m.metric || "unknown"}: ${shown.label}`);
       console.log(`[SemDB]   saved -> ${telePath} and ${csvPath}`);
     }
   } else if (gt) {
@@ -2613,6 +2712,12 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   };
   const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
     const diffPath = resolve(iterDir, "diff.json");
+    // A candidate that selects nothing scores F1 0 like any other bad candidate, but it
+    // is strictly worse for the loop: with no selected rows the branch counters stop
+    // moving and every later iteration sees the same empty output. It was only visible
+    // by reading "retained 0" out of stderr_tail, so the optimizer kept treating it as an
+    // ordinary precision problem. Count it and hand it over as a first-class signal.
+    const selectedRows = countCsvDataRows(iterCsv);
     if (valMode) {
       // Pairwise: mistakes are looked up in the PAIR frame, not the image manifest —
       // its ids are what the val file and the solver's trace key on.
@@ -2620,14 +2725,14 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       // "ok" requires a trace to score; without one the agent must fix-first.
       const traceOk = existsSync(resolve(iterDir, `trace_${query}.json`));
       const status = run.status === "crash" ? "crash" : (traceOk ? "ok" : "empty");
-      return { ...scored, status, stage: run.stage ?? null,
+      return { ...scored, status, stage: run.stage ?? null, selectedRows,
                execMs: run.execMs ?? null,
                runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
                stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
     }
     const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
     const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
-    return { ...scored, status, stage: run.stage ?? null,
+    return { ...scored, status, stage: run.stage ?? null, selectedRows,
              execMs: run.execMs ?? null,
              runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
              stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
@@ -2636,7 +2741,8 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const primitiveFiles = isImage
     ? [resolve(__dirname, "vadar", "predefined.py")]
     : [resolve(__dirname, "vadar", "predefined_text.py")];
-  const plannerVars = (planPath, previousPlanPath = "", optimizerActionPath = "") => ({
+  const plannerVars = (planPath, previousPlanPath = "", optimizerActionPath = "",
+                       plannerLint = "") => ({
     query_id: query,
     query_sql: sql,
     query_nl: nl || "(none)",
@@ -2647,6 +2753,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     plan_path: planPath,
     previous_plan_path: previousPlanPath,
     optimizer_action_path: optimizerActionPath,
+    planner_lint: plannerLint,
   });
   const generatorVars = ({
     planPath,
@@ -2670,17 +2777,35 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   });
 
   const createInitialPlan = async ({ iterDir, planPath }) => {
-    record("query_planner", await runPhase(
-      queryPlannerConfig,
-      plannerVars(planPath),
-      iterDir,
-      args,
-    ));
-    const plan = await readAndValidatePlan(planPath, { queryId: query });
-    if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
-      throw new Error(
-        `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
-      );
+    // A non-discriminative image binding cannot be repaired downstream: the generator
+    // must implement the plan, and the optimizer can only reword its prompt. Catching it
+    // here costs one planner call instead of the query's whole iteration budget.
+    let lintText = "";
+    let plan = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      record("query_planner", await runPhase(
+        queryPlannerConfig,
+        plannerVars(planPath, "", "", lintText),
+        iterDir,
+        args,
+      ));
+      plan = await readAndValidatePlan(planPath, { queryId: query });
+      if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
+        throw new Error(
+          `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
+        );
+      }
+      const findings = lintImagePlan(plan);
+      if (!findings.length) return { plan, planPath };
+      for (const finding of findings) {
+        console.log(`[SemDB]   [${query}] plan lint: ${finding.split(".")[0]}.`);
+      }
+      if (attempt === 1) {
+        // Advisory, not fatal: an unusual query may legitimately be property-shaped.
+        console.warn(`[SemDB]   [${query}] plan still flagged after one revision — proceeding.`);
+        break;
+      }
+      lintText = findings.map((f) => `- ${f}`).join("\n");
     }
     return { plan, planPath };
   };
@@ -3044,7 +3169,8 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     const scored = await readJSON(telePath);
     const m = scored?.metrics;
     if (m) {
-      console.log(`[SemDB]   METRICS            precision=${m.precision}  recall=${m.recall}  F1=${m.f1}  (tp=${m.tp} fp=${m.fp} fn=${m.fn})`);
+      const shown = formatQueryMetric(m);
+      console.log(`[SemDB]   METRICS            ${m.metric || "unknown"}: ${shown.label}`);
       console.log(`[SemDB]   saved -> ${telePath} and ${csvPath}`);
     }
   } else if (gt) {
@@ -3216,20 +3342,30 @@ async function main() {
 
   // 4) Workload summary.
   console.log(`\n[SemDB] ==================== SUMMARY ====================`);
+  // Each query is printed with the metric SemBench actually scores it by: a grouping
+  // query has an ARI and no F1, an aggregate has a relative error. Assuming P/R/F1 for
+  // all of them printed `undefined` for every non-retrieval query.
+  const families = new Map();
   for (const s of summary) {
-    console.log(
-      s.notCompilable
-        ? `[SemDB]   ${s.q.padEnd(6)} NOT_COMPILABLE — `
-          + `${s.notCompilable.reason_code}: ${s.notCompilable.reason}`
-        : (s.error
-            ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
-            : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`),
-    );
+    if (s.notCompilable) {
+      console.log(`[SemDB]   ${s.q.padEnd(6)} NOT_COMPILABLE — `
+        + `${s.notCompilable.reason_code}: ${s.notCompilable.reason}`);
+      continue;
+    }
+    if (s.error) {
+      console.log(`[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`);
+      continue;
+    }
+    const shown = formatQueryMetric(s);
+    console.log(`[SemDB]   ${s.q.padEnd(6)} ${shown.label}`);
+    if (shown.value == null) continue;
+    if (!families.has(shown.key)) families.set(shown.key, []);
+    families.get(shown.key).push(shown.value);
   }
-  const scored = summary.filter((s) => s.f1 != null);
-  if (scored.length) {
-    const mean = (k) => (scored.reduce((a, s) => a + s[k], 0) / scored.length).toFixed(4);
-    console.log(`[SemDB]   ${"MEAN".padEnd(6)} P=${mean("precision")} R=${mean("recall")} F1=${mean("f1")}  (${scored.length} scored)`);
+  // Mean WITHIN a metric family only — averaging an ARI against an F1 is meaningless.
+  for (const [key, values] of families) {
+    const mean = (values.reduce((a, v) => a + v, 0) / values.length).toFixed(4);
+    console.log(`[SemDB]   ${"MEAN".padEnd(6)} ${key}=${mean}  (${values.length} scored)`);
   }
   console.log(`[SemDB]   metrics CSV -> ${csvPath}`);
 }

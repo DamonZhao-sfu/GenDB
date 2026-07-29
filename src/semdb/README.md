@@ -105,7 +105,7 @@ node src/semdb/orchestrator.mjs \
 --benchmark cars \
 --sembench-dir /localhome/hza214/SemBench \
 --sf 9836 \
---query Q1,Q3,Q4,Q8,Q10 \
+--query Q10 \
 --direct \
 --run \
 --agent-provider codex \
@@ -113,6 +113,6 @@ node src/semdb/orchestrator.mjs \
 --api-key EMPTY \
 --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
 --val-rate 0.05 \
---max-iterations 5 \
+--max-iterations 3 \
 --out src/semdb/runs/cars \
 2>&1 | tee cars-qwen-val05.log

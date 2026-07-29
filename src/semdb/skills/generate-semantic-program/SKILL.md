@@ -48,7 +48,13 @@ For image plans:
   Never compare confidence values from different primitive families.
 - Preserve a planned cheap gate before expensive OCR, open-vocabulary detection, or
   region decomposition.
-- Keep CLIP phrases short; realize a long predicate as the plan's explicit helper DAG.
+- Keep CLIP phrases short — a few words. CLIP reads only ~77 tokens and does not process
+  negation, so never build a prompt by concatenating the query sentence or a "reject
+  X, Y, Z" clause; that lowers precision. Realize a long predicate as the plan's explicit
+  helper DAG.
+- Implement each planned primitive as planned. Do not collapse a planned OCR or
+  closed-set `classify` step into a single `verify_property`, and do not drop a planned
+  gate, threshold, confidence, or assignment/dedup step because a simpler form runs.
 
 For text plans, use ordinary strings plus the exact functions exported by
 `vadar.predefined_text` and Python standard-library regex/numeric/date operations.

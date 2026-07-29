@@ -185,6 +185,12 @@ export function buildIterationFeedback({
         ?? runOutcome.stderrTail
         ?? String(runOutcome.stderr || "").split("\n").slice(-40).join("\n"),
       runtime_ms: finiteOrNull(runOutcome.execMs ?? scoreOutcome.execMs),
+      // How many rows the candidate actually selected. Zero is a distinct failure from a
+      // low score: it freezes the branch counters, so every later iteration learns
+      // nothing. Surfaced here instead of only inside stderr_tail.
+      selected_rows: finiteOrNull(
+        scoreOutcome.selectedRows ?? runOutcome.selectedRows,
+      ),
     },
     objective: selectedObjective,
     operator_fidelity: fidelity,

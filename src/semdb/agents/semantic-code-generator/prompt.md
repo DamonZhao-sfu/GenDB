@@ -18,5 +18,29 @@ Hard constraints:
   require its parent directory. Do not mix an import form with the wrong path root.
 - The orchestrator, not you, computes and verifies artifact hashes.
 
+Image-primitive fidelity (the plan chose the operators; you must not weaken them):
+
+- Every string reaching `classify`, `verify_property`, or `score` is a SHORT visual phrase
+  — a few words, like `"a flat graphic logo"`. CLIP's text encoder reads only ~77 tokens
+  and compares phrases, not sentences. Never build a prompt by concatenating the query
+  sentence, a list of exclusions, or a "reject X, Y, Z" clause: CLIP does not process
+  negation, so a longer prompt makes the predicate worse, not stricter. Realize a long
+  predicate as the plan's helper DAG.
+- Implement each planned primitive as planned. Do not collapse a planned OCR or closed-set
+  `classify` step into a single `verify_property`, and do not drop a planned gate,
+  confidence, or assignment/dedup step because a simpler form runs.
+- Implement the plan's acceptance paths as a DISJUNCTION with distinct branch names, not as
+  one AND-chain. Never invent an absolute confidence cutoff the plan did not specify: CLIP
+  scores are uncalibrated, so an unplanned `>= 0.5` typically rejects every row. When the
+  plan states a comparison, implement that comparison — an argmax over competing options or
+  a margin between two confidences from the same primitive.
+- A candidate that selects ZERO rows is a failure, not a strict predicate: it scores F1 0
+  and leaves the next iteration nothing to learn from. If your implementation retains no
+  rows, loosen the most arbitrary rejection rule and regenerate before writing the manifest.
+- Report the branch counters the plan names, so the optimizer can see WHERE rows were lost.
+- Read every closed value space from the runtime column at execution time.
+- If the plan's binding cannot be implemented faithfully, fail with `NEEDS_REPLAN` rather
+  than substituting a weaker predicate.
+
 Write only the three requested paths. Do not edit the plan, optimizer action, parent
 candidate, repository sources, or any path outside the candidate directory.

@@ -18,25 +18,83 @@
     "data_boundary"
   ],
   "properties": {
-    "schema_version": { "const": "1.0" },
-    "query_id": { "type": "string", "minLength": 1 },
-    "candidate_id": { "type": "string", "minLength": 1 },
-    "iteration": { "type": "integer", "minimum": 0 },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "query_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0
+    },
     "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "stage", "preflight", "stderr_tail", "runtime_ms"],
+      "required": [
+        "status",
+        "stage",
+        "preflight",
+        "stderr_tail",
+        "runtime_ms"
+      ],
       "properties": {
-        "status": { "enum": ["ok", "crash", "empty"] },
+        "status": {
+          "enum": [
+            "ok",
+            "crash",
+            "empty"
+          ]
+        },
         "stage": {
-          "anyOf": [{ "type": "string" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "preflight": {
-          "anyOf": [{ "type": "object" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "stderr_tail": { "type": "string" },
+        "stderr_tail": {
+          "type": "string"
+        },
         "runtime_ms": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selected_rows": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -54,22 +112,59 @@
         "details"
       ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
         "value": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "precision": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "recall": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "weighted": { "type": "boolean" },
-        "direction": { "enum": ["maximize", "minimize"] },
+        "weighted": {
+          "type": "boolean"
+        },
+        "direction": {
+          "enum": [
+            "maximize",
+            "minimize"
+          ]
+        },
         "scope": {
-          "enum": ["query_metric", "operator_fidelity", "unavailable"]
+          "enum": [
+            "query_metric",
+            "operator_fidelity",
+            "unavailable"
+          ]
         },
-        "details": { "type": "object" }
+        "details": {
+          "type": "object"
+        }
       }
     },
     "operator_fidelity": {
@@ -86,24 +181,70 @@
       ],
       "properties": {
         "accuracy": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "precision": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "recall": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "f1": {
-          "anyOf": [{ "type": "number" }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "n": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "correct": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "weighted": { "type": "boolean" }
+        "weighted": {
+          "type": "boolean"
+        }
       }
     },
     "errors": {
@@ -126,35 +267,76 @@
           ]
         },
         "false_positive_total": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "false_negative_total": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "mismatch_total": {
-          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "mistakes": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object"
+          }
         }
       }
     },
-    "runtime_branches": { "type": "object" },
+    "runtime_branches": {
+      "type": "object"
+    },
     "history": {
       "type": "array",
-      "items": { "type": "object" }
+      "items": {
+        "type": "object"
+      }
     },
     "data_boundary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "cert_accessed", "full_ground_truth_accessed"],
+      "required": [
+        "source",
+        "cert_accessed",
+        "full_ground_truth_accessed"
+      ],
       "properties": {
         "source": {
-          "enum": ["select_validation", "none"]
+          "enum": [
+            "select_validation",
+            "none"
+          ]
         },
-        "cert_accessed": { "const": false },
-        "full_ground_truth_accessed": { "const": false }
+        "cert_accessed": {
+          "const": false
+        },
+        "full_ground_truth_accessed": {
+          "const": false
+        }
       }
     }
   }

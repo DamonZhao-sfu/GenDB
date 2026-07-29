@@ -85,6 +85,87 @@ export async function readAndValidatePlan(path, options = {}) {
   return plan;
 }
 
+/** Primitives that read a SPECIFIC identity out of an image, as opposed to scoring a
+ *  generic property. At least one of these must appear in an image plan that filters
+ *  rows, otherwise the predicate cannot tell one named entity from another. */
+const DISCRIMINATIVE_IMAGE_PRIMITIVES = new Set([
+  "best_ocr_match", "best_ocr_match_detail", "read_text", "ocr_detail",
+  "classify", "classify_detail", "classify_multi", "domain_classify",
+  "topk_text", "topk_similar", "detect", "detect_detail", "detect_open",
+  "dominant_colors", "pair_score", "score", "embed",
+]);
+
+/** Does a `verify_property` step build its property string from a DATA value?
+ *
+ *  This is the line between the two uses of the primitive. A constant property —
+ *  `"a damaged car"`, `"a sports shoe"` — is a real generic visual question and CLIP
+ *  answers it usefully. A property assembled from a column value —
+ *  `"the logo of " + track_name` — is an identity question, and `verify_property`
+ *  compares `prop` against `not prop`, which is positively biased: it returns true for
+ *  nearly every image, scoring recall 1.0 at precision near zero.
+ */
+function verifyPropertyIsParameterized(step, helper) {
+  const argNames = (Array.isArray(helper?.args) ? helper.args : [])
+    .map((a) => String(a?.name || ""))
+    .filter((n) => n && !/^(image|image_ref|resolved_image|img|patch)$/i.test(n));
+  const inputs = (Array.isArray(step?.inputs) ? step.inputs : []).map(String);
+  const template = String(step?.property_template || "");
+  if (/\{[^}]+\}/.test(template)) return true;
+  return inputs.some((raw) => {
+    // Drop the image argument; only the property expression matters here.
+    if (/^\s*(image|image_ref|resolved_image|img|patch)\b\s*[:=]?\s*\w*\s*$/i.test(raw)) return false;
+    if (raw.includes("+") || /\{[^}]+\}/.test(raw)) return true;
+    return argNames.some((n) => new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(raw));
+  });
+}
+
+/** Lint an image plan for the failure mode that made mmqa q2a/q7 score P≈0.02.
+ *
+ *  Fires only on a data-parameterized `verify_property` with no discriminative sibling
+ *  primitive anywhere in the DAG — an identity predicate that no amount of rewording can
+ *  fix, so the optimizer would burn its whole budget on prompt tweaks. A constant-property
+ *  `verify_property` is left alone; that is the primitive's legitimate use.
+ *
+ *  Returns human-readable findings (empty when the plan is fine). Advisory by design: the
+ *  caller re-prompts the planner once rather than failing the query.
+ */
+export function lintImagePlan(plan) {
+  if (!plan || plan.modality !== "image") return [];
+  if (plan.compilability?.class === "not_compilable") return [];
+  const helpers = Array.isArray(plan.helper_dag) ? plan.helper_dag : [];
+  const primitives = helpers
+    .flatMap((h) => (Array.isArray(h.primitive_steps) ? h.primitive_steps : []))
+    .map((s) => String(s?.primitive || ""));
+  if (primitives.some((p) => DISCRIMINATIVE_IMAGE_PRIMITIVES.has(p))) return [];
+  // A site that decides row membership is the one that has to discriminate; a plan that
+  // only extracts an attribute for projection is judged by a different metric.
+  const filtersRows = (Array.isArray(plan.semantic_sites) ? plan.semantic_sites : [])
+    .some((s) => /^bool(ean)?$/i.test(String(s?.output_type || "")));
+  if (!filtersRows) return [];
+  const parameterized = helpers.some((h) => (Array.isArray(h.primitive_steps) ? h.primitive_steps : [])
+    .some((s) => s?.primitive === "verify_property" && verifyPropertyIsParameterized(s, h)));
+  if (!parameterized) return [];
+  const findings = [
+    "This plan decides row membership with a `verify_property` whose property string is "
+    + "built from a data value, and no other visual primitive. `verify_property` compares "
+    + "`prop` against `not prop` and is positively biased, so an identity property such as "
+    + "`'the logo of ' + X` returns true for nearly every image — recall 1.0 at precision "
+    + "near zero, and no rewording fixes it. Add a discriminative step that reads the "
+    + "identity out of the image: `best_ocr_match_detail` against the value space read from "
+    + "the runtime column, or a closed-set `classify_detail` over that value space. Keep "
+    + "`verify_property` only as a cheap constant-property gate beside it.",
+  ];
+  if (helpers.length
+      && helpers.every((h) => h.confidence_signal === null || h.confidence_signal === undefined)) {
+    findings.push(
+      "Every helper also declares `confidence_signal: null`, so the plan exposes no "
+      + "threshold the optimizer can tune. Bind the `*_detail` variant of the discriminative "
+      + "primitive and record its gating threshold in `confidence_signal`.",
+    );
+  }
+  return findings;
+}
+
 export function assertPlanGeneratable(plan) {
   if (plan?.compilability?.class === "not_compilable") {
     throw new Error(
