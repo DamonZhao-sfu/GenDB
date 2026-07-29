@@ -87,6 +87,41 @@ def build_plan(sql: str, *, benchmark: str = "", query: str = "",
                 sql, left, right),
         }
     elif len(sites) > 1:
+        # A common two-stage SQL shape first keeps a cross-table pair with AI.IF,
+        # then extracts a value from that same matched image with AI.GENERATE.  The
+        # root validation unit is still the pair; its typed label jointly represents
+        # both sites as either "no_match" or "match:<generated value>".  Keeping this
+        # composition explicit lets one Oracle call validate the whole query without
+        # leaking either intermediate label into the optimizer.
+        first, second = sites[0], sites[1]
+        if (len(sites) == 2 and first.kind == "if"
+                and first.shape == "pairwise"
+                and second.kind in {"generate", "classify"}
+                and second.shape == "per_row"):
+            candidate = {
+                "unit": "pair",
+                "site_id": "s0",
+                "aliases": list(first.aliases),
+                "bases": list(first.bases),
+                "ordered": True,
+                "include_diagonal": False,
+                "composition": {
+                    "kind": "filter_then_extract",
+                    "gate_site": "s0",
+                    "value_site": "s1",
+                    "negative_value": "no_match",
+                    "positive_prefix": "match:",
+                },
+            }
+            return {
+                "version": 2,
+                "benchmark": benchmark,
+                "query": query,
+                "sql_path": os.path.abspath(sql_path) if sql_path else None,
+                "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(),
+                "candidate": candidate,
+                "sites": rendered_sites,
+            }
         aliases: list[str] = []
         for site in sites:
             for alias in site.aliases:

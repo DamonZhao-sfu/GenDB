@@ -225,11 +225,14 @@ node src/semdb/validation_matrix.mjs \
   --out /tmp/semdb-validation-matrix.json
 ```
 
-Whole-query validation for a typed tuple or multi-site composition is not silently
-reduced to one predicate. Until a joint Oracle protocol exists, DIRECT mode writes
-`validation_capability.json` and reports `NOT_COMPILABLE` with reason
-`joint_multi_site_oracle_not_implemented`. This is a validation-frame capability
-boundary; it does not claim that the semantic SQL itself lacks an offline solver.
+Whole-query validation for a typed tuple or multi-site composition is never silently
+reduced to one predicate. The supported `filter_then_extract` shape (MMQA q2b) uses
+one joint pair label—`no_match` or `match:<value>`—and query-specific tuple F1, so
+both semantic sites participate in optimization. Other tuple/multi-site compositions
+still write `validation_capability.json` and report `NOT_COMPILABLE` with reason
+`joint_multi_site_oracle_not_implemented` until they have an equivalent typed
+composition. This is a validation-frame capability boundary; it does not claim that
+the semantic SQL itself lacks an offline solver.
 
 **Why `--val-score-tilt` defaults to 2.** These predicates are highly selective — ecomm
 Q2 has 5 positives in 250 rows. A uniform 20% draw expects ~1 positive, and a val set

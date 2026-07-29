@@ -1,6 +1,6 @@
 ---
 name: optimize-semantic-program
-description: Diagnose a GenDB SemDB candidate from structured preflight, runtime, SELECT-validation, metric, trace, and history evidence, then choose a bounded code patch, plan revision, or stop action. Use during iterative optimization to separate implementation defects from plan defects, target precision/recall/F1 failures, protect validation integrity, and produce an optimizer action without editing program files.
+description: Diagnose a GenDB SemDB candidate from structured preflight, runtime, SELECT-validation, query-specific metric, trace, and history evidence, then choose a bounded code patch, plan revision, or stop action. Use during iterative optimization to separate implementation defects from plan defects, target the official metric family, protect validation integrity, and produce an optimizer action without editing program files.
 ---
 
 # Optimize Semantic Program
@@ -20,9 +20,31 @@ Treat `data_boundary` as a hard policy. Stop if feedback includes CERT or unauth
 3. Check trace coverage, key format, and sampling-unit errors.
 4. Check relational projection and join/filter placement.
 5. Check primitive arguments, value-space mapping, prompts, thresholds, and confidence semantics.
-6. Compare precision and recall to distinguish over-broad from under-broad behavior.
+6. Diagnose according to `objective.name`, `objective.direction`, and
+   `objective.details`; do not assume the objective is F1.
 7. Use capped mistakes as supporting evidence, not as cases to memorize.
 8. Compare history to avoid repeating a failed action.
+
+## Use metric-specific evidence
+
+- For `f1` or `predicate_fidelity_f1`, compare precision and recall and use binary
+  false-positive/false-negative totals when present.
+- For `macro_f1`, look for class collapse, missing labels, and minority-class recall.
+  Row label mismatches are diagnostic; binary FP/FN terminology is not.
+- For `adjusted_rand_index`, optimize partition agreement. Category names may be
+  permuted without hurting ARI, so focus on incorrect merges, splits, missing rows,
+  and inconsistent assignments. Do not reinterpret operator accuracy or binary F1
+  as ARI.
+- For `relative_error` or `mape`, read expected/predicted aggregate details and
+  remember that the direction is `minimize`. A row-level fidelity increase matters
+  only if it improves the aggregate.
+- For `spearman_correlation`, diagnose ordering and score ties; exact row-label
+  accuracy is not the ranking objective.
+- For `query_metric_unavailable`, do not invent a surrogate query score. Repair
+  compile/runtime/trace-contract failures if present; otherwise choose `STOP`.
+
+`operator_fidelity` is a separate diagnostic. It can explain the query metric but
+must never replace a measurable query-specific objective during candidate selection.
 
 ## Choose one action
 
@@ -44,6 +66,8 @@ Prefer one falsifiable change per iteration. Do not request an unrelated rewrite
 - Never infer a hidden label rule from a small validation sample.
 - Never request access to CERT or final ground truth.
 - Never optimize accuracy alone when class imbalance makes precision/recall/F1 available.
+- Never report binary FP/FN analysis for ARI, ranking, aggregation, or multiclass
+  macro-F1 feedback.
 - Never claim a statistical guarantee from point estimates.
 - Never change the validation unit or metric definition to make the score look better.
 

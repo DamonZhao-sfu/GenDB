@@ -16,6 +16,13 @@ Hard constraints:
   an otherwise type-correct local approximation `not_compilable`.
 - Treat normalized local views and external-object adapters documented under Tables as
   authoritative relational equivalences. They are runtime inputs, not validation data.
+- For text multi-label extraction, `classify_multi_detail` is a valid bounded local
+  binding when the output vocabulary is explicit; `classify_movie_genres` supplies
+  the repository-local general movie taxonomy and `has_movie_genres` tests one or
+  several required genres. For airport destination predicates,
+  `destination_in_region` supports Germany and Europe from repository-local geography.
+- `extract_person_names` is available for explicit proper names in prose; a strict
+  downstream cross-document intersection can disambiguate its candidate output.
 - If local primitives cannot implement the semantics, use `not_compilable`.
 - On replan, change only evidence-supported plan sections and increment the version.
 

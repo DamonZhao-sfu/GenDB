@@ -2,6 +2,8 @@ import assert from "node:assert";
 import {
   checkSemdbImprovement,
   directTimingBreakdown,
+  sanitizeAgentQueryMetadata,
+  semdbObjective,
   shouldContinueSemdb,
 } from "../orchestrator.mjs";
 
@@ -30,6 +32,36 @@ assert.equal(checkSemdbImprovement(
   { status: "ok", f1: null, objective: { name: "ari", value: null, direction: "maximize" } },
   { status: "ok", f1: null, objective: { name: "ari", value: null, direction: "maximize" } },
 ), false, "null is not a numeric objective");
+assert.deepEqual(
+  semdbObjective({
+    f1: 0.99,
+    objective: {
+      name: "query_metric_unavailable",
+      value: null,
+      direction: "maximize",
+      details: { reason: "multi-site" },
+    },
+  }),
+  {
+    name: "query_metric_unavailable",
+    value: null,
+    direction: "maximize",
+    details: { reason: "multi-site" },
+  },
+  "an explicit unavailable objective never falls back to legacy F1",
+);
+const safeIntent = sanitizeAgentQueryMetadata({
+  nl_question: "Which images contain the logo?",
+  modalities: ["table", "image"],
+  ground_truth: [["secret-id", "secret.png"]],
+});
+assert.equal(safeIntent, "Which images contain the logo?");
+assert.ok(!safeIntent.includes("secret"),
+  "agent-facing natural-language metadata excludes colocated ground truth");
+assert.equal(
+  sanitizeAgentQueryMetadata({ ground_truth: ["secret"] }),
+  "(natural-language intent unavailable; use the SQL)",
+);
 
 // stop logic
 assert.equal(shouldContinueSemdb([{ iter: 0, f1: 1.0, status: "ok", improved: true }], 1, 5, 2).action, "continue",

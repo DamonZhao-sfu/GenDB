@@ -13,6 +13,12 @@ const plan = (unit, sites = 1) => ({
 
 assert.equal(classifyValidationCapability(plan("row")).class, "executable");
 assert.equal(classifyValidationCapability(plan("pair")).class, "executable");
+const composedPair = plan("pair", 2);
+composedPair.candidate.composition = { kind: "filter_then_extract" };
+assert.equal(
+  classifyValidationCapability(composedPair).reason_code,
+  "pair_filter_then_extract_validation_frame",
+);
 
 const tuple = classifyValidationCapability(plan("tuple", 5));
 assert.equal(tuple.class, "not_compilable");

@@ -311,6 +311,33 @@ def test_a_single_class_select_half_is_refused_by_default(corpus, gt_file, tmp_p
     Such a set scores `return false` perfectly and cannot rank programs at all."""
     with pytest.raises(SystemExit, match="single-class|unusable"):
         assert B.main(_argv(corpus, gt_file, tmp_path / "v", "--n", "20", "--seed", "3")) == 0
+    failure = json.load(open(tmp_path / "v" / "failure.json"))
+    assert failure["reason_code"] == "single_class_select"
+    assert failure["select_n"] == 20
+
+
+def test_joint_oracle_type_and_choices_override(monkeypatch, corpus, tmp_path):
+    captured = {}
+
+    def fake_oracle(rows, ids, id_col, **kwargs):
+        captured.update(kwargs)
+        labels = {row_id: ("match:blue" if index == 0 else "no_match")
+                  for index, row_id in enumerate(ids)}
+        return labels, {"abstained": [], "cost": {}}
+
+    monkeypatch.setattr(B, "labels_from_oracle", fake_oracle)
+    argv = [
+        "--corpus", str(corpus), "--id-col", "row_id", "--text-col", "text",
+        "--query", "q", "--attr", "answer", "--query-nl", "joint question",
+        "--label-type", "text",
+        "--label-choices-json", '["no_match","match:blue"]',
+        "--method", "uniform", "--n", "2", "--seed", "1",
+        "--label-source", "oracle", "--endpoint", "http://unused",
+        "--oracle-model", "test", "--out", str(tmp_path / "joint"),
+    ]
+    assert B.main(argv) == 0
+    assert captured["boolean"] is False
+    assert captured["choices"] == ["no_match", "match:blue"]
 
 
 def test_the_refusal_names_a_way_out(corpus, gt_file, tmp_path):

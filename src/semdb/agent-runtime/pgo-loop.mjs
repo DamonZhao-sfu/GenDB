@@ -19,10 +19,19 @@ function candidateIteration(candidate) {
 
 function objective(outcome = {}) {
   const explicit = outcome.objective;
-  if (explicit && Number.isFinite(Number(explicit.value))) {
+  // A typed objective is authoritative even when its value is null.  In
+  // particular, query_metric_unavailable must not fall back to a legacy fidelity
+  // F1/accuracy field.
+  if (explicit && typeof explicit === "object") {
     return {
       name: explicit.name || "objective",
-      value: Number(explicit.value),
+      value:
+        explicit.value !== null
+        && explicit.value !== undefined
+        && explicit.value !== ""
+        && Number.isFinite(Number(explicit.value))
+          ? Number(explicit.value)
+          : null,
       direction: explicit.direction === "minimize" ? "minimize" : "maximize",
     };
   }
@@ -179,11 +188,9 @@ export async function runPgoLoop({
   };
 
   let latestFeedback = await feedbackFor(bestCandidate, bestRun, bestOutcome);
-  const canOptimize = hasValidationSignal === true
-    ? true
-    : (hasValidationSignal === false
-        ? false
-        : hasMeasurableSelectSignal(latestFeedback.feedback));
+  const canOptimize = hasValidationSignal === false
+    ? false
+    : hasMeasurableSelectSignal(latestFeedback.feedback);
 
   if (canOptimize) {
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
@@ -233,6 +240,14 @@ export async function runPgoLoop({
           await writeJsonAtomic(planPath, plan);
         }
         replansUsed++;
+        // A failed replan must not discard a runnable historical candidate. Keep the
+        // rejected plan artifact for diagnosis, restore the last generatable plan,
+        // stop refinement, and let promotion freeze the best measured candidate.
+        if (plan?.compilability?.class === "not_compilable") {
+          plan = previousPlan;
+          planPath = previousPlanPath;
+          break;
+        }
       } else {
         planPath = resolve(iterDir, "plan.json");
         await writeJsonAtomic(planPath, plan);

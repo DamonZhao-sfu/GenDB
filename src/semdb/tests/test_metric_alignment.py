@@ -76,3 +76,43 @@ def test_final_metric_objective_keeps_secondary_sembench_metrics():
         "direction": "maximize",
         "details": {"kendall_tau": 0.6},
     }
+
+
+def test_cars_q10_ground_truth_is_rebuilt_for_requested_scale(tmp_path):
+    root = tmp_path / "cars"
+    gt_dir = root / "raw_results" / "ground_truth"
+    sample = root / "data" / "sf_2"
+    full = root / "data" / "full_data"
+    for path in (gt_dir, sample, full):
+        path.mkdir(parents=True)
+    # Deliberately stale plain evaluator output from another scale.
+    pd.DataFrame({
+        "car_id": [99, 100, 101],
+        "problem_category": ["wrong", "wrong", "wrong"],
+    }).to_csv(gt_dir / "Q10.csv", index=False)
+    pd.DataFrame({"complaint_id": [10, 12], "car_id": [1, 2], "summary": ["a", "b"]}).to_csv(
+        sample / "text_complaints_data_2.csv", index=False)
+    pd.DataFrame({"car_id": [1, 2]}).to_csv(sample / "car_data_2.csv", index=False)
+    pd.DataFrame({
+        "complaint_id": [10, 11, 12],
+        "car_id": [1, 3, 2],
+        "component_class": ["ENGINE", "TIRES", "STEERING"],
+    }).to_csv(full / "text_complaints_data_full.csv", index=False)
+    pd.DataFrame({"car_id": [1, 2, 3]}).to_csv(
+        full / "car_data_full.csv", index=False)
+
+    rebuilt = S._load_gt("cars", 10, gt_dir, 2)
+    assert rebuilt["car_id"].tolist() == [1, 2]
+    assert rebuilt["problem_category"].tolist() == ["engine", "steering"]
+
+
+def test_macro_f1_penalizes_missing_ids_without_sklearn_length_crash():
+    gt = pd.DataFrame({
+        "car_id": [1, 2],
+        "problem_category": ["engine", "steering"],
+    })
+    pred = pd.DataFrame({"car_id": [1], "problem_category": ["engine"]})
+    result = S._macro_f1(pred, gt, "car_id", "problem_category")
+    assert result["covered"] == 1
+    assert result["pred_count"] == 1
+    assert 0 < result["f1"] < 1

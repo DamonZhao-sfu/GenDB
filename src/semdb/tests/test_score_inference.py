@@ -3,6 +3,31 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import evaluate as E
 
 
+def test_every_supported_query_has_one_explicit_metric_route():
+    expected = {
+        "mmqa": set(range(1, 8)),
+        "movie": set(range(1, 11)),
+        "animals": set(range(1, 11)),
+        "cars": set(range(1, 11)),
+        "medical": set(range(1, 12)),
+        "ecomm": set(range(1, 15)),
+    }
+    registries = [
+        set(E.AGGREGATION_REFINEMENT),
+        set(E.EXACT_SINGLE_RESULT_RETRIEVAL),
+        set(E.ARI_REFINEMENT),
+        set(E.MACRO_F1_REFINEMENT),
+        set(E.RANKING_REFINEMENT),
+        set(E.F1_REFINEMENT),
+        set(E.MULTISITE_QUERY_OBJECTIVE_UNAVAILABLE),
+        set(E.UNSUPPORTED_QUERY_METRIC),
+    ]
+    for benchmark, queries in expected.items():
+        for query in queries:
+            routes = sum((benchmark, query) in registry for registry in registries)
+            assert routes == 1, f"{benchmark}.Q{query} has {routes} metric routes"
+
+
 def _val():
     return {"query": "q3a", "attr": "genre",
             "labels": {"m1": "comedy", "m2": "drama", "m3": "Comedy", "m4": "drama"}}
@@ -110,6 +135,97 @@ def test_multisite_aggregate_does_not_fall_back_to_wrong_f1_objective():
     assert result["objective"]["name"] == "query_metric_unavailable"
     assert result["objective"]["value"] is None
     assert "multiple semantic call sites" in result["objective"]["details"]["reason"]
+
+
+def test_known_retrieval_query_uses_official_f1_family():
+    val = {"query": "Q7", "labels": {"a": "true", "b": "false"}}
+    result = E.score_inference(
+        {"rows": {"a": "true", "b": "true"}},
+        val, None, 15, benchmark="movie")
+    assert result["objective"]["name"] == "f1"
+    assert result["objective"]["direction"] == "maximize"
+    assert result["objective"]["details"]["metric_family"] == "QueryMetricRetrieval"
+    assert result["objective"]["details"]["precision"] == 0.5
+    assert result["objective"]["details"]["recall"] == 1.0
+
+
+def test_mmqa_q2b_joint_objective_penalizes_wrong_color_as_fp_and_fn():
+    val = {"query": "q2b", "labels": {
+        "a-x.png": "match:blue",
+        "b-y.png": "no_match",
+        "c-z.png": "match:red",
+    }}
+    result = E.score_inference(
+        {"rows": {
+            "a-x.png": "match:green",  # wrong positive tuple: FP + FN
+            "b-y.png": "match:blue",   # false matching pair: FP
+            "c-z.png": "match:red",    # TP
+        }},
+        val, None, 15, benchmark="mmqa")
+    objective = result["objective"]
+    assert objective["name"] == "f1"
+    assert objective["details"]["variant"] == "filter_then_extract_tuple_f1"
+    assert objective["details"]["tp"] == 1
+    assert objective["details"]["fp"] == 2
+    assert objective["details"]["fn"] == 1
+    assert objective["value"] == 0.4
+
+
+def test_mmqa_q4_objective_scores_genre_memberships_not_list_format():
+    val = {"query": "q4", "labels": {
+        "a": "comedy, romance",
+        "b": "science fiction|horror",
+    }}
+    result = E.score_inference(
+        {"rows": {
+            "a": ["Romance", "Comedy"],
+            "b": "sci-fi, drama",
+        }},
+        val, None, 15, benchmark="mmqa")
+    objective = result["objective"]
+    assert objective["details"]["variant"] == "multi_label_genre_tuple_f1"
+    assert objective["details"]["tp"] == 3
+    assert objective["details"]["fp"] == 1
+    assert objective["details"]["fn"] == 1
+    assert objective["value"] == 0.75
+
+
+def test_mmqa_q5_objective_scores_cross_document_person_intersection():
+    val = {"query": "q5", "labels": {
+        "a": "Lizzy Caplan, Jesse Bradford",
+        "b": "Lizzy Caplan, Brad Pitt",
+        "c": "Lizzy Caplan",
+    }}
+    result = E.score_inference(
+        {"rows": {
+            "a": ["Lizzy Caplan", "Jesse Bradford"],
+            "b": ["Lizzy Caplan", "Brad Pitt"],
+            "c": ["Lizzy Caplan"],
+        }},
+        val, None, 15, benchmark="mmqa")
+    objective = result["objective"]
+    assert objective["value"] == 1
+    assert objective["details"]["variant"] == "cross_document_person_intersection_f1"
+    assert objective["details"]["expected"] == ["lizzy caplan"]
+
+
+def test_zero_retrieval_f1_is_measurable_not_missing():
+    val = {"query": "Q7", "labels": {"a": "true", "b": "false"}}
+    result = E.score_inference(
+        {"rows": {"a": "false", "b": "false"}},
+        val, None, 15, benchmark="movie")
+    assert result["objective"]["name"] == "f1"
+    assert result["objective"]["value"] == 0.0
+
+
+def test_query_without_official_evaluator_does_not_silently_use_f1():
+    val = {"query": "Q11", "labels": {"a": "true", "b": "false"}}
+    result = E.score_inference(
+        {"rows": {"a": "true", "b": "false"}},
+        val, None, 15, benchmark="medical")
+    assert result["objective"]["name"] == "query_metric_unavailable"
+    assert result["objective"]["value"] is None
+    assert "does not define a metric" in result["objective"]["details"]["reason"]
 
 
 def test_cli_score_inference_writes_json(tmp_path):

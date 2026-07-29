@@ -297,10 +297,13 @@ export function semdbObjective(outcome) {
   const candidate = outcome?.objective;
   const hasNumber = (value) => value !== null && value !== undefined && value !== ""
     && Number.isFinite(Number(value));
-  if (candidate && hasNumber(candidate.value)) {
+  // Once an evaluator emits a typed objective it is authoritative, including an
+  // explicit null such as query_metric_unavailable.  Falling back to the legacy F1
+  // field in that case would silently optimize an operator surrogate.
+  if (candidate && typeof candidate === "object") {
     return {
       name: candidate.name || "objective",
-      value: Number(candidate.value),
+      value: hasNumber(candidate.value) ? Number(candidate.value) : null,
       direction: candidate.direction === "minimize" ? "minimize" : "maximize",
       details: candidate.details || null,
     };
@@ -467,9 +470,13 @@ export function validationCorpusFingerprint(corpusPath) {
   }
 }
 
-export function buildValSet(args, query, spec) {
+export function buildValSet(args, query, spec, attempt = {}) {
+  const valRate = Math.max(
+    attempt.rate ?? args.valRate,
+    Number(spec.minimumRate ?? 0),
+  );
   const corpusFingerprint = validationCorpusFingerprint(spec.corpusCsv);
-  const key = [args.valMethod, args.valRate, args.valCertRate ?? 0, args.valSeed,
+  const key = [args.valMethod, valRate, args.valCertRate ?? 0, args.valSeed,
     args.valStrataK, args.valScoreTilt, spec.oracleModel,
     args.valCallSite ?? "auto",
     // Sampling v2 adds a probability-valid certainty stratum at the score-ranked
@@ -481,6 +488,8 @@ export function buildValSet(args, query, spec) {
     // A pairwise design samples a different frame with different keys, so it must
     // never reuse a per-row cache entry (or vice versa).
     ...(spec.pairwise ? ["pairwise", spec.frameKey || "full-frame"] : []),
+    ...(spec.oracleQuestion ? ["joint-oracle-v1", spec.oracleLabelType || "text",
+      ...(spec.oracleChoices || [])] : []),
   ].join("_").replace(/[^\w.-]/g, "");
   const dir = resolve(args.out, "_val", `${args.benchmark}-${query}`, key);
   const selectPath = resolve(dir, "select.json");
@@ -496,8 +505,14 @@ export function buildValSet(args, query, spec) {
     : (spec.isImage ? "clip-similarity" : "query-similarity"));
   const bvArgs = [resolve(__dirname, "build_valset.py"),
     "--corpus", spec.corpusCsv, "--id-col", spec.idCol,
-    "--query", query, "--attr", "answer", "--sql", spec.sqlPath,
-    "--method", args.valMethod, "--rate", String(args.valRate),
+    "--query", query, "--attr", "answer",
+    ...(spec.oracleQuestion
+      ? ["--query-nl", spec.oracleQuestion,
+         "--label-type", spec.oracleLabelType || "text",
+         ...(spec.oracleChoices
+           ? ["--label-choices-json", JSON.stringify(spec.oracleChoices)] : [])]
+      : ["--sql", spec.sqlPath]),
+    "--method", args.valMethod, "--rate", String(valRate),
     ...(args.valCertRate ? ["--cert-rate", String(args.valCertRate)] : []),
     "--seed", String(args.valSeed), "--strata-k", String(args.valStrataK),
     "--score-tilt", String(args.valScoreTilt),
@@ -521,12 +536,22 @@ export function buildValSet(args, query, spec) {
       `labels-${corpusFingerprint}.json`,
     ),
     "--out", dir];
-  console.log(`\n[SemDB] [${query}] building validation set (rate=${args.valRate}, `
+  console.log(`\n[SemDB] [${query}] building validation set (rate=${valRate}, `
     + `${args.valMethod}, oracle=${spec.oracleModel})`);
   const proc = spawnSync("python3", bvArgs, { stdio: "inherit" });
   if (proc.status !== 0 || !existsSync(selectPath)) {
     console.warn(`[SemDB] [${query}] validation set not built (build_valset.py exited `
       + `${proc.status}).`);
+    let failure = null;
+    try { failure = JSON.parse(readFileSync(resolve(dir, "failure.json"), "utf-8")); }
+    catch { /* A non-class-balance failure is not retryable here. */ }
+    const maxSelectRate = Math.max(0, 1 - Number(args.valCertRate ?? 0));
+    if (failure?.reason_code === "single_class_select" && valRate < maxSelectRate) {
+      const nextRate = Math.min(maxSelectRate, Math.max(valRate * 2, valRate + 0.01));
+      console.warn(`[SemDB] [${query}] SELECT labels are single-class at rate=${valRate}; `
+        + `retrying adaptively at rate=${nextRate}. Existing Oracle labels are cached.`);
+      return buildValSet(args, query, spec, { rate: nextRate });
+    }
     return null;
   }
   return selectPath;
@@ -668,6 +693,10 @@ export function buildPhysicalRowFrame(args, query, spec) {
     resolve(__dirname, "physical_frame.py"),
     "--corpus", spec.corpusCsv, "--out", out,
     ...(spec.textCols || []).flatMap((column) => ["--text-col", column]),
+    ...(spec.filterCol && spec.filterValues?.length
+      ? ["--filter-col", spec.filterCol,
+         ...spec.filterValues.flatMap((value) => ["--filter-value", value])]
+      : []),
   ];
   const proc = spawnSync("python3", pfArgs, { stdio: "inherit" });
   if (proc.status !== 0 || !existsSync(out)) {
@@ -732,6 +761,22 @@ export function predicateAliasForTable(site, table) {
     (base) => String(base).toLowerCase() === wanted,
   );
   return index >= 0 ? (site.aliases || [])[index] || null : null;
+}
+
+/** Literal values from one deterministic SQL `column IN (...)` predicate. */
+export function sqlInLiteralValues(sqlPath, column) {
+  const sql = readFileSync(sqlPath, "utf-8");
+  const escaped = String(column).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = sql.match(new RegExp(
+    String.raw`(?:\b[A-Za-z_]\w*\.)?\b${escaped}\s+IN\s*\(([\s\S]*?)\)`,
+    "i",
+  ));
+  if (!match) return [];
+  const values = [];
+  for (const literal of match[1].matchAll(/"((?:[^"]|"")*)"|'((?:[^']|'')*)'/g)) {
+    values.push((literal[1] ?? literal[2] ?? "").replace(/""/g, '"').replace(/''/g, "'"));
+  }
+  return values;
 }
 
 /** All ordinary-text columns consumed by a per-row AI predicate, resolved against
@@ -892,6 +937,25 @@ export function renderPreflightText(report) {
   return lines.join("\n");
 }
 
+/** Reduce benchmark metadata to an agent-safe natural-language intent.
+ *
+ * MMQA natural_language JSON files colocate `nl_question` with `ground_truth`.
+ * Serializing the whole object into a prompt leaks final answers even though the
+ * agent is told not to read them.  Use only explicit intent fields and never pass
+ * answer/label metadata through as a fallback.
+ */
+export function sanitizeAgentQueryMetadata(raw) {
+  if (typeof raw === "string") return raw;
+  if (!raw || typeof raw !== "object") {
+    return "(no natural_language/*.json found)";
+  }
+  for (const key of ["question", "nl_question", "nl", "description"]) {
+    const value = raw[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "(natural-language intent unavailable; use the SQL)";
+}
+
 /** Load a SemBench query's SQL from the query folder, and its NL intent if present. */
 async function loadQuery(args) {
   if (!args.queryDir) {
@@ -907,8 +971,7 @@ async function loadQuery(args) {
   // NL intent lives a sibling folder over: .../query/natural_language/<q>.json
   const nlPath = resolve(args.queryDir, "..", "natural_language", `${args.query}.json`);
   const nlRaw = existsSync(nlPath) ? await readJSON(nlPath) : null;
-  const nl = nlRaw?.question || nlRaw?.nl || nlRaw?.description ||
-    (nlRaw ? JSON.stringify(nlRaw) : "(no natural_language/*.json found)");
+  const nl = sanitizeAgentQueryMetadata(nlRaw);
   return { sql, nl };
 }
 
@@ -1929,6 +1992,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   let valFile = args.valFile;
   let valPairwise = false;      // the val set keys on "<left_id>-<image_id>"
   let valPairKind = "";         // "cross" | "self"; affects the solver trace contract
+  let valPairComposition = "";
   let valPairIncludeDiagonal = false;
   let valCorpusCsv = corpus.path;
   let valRowIdCol = "";
@@ -1982,10 +2046,14 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
             candidate_population: population, sample_n: sampleN,
           };
         }
-        console.log(`[SemDB] [${query}] typed/grouped multi-site plan: `
-          + `${(vplan.candidate?.kinds || []).join(" + ")}. Candidate-frame `
-          + `materialization is deferred to the typed-operator phase.`);
-        return { query, validation_plan: vplan };
+        if (vplan.candidate?.unit !== "pair") {
+          console.log(`[SemDB] [${query}] typed/grouped multi-site plan: `
+            + `${(vplan.candidate?.kinds || []).join(" + ")}. Candidate-frame `
+            + `materialization is deferred to the typed-operator phase.`);
+          return { query, validation_plan: vplan };
+        }
+        // A typed filter_then_extract composition has several AI sites but one
+        // executable root pair frame. Continue through the ordinary pair builder.
       }
       const pairSite = sites.find((s) => s.shape === "pairwise");
       const selectedSite = args.valCallSite != null ? sites[args.valCallSite] : null;
@@ -2152,9 +2220,26 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
             imageDir, clipModel, endpoint: args.endpoint, oracleModel,
             importanceBy: "column:pair_score",
             frameKey: filteredFrameKey,
+            ...(directValidationPlan?.candidate?.composition?.kind
+                === "filter_then_extract" ? {
+              oracleQuestion:
+                "The text names a horse racetrack and the attached image is a candidate "
+                + "logo. If the image is not that racetrack's logo, answer no_match. "
+                + "If it is the logo, answer match:<primary logo color>. Choose exactly "
+                + "one supplied label and provide no explanation.",
+              oracleLabelType: "text",
+              oracleChoices: [
+                "no_match", "match:black", "match:white", "match:red",
+                "match:orange", "match:yellow", "match:green", "match:blue",
+                "match:purple", "match:pink", "match:brown", "match:gray",
+                "match:silver", "match:gold",
+              ],
+            } : {}),
           });
           valPairwise = !!valFile;
           valPairKind = "cross";
+          valPairComposition =
+            directValidationPlan?.candidate?.composition?.kind || "";
           valLeftIdCol = leftIdCol;
           // A real key from the frame beats a described one: the solver copies it.
           const firstRow = (await readFile(frame, "utf-8")).split(/\r?\n/)[1] || "";
@@ -2162,9 +2247,19 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         }
       } else {
         const textCols = semanticTextCols.length ? semanticTextCols : [textCol];
+        const deterministicTitles =
+          args.benchmark === "mmqa" && ["q4", "q5"].includes(String(query).toLowerCase())
+            ? sqlInLiteralValues(sqlPath, "title")
+            : [];
+        const minimumValidationRate =
+          args.benchmark === "mmqa" && String(query).toLowerCase() === "q5"
+            ? Math.max(0, 1 - Number(args.valCertRate ?? 0))
+            : 0;
         const rowCorpus = buildPhysicalRowFrame(args, query, {
           corpusCsv: corpus.path,
           textCols: isImage ? [] : textCols,
+          ...(deterministicTitles.length
+            ? { filterCol: "title", filterValues: deterministicTitles } : {}),
         });
         const rowIdCol = "_semdb_row_id";
         valCorpusCsv = rowCorpus;
@@ -2174,9 +2269,10 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
           if (!Number.isInteger(population)) {
             throw new Error(`[SemDB] [${query}] row validation frame has no row count`);
           }
-          const sampleN = Math.ceil(population * args.valRate);
+          const plannedRate = Math.max(args.valRate, minimumValidationRate);
+          const sampleN = Math.ceil(population * plannedRate);
           console.log(`[SemDB] [${query}] per-row validation population: `
-            + `${population}; rate=${args.valRate} -> ${sampleN} validation rows.`);
+            + `${population}; rate=${plannedRate} -> ${sampleN} validation rows.`);
           console.log(`[SemDB] [${query}] validation plan complete; `
             + `--val-plan-only skips Oracle labeling and agent execution.`);
           return {
@@ -2197,6 +2293,47 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
           importanceBy: !isImage && textCols.length > 1
             ? "clip-text-similarity" : undefined,
           endpoint: args.endpoint, oracleModel,
+          ...(
+            args.benchmark === "mmqa"
+            && ["q6b", "q6c"].includes(String(query).toLowerCase())
+              ? {
+                oracleQuestion:
+                  `Use only the provided Destinations field. Answer true exactly when `
+                  + `at least one listed destination city is geographically in `
+                  + `${String(query).toLowerCase() === "q6b" ? "Germany" : "Europe"}. `
+                  + `Ignore the airline name and any Airport field; a flight origin or `
+                  + `airport name is not a destination.`,
+                oracleLabelType: "boolean",
+                oracleChoices: ["true", "false"],
+              }
+              : {}
+          ),
+          ...(
+            args.benchmark === "mmqa" && String(query).toLowerCase() === "q4"
+              ? {
+                oracleQuestion:
+                  "From the supplied movie title and description, return every "
+                  + "applicable genre as a comma-separated list using only: action, "
+                  + "biography, comedy, crime, drama, heist, horror, romance, satire, "
+                  + "science fiction, thriller, war, western. Return genre names only, "
+                  + "in alphabetical order, with no explanation.",
+                oracleLabelType: "text",
+              }
+              : {}
+          ),
+          ...(
+            args.benchmark === "mmqa" && String(query).toLowerCase() === "q5"
+              ? {
+                minimumRate: minimumValidationRate,
+                oracleQuestion:
+                  "Extract the full canonical names of every actor or actress "
+                  + "explicitly named in the supplied movie description. Return a "
+                  + "comma-separated alphabetical list of person names only, without "
+                  + "roles or explanation.",
+                oracleLabelType: "text",
+              }
+              : {}
+          ),
         });
       }
       // NO SILENT DEGRADATION. Without a val set the refinement loop scores against
@@ -2344,6 +2481,21 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
        ``,
        `  With \`--only-ids\` the loop must run the vision model ONLY for listed pairs —`,
        `  that is the whole point of the sampled validation set.`].join("\n");
+  const composedCrossPairTraceContract =
+    [`This query composes a pairwise semantic filter with value extraction and is`,
+     `scored once PER PAIR against a typed joint Oracle label.`,
+     ``,
+     `- \`<key>\` is \`"<physical_row_id>-<image_filename>"\`, using the structured`,
+     `  row's \`${valLeftIdCol}\` and the image filename (e.g. \`"${valKeyExample}"\`).`,
+     `- Form the complete structured-row × image domain. Apply \`--only-ids\` to`,
+     `  this pair key before visual inference.`,
+     `- Write exactly one trace value for every evaluated key: \`"no_match"\` when`,
+     `  the image fails the SQL AI.IF logo predicate, otherwise`,
+     `  \`"match:<canonical primary color>"\` (for example \`"match:blue"\`).`,
+     `- The final CSV must still implement both SQL stages: emit only matching pairs`,
+     `  and project the extracted color without the \`match:\` trace prefix.`,
+     `- Do not emit a bare true/false trace: it discards the second semantic site's`,
+     `  value and cannot validate the whole query.`].join("\n");
   const selfPairTraceContract =
     [`This query is a SEMANTIC SELF-JOIN and is scored PER ORDERED PAIR.`,
      ``,
@@ -2394,7 +2546,10 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
        `  inference, and write one true/false or extracted-value trace entry for`,
        `  every listed row key.`].join("\n");
   const traceContract = tracePairKind
-    ? (tracePairKind === "self" ? selfPairTraceContract : crossPairTraceContract)
+    ? (tracePairKind === "self"
+        ? selfPairTraceContract
+        : (valPairComposition === "filter_then_extract"
+            ? composedCrossPairTraceContract : crossPairTraceContract))
     : rowTraceContract;
   const agentTraceContract = valKeyExample
     ? traceContract.split(valKeyExample).join(
@@ -2509,6 +2664,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     solve_path: solverPath,
     manifest_draft_path: manifestPath,
     tables_doc: tableLines.join("\n"),
+    local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
     semdb_dir: __dirname,
     runtime_args: isImage ? " --image-dir <dir> --clip-model <model>" : "",
   });

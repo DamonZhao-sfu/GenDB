@@ -79,44 +79,40 @@ place. See `docs/PLAN.md`.
 
 # Command to run codegen with validation set
 
-node src/semdb/orchestrator.mjs     --benchmark mmqa     --sembench-dir /localhome/hza214/SemBench     -
--sf 200     --direct     --run     --agent-provider codex     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3-VL-3
-0B-A3B-Instruct     --val-rate 0.1     --max-iterations 5     --out src/semdb/runs/mmqa-sf200-qwen-val01     > mmqa-qwen-val01.log
+node src/semdb/orchestrator.mjs     --benchmark mmqa     --sembench-dir /localhome/hza214/SemBench     --sf 200 --direct     --run     --agent-provider codex     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct     --val-rate 0.05     --max-iterations 5     --out src/semdb/runs/mmqa
 
 
-node src/semdb/orchestrator.mjs   --benchmark animals   --sembench-dir /localhome/hza214/SemBench   --sf 100   --query Q1,Q3,Q10   --direct   --run   --agent-provider codex   --endpoint http://localhost:8000/v1   --api-key EMPTY   --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct   --val-rate 0.05  --max-iterations 5   --out src/semdb/runs/animals   2>&1 | tee animals-qwen-val05.log
+node src/semdb/orchestrator.mjs   --benchmark animals   --sembench-dir /localhome/hza214/SemBench   --sf 100   --query Q1,Q3,Q10   --direct   --run   --agent-provider codex   --endpoint http://localhost:8000/v1   --api-key EMPTY   --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct   --val-rate 0.05  --max-iterations 3   --out src/semdb/runs/animals   2>&1 | tee animals-qwen-val05.log
 
-
-#
 
 node src/semdb/orchestrator.mjs \
-  --benchmark ecomm \
-  --sembench-dir /localhome/hza214/SemBench \
-  --sf 250 \
-  --direct \
-  --run \
-  --agent-provider codex \
-  --endpoint http://localhost:8000/v1 \
-  --api-key EMPTY \
-  --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
-  --val-rate 0.05 \
-  --max-iterations 5 \
-  --out src/semdb/runs/ecomm \
-  2>&1 | tee ecomm-qwen-val05.log
+--benchmark ecomm \
+--sembench-dir /localhome/hza214/SemBench \
+--sf 250 \
+--direct \
+--run \
+--agent-provider codex \
+--endpoint http://localhost:8000/v1 \
+--api-key EMPTY \
+--oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+--val-rate 0.05 \
+--max-iterations 3 \
+--out src/semdb/runs/ecomm \
+2>&1 | tee ecomm-qwen-val05.log
 
 
-  node src/semdb/orchestrator.mjs \
-  --benchmark cars \
-  --sembench-dir /localhome/hza214/SemBench \
-  --sf 9836 \
-  --query Q1,Q3,Q4,Q8,Q10 \
-  --direct \
-  --run \
-  --agent-provider codex \
-  --endpoint http://localhost:8000/v1 \
-  --api-key EMPTY \
-  --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
-  --val-rate 0.05 \
-  --max-iterations 5 \
-  --out src/semdb/runs/cars \
-  2>&1 | tee cars-qwen-val05.log
+node src/semdb/orchestrator.mjs \
+--benchmark cars \
+--sembench-dir /localhome/hza214/SemBench \
+--sf 9836 \
+--query Q1,Q3,Q4,Q8,Q10 \
+--direct \
+--run \
+--agent-provider codex \
+--endpoint http://localhost:8000/v1 \
+--api-key EMPTY \
+--oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+--val-rate 0.05 \
+--max-iterations 5 \
+--out src/semdb/runs/cars \
+2>&1 | tee cars-qwen-val05.log

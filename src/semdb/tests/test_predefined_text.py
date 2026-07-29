@@ -35,6 +35,46 @@ def test_bounded_classification_and_candidate_extraction_expose_confidence():
         "The new Acme Sports running shoe", ["Acme", "Acme Sports"])[0] == "Acme Sports"
 
 
+def test_multi_label_classification_keeps_each_supported_option():
+    labels, scores = pt.classify_multi_detail(
+        "A funny romantic story with jokes and a love affair.",
+        ["comedy", "romance", "horror"],
+        aliases={
+            "comedy": ["funny jokes"],
+            "romance": ["romantic love affair"],
+            "horror": ["ghost slasher"],
+        },
+        threshold=0.5,
+    )
+    assert labels == ["comedy", "romance"]
+    assert scores["horror"] == 0
+
+
+def test_destination_region_handles_airport_suffixes_and_fails_closed():
+    assert pt.destination_in_region("Atlanta, London–Heathrow", "Europe")
+    assert pt.destination_in_region("Frankfurt", "Germany")
+    assert not pt.destination_in_region("Jeddah, Atlanta", "Europe")
+    assert not pt.destination_in_region("Frankfurt", "Oceania")
+
+
+def test_movie_genres_are_multi_label_and_use_general_taxonomy():
+    assert pt.classify_movie_genres(
+        "A romantic comedy film and love story.") == ["comedy", "romance"]
+    assert pt.classify_movie_genres(
+        "A science fiction horror story about an alien monster.") == [
+            "horror", "science fiction"]
+    assert pt.has_movie_genres(
+        "A romantic comedy and love story.", ["romance", "comedy"])
+    assert not pt.has_movie_genres(
+        "A romantic comedy and love story.", ["romance", "horror"])
+
+
+def test_person_name_candidates_are_deduplicated_and_preserve_spelling():
+    assert pt.extract_person_names(
+        "Lizzy Caplan stars with Jesse Bradford. Later Lizzy Caplan returns.") == [
+            "Lizzy Caplan", "Jesse Bradford"]
+
+
 def test_api_surface_has_no_endpoint_or_semantic_judge():
     public = set(pt.MODULES_SIGNATURES_TEXT.casefold().split())
     assert "judge" not in public

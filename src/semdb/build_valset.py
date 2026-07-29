@@ -616,6 +616,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--query", required=True, help="Query id, e.g. q3a.")
     ap.add_argument("--attr", required=True, help="Attribute name the labels carry.")
     ap.add_argument("--query-nl", default="", help="Natural-language query text.")
+    ap.add_argument("--label-type", choices=["boolean", "text"],
+                    help="Override the AI call's output type for a typed joint Oracle "
+                         "question supplied with --query-nl.")
+    ap.add_argument("--label-choices-json",
+                    help="JSON array constraining text labels for a typed joint Oracle "
+                         "question.")
     ap.add_argument("--sql", help="Query .sql -- the oracle question is read from its "
                                   "AI.IF/AI.GENERATE/AI.CLASSIFY call (see predicate.py).")
     ap.add_argument("--call-site", type=int,
@@ -701,6 +707,21 @@ def main(argv: list[str] | None = None) -> int:
         question, choices, boolean, site_info = resolve_question(
             args.sql, args.call_site, args.query_nl,
             "pairwise" if args.pairwise else "per_row")
+    if args.label_type:
+        boolean = args.label_type == "boolean"
+        site_info = {**site_info, "label_type_override": args.label_type}
+    if args.label_choices_json:
+        try:
+            parsed_choices = json.loads(args.label_choices_json)
+        except ValueError as exc:
+            raise SystemExit("--label-choices-json must be a JSON array") from exc
+        if (not isinstance(parsed_choices, list)
+                or not parsed_choices
+                or not all(isinstance(value, str) and value.strip()
+                           for value in parsed_choices)):
+            raise SystemExit("--label-choices-json must be a non-empty JSON string array")
+        choices = parsed_choices
+        site_info = {**site_info, "choices_override": True}
     score_text = question or args.query_nl
 
     # --- draw ------------------------------------------------------------
@@ -806,6 +827,17 @@ def main(argv: list[str] | None = None) -> int:
     if problem and labels is not None:
         message = f"the SELECT half is unusable: {problem}"
         if not args.allow_single_class:
+            os.makedirs(args.out, exist_ok=True)
+            with open(os.path.join(args.out, "failure.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "reason_code": "single_class_select",
+                    "message": message,
+                    "class_balance": balance,
+                    "population": sample.N,
+                    "select_n": select.n,
+                    "rate": args.rate,
+                }, handle, indent=2)
             raise SystemExit(f"[build_valset] {message}\n"
                              f"  (pass --allow-single-class to write it anyway)")
         warnings.append(message)

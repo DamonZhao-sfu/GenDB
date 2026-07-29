@@ -21,18 +21,64 @@ function finiteOrNull(value) {
 
 function objectiveFrom(outcome = {}) {
   const explicit = outcome.objective || {};
+  const details = explicit.details && typeof explicit.details === "object"
+    ? explicit.details
+    : {};
+  const fidelity = outcome.metrics?.quality || outcome.metrics?.unweighted || {};
   const fallbackF1 = finiteOrNull(outcome.f1);
+  const name = explicit.name || "f1";
+  const f1Like = ["f1", "macro_f1", "predicate_fidelity_f1"].includes(name);
+  const hasTypedObjective = outcome.objective
+    && typeof outcome.objective === "object";
   return {
-    name: explicit.name || "f1",
-    value: finiteOrNull(explicit.value) ?? fallbackF1,
-    precision: finiteOrNull(outcome.metrics?.precision),
-    recall: finiteOrNull(outcome.metrics?.recall),
+    name,
+    value: hasTypedObjective ? finiteOrNull(explicit.value) : fallbackF1,
+    precision:
+      finiteOrNull(details.precision)
+      ?? (f1Like
+        ? (finiteOrNull(outcome.metrics?.precision)
+          ?? finiteOrNull(fidelity.precision))
+        : null),
+    recall:
+      finiteOrNull(details.recall)
+      ?? (f1Like
+        ? (finiteOrNull(outcome.metrics?.recall)
+          ?? finiteOrNull(fidelity.recall))
+        : null),
     weighted: Boolean(
       explicit.weighted
       ?? outcome.metrics?.weighted
       ?? outcome.diff?.weighted,
     ),
     direction: explicit.direction === "minimize" ? "minimize" : "maximize",
+    scope: name === "query_metric_unavailable"
+      ? "unavailable"
+      : (name === "predicate_fidelity_f1"
+          ? "operator_fidelity"
+          : "query_metric"),
+    details,
+  };
+}
+
+function operatorFidelityFrom(outcome = {}) {
+  const metrics = outcome.metrics || {};
+  const quality = metrics.quality || metrics.unweighted || {};
+  return {
+    accuracy:
+      finiteOrNull(quality.accuracy)
+      ?? finiteOrNull(metrics.accuracy),
+    precision:
+      finiteOrNull(quality.precision)
+      ?? finiteOrNull(metrics.precision),
+    recall:
+      finiteOrNull(quality.recall)
+      ?? finiteOrNull(metrics.recall),
+    f1:
+      finiteOrNull(quality.f1)
+      ?? finiteOrNull(metrics.f1),
+    n: finiteOrNull(metrics.n),
+    correct: finiteOrNull(metrics.correct),
+    weighted: Boolean(metrics.weighted),
   };
 }
 
@@ -90,6 +136,33 @@ export function buildIterationFeedback({
   assertSafeDataBoundary(dataBoundary);
   const diff = scoreOutcome.diff || {};
   const metrics = scoreOutcome.metrics || {};
+  const selectedObjective = objectiveFrom(scoreOutcome);
+  const fidelity = operatorFidelityFrom(scoreOutcome);
+  const binaryObjective = ["f1", "predicate_fidelity_f1"].includes(
+    selectedObjective.name,
+  );
+  const effectiveStatus = runOutcome.status ?? scoreOutcome.status ?? "empty";
+  const errorKind = effectiveStatus !== "ok"
+    ? "execution"
+    : (binaryObjective
+        ? "classification"
+        : (["adjusted_rand_index", "macro_f1"].includes(selectedObjective.name)
+            ? "label_mismatch"
+            : "metric_specific"));
+  const fp = finiteOrNull(
+    diff.fp_total
+    ?? diff.false_positive_total
+    ?? metrics.fp
+    ?? metrics.quality?.fp
+    ?? metrics.unweighted?.fp,
+  );
+  const fn = finiteOrNull(
+    diff.fn_total
+    ?? diff.false_negative_total
+    ?? metrics.fn
+    ?? metrics.quality?.fn
+    ?? metrics.unweighted?.fn,
+  );
   const feedback = {
     schema_version: "1.0",
     query_id: String(query?.query_id ?? query?.query ?? query?.id ?? query),
@@ -113,13 +186,14 @@ export function buildIterationFeedback({
         ?? String(runOutcome.stderr || "").split("\n").slice(-40).join("\n"),
       runtime_ms: finiteOrNull(runOutcome.execMs ?? scoreOutcome.execMs),
     },
-    objective: objectiveFrom(scoreOutcome),
+    objective: selectedObjective,
+    operator_fidelity: fidelity,
     errors: {
-      false_positive_total: Number(
-        diff.fp_total ?? diff.false_positive_total ?? metrics.fp ?? 0,
-      ),
-      false_negative_total: Number(
-        diff.fn_total ?? diff.false_negative_total ?? metrics.fn ?? 0,
+      kind: errorKind,
+      false_positive_total: binaryObjective ? fp : null,
+      false_negative_total: binaryObjective ? fn : null,
+      mismatch_total: finiteOrNull(
+        diff.n_mistakes ?? diff.mismatch_total,
       ),
       mistakes: boundedMistakes(scoreOutcome, sampleCap),
     },

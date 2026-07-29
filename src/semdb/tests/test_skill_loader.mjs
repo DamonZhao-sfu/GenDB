@@ -20,6 +20,40 @@ for (const config of [planner, generator, optimizer]) {
   assert.ok(skill.prompt.includes("statically bound"));
 }
 
+const plannerSkill = await loadAgentSkill(planner.skillPath, planner.skillName);
+for (const primitive of [
+  "classify_multi",
+  "detect_open",
+  "regions_propose",
+  "pair_score",
+  "topk_similar",
+  "topk_text",
+]) {
+  assert.ok(
+    plannerSkill.body.includes(`\`${primitive}\``),
+    `Planner skill preserves vis-operator guidance for ${primitive}`,
+  );
+}
+
+const generatorSkill = await loadAgentSkill(generator.skillPath, generator.skillName);
+assert.ok(generatorSkill.body.includes("semextract.resolve_image_path"));
+assert.ok(generatorSkill.body.includes("vadar.predefined_text"));
+assert.ok(generatorSkill.body.includes("branch counters"));
+
+const optimizerSkill = await loadAgentSkill(optimizer.skillPath, optimizer.skillName);
+for (const metric of [
+  "adjusted_rand_index",
+  "relative_error",
+  "spearman_correlation",
+  "macro_f1",
+]) {
+  assert.ok(
+    optimizerSkill.body.includes(`\`${metric}\``),
+    `Optimizer skill has query-specific guidance for ${metric}`,
+  );
+}
+assert.ok(optimizerSkill.body.includes("must never replace"));
+
 assert.equal(await loadBoundAgentSkill(planner, false), null);
 
 const root = await mkdtemp(resolve(tmpdir(), "semdb-skills-"));

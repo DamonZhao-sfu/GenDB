@@ -139,6 +139,35 @@ def _gt_path(scenario: str, qid: int, gt_dir: str | Path, scale_factor: Optional
 
 
 def _load_gt(scenario: str, qid: int, gt_dir: str | Path, scale_factor: Optional[int]) -> pd.DataFrame:
+    # SemBench's CarsEvaluator generates Q10 from the labeled full tables *after*
+    # filtering them to the requested scale-factor sample. The shipped plain Q10.csv
+    # is mutable evaluator output and may belong to a previous run at another scale.
+    # Reconstructing it here reproduces the native evaluator and prevents a stale
+    # 19,657-row file from being scored against sf_9836's 9,828 complaints.
+    if scenario == "cars" and qid == 10 and scale_factor is not None:
+        root = Path(gt_dir).resolve().parents[1]
+        sf = int(scale_factor)
+        sample_dir = root / "data" / f"sf_{sf}"
+        sample_text = sample_dir / f"text_complaints_data_{sf}.csv"
+        sample_cars = sample_dir / f"car_data_{sf}.csv"
+        full_dir = root / "data" / "full_data"
+        full_text = full_dir / "text_complaints_data_full.csv"
+        full_cars = full_dir / "car_data_full.csv"
+        if all(path.exists() for path in
+               (sample_text, sample_cars, full_text, full_cars)):
+            text_ids = set(pd.read_csv(sample_text, usecols=["complaint_id"])
+                           ["complaint_id"])
+            car_ids = set(pd.read_csv(sample_cars, usecols=["car_id"])["car_id"])
+            text = pd.read_csv(
+                full_text, usecols=["complaint_id", "car_id", "component_class"])
+            cars = pd.read_csv(full_cars, usecols=["car_id"])
+            text = text[text["complaint_id"].isin(text_ids)]
+            cars = cars[cars["car_id"].isin(car_ids)]
+            gt = cars.join(text.set_index("car_id"), on="car_id", how="inner")[
+                ["car_id", "component_class"]]
+            gt["component_class"] = gt["component_class"].apply(
+                lambda value: str(value).lower())
+            return gt.rename(columns={"component_class": "problem_category"}).reset_index()
     return _read_csv_safe(_gt_path(scenario, qid, gt_dir, scale_factor))
 
 
@@ -636,15 +665,31 @@ def _limit_balanced_id_set(
 
 
 def _macro_f1(system_results: pd.DataFrame, ground_truth: pd.DataFrame, id_column: str, result_column: str) -> Dict[str, Any]:
-    # Faithful SemBench Q10 behavior: sort each frame independently by id and feed
-    # the label vectors to sklearn.  In particular, unequal result lengths raise
-    # ValueError instead of being silently padded or intersected.
+    # Faithful SemBench Q10 behavior for valid output: sort each frame independently
+    # by id and feed the label vectors to sklearn. Invalid/missing ids are outer-
+    # aligned below so they score as errors instead of aborting the benchmark.
     gt_sorted = ground_truth.sort_values(by=id_column)
     query_sorted = system_results.sort_values(by=id_column)
-    y_true = gt_sorted[result_column]
-    y_pred = query_sorted[result_column]
+    gt_ids_ordered = gt_sorted[id_column].astype(str).tolist()
+    query_ids_ordered = query_sorted[id_column].astype(str).tolist()
+    if gt_ids_ordered == query_ids_ordered:
+        y_true = gt_sorted[result_column]
+        y_pred = query_sorted[result_column]
+    else:
+        # Invalid/incomplete output should receive a poor score, not an opaque
+        # sklearn length exception. Pair duplicate ids by occurrence, outer-align,
+        # and use impossible sentinel labels for missing predictions/ground truth.
+        left = gt_sorted[[id_column, result_column]].copy()
+        right = query_sorted[[id_column, result_column]].copy()
+        left["_occurrence"] = left.groupby(id_column).cumcount()
+        right["_occurrence"] = right.groupby(id_column).cumcount()
+        aligned = left.merge(
+            right, on=[id_column, "_occurrence"], how="outer",
+            suffixes=("_true", "_pred"))
+        y_true = aligned[f"{result_column}_true"].fillna("__unexpected_prediction__")
+        y_pred = aligned[f"{result_column}_pred"].fillna("__missing_prediction__")
     precision, recall, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro")
+        y_true, y_pred, average="macro", zero_division=0)
     gt_ids = set(ground_truth[id_column])
     query_ids = set(system_results[id_column])
     covered = len(gt_ids & query_ids)

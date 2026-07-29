@@ -43,6 +43,56 @@ Treat the primitive implementation files as authoritative. Never invent a functi
 - Reject silent fallback to a different semantic predicate.
 - Mark a plan `not_compilable` when required information or capability is unavailable.
 
+## Preserve the vis-operator physical-operator repertoire
+
+For image sites, select primitives using the same rules as the legacy VADAR agents:
+
+- Use `classify` for a small visual enum, `classify_multi` when one image can contain
+  several enum values, and `domain_classify` when a documented domain specialist fits.
+- Use `best_ocr_match` or `read_text` for legible names and wordmarks. For a large
+  runtime value space, use `topk_text` to shortlist candidates before verification.
+- Use `dominant_colors` for colors. Use `detect` only for its documented closed
+  vocabulary and `detect_open` for an open-vocabulary object. A `detect` result is a
+  sub-image that may be classified, scored, cropped, or OCRed; use `bbox` only when
+  coordinates are part of the physical plan.
+- Use `verify_property` for a boolean visual property. Use the corresponding
+  `classify_detail`, `verify_detail`, `detect_detail`, `ocr_detail`, or
+  `best_ocr_match_detail` primitive only when the plan needs a comparable confidence
+  for gating, ranking, or threshold optimization.
+- Use `regions_center` for product-photo margins, `regions_grid` for a systematic
+  scan, and `regions_propose` for several distinct foreground objects. Use `crop` for
+  a known layout. Plan region work only when whole-image evidence is too coarse.
+- Use `pair_score` for an image-to-image predicate. Use `topk_similar` for one-to-many
+  ranking rather than repeated pair calls. Use `score` for image-to-short-text
+  relevance and `embed` when the plan benefits from reusable image vectors.
+- When one target is rare among many images, plan a cheap kind/property gate before
+  expensive OCR, open-vocabulary detection, or region decomposition.
+- Keep CLIP prompts short and visual. Decompose long natural-language predicates into
+  category, color, presence, OCR, and relational checks instead of passing the whole
+  query to one primitive.
+- Resolve image references through the supplied offline image adapter and reuse one
+  encoder context per process.
+
+For text sites, compose `normalize`, phrase/all/any predicates, lexical matching,
+`classify_detail`, `classify_multi_detail`, `classify_movie_genres`,
+`has_movie_genres`,
+`destination_in_region`, regex extraction,
+`extract_person_names`, value splitting, numeric/date parsing, and Python
+standard-library logic.
+`classify_multi_detail` preserves an explicit multi-label SQL/runtime value space;
+`classify_movie_genres` supplies a repository-local general movie-genre taxonomy;
+`has_movie_genres` evaluates conjunctive genre predicates such as romantic comedy;
+`destination_in_region` supplies repository-local airport geography for Germany and
+Europe and fails closed for unknown regions. Read other closed value spaces from
+runtime CSV columns. Do not replace an implicit semantic predicate with an unrelated
+keyword rule; declare a bounded approximation and its limitation, or mark the site
+not compilable.
+
+For a cast/person extraction followed by a strict relational intersection,
+`extract_person_names` may produce conservative proper-name candidates and let the
+SQL `COUNT(DISTINCT ...)`/intersection disambiguate them. Do not require a literal
+"cast:" marker when the description explicitly names performers in prose.
+
 ## Replan from evidence
 
 Preserve all unaffected plan sections. Increment `plan_version`, set `parent_plan_version`, and change only what the optimizer evidence supports.

@@ -9,7 +9,13 @@ function plan(version = 1) {
   return { query_id: "q", plan_version: version };
 }
 
-async function scenario({ actions, scores, hasValidationSignal = true, maxReplans = 1 }) {
+async function scenario({
+  actions,
+  scores,
+  hasValidationSignal = true,
+  maxReplans = 1,
+  replanCompilability = null,
+}) {
   const runDir = await mkdtemp(resolve(tmpdir(), "semdb-pgo-"));
   const calls = {
     planner: 0,
@@ -34,7 +40,11 @@ async function scenario({ actions, scores, hasValidationSignal = true, maxReplan
     },
     replan: async ({ previousPlan }) => {
       calls.replan++;
-      return plan(previousPlan.plan_version + 1);
+      const next = plan(previousPlan.plan_version + 1);
+      if (replanCompilability) {
+        next.compilability = { class: replanCompilability };
+      }
+      return next;
     },
     generateCandidate: async ({
       iteration, iterDir, plan: currentPlan, parentCandidate,
@@ -69,21 +79,24 @@ async function scenario({ actions, scores, hasValidationSignal = true, maxReplan
       scores[candidate.iteration]?.run
       ?? { status: "ok", execMs: 1 }
     ),
-    scoreCandidate: async (candidate, run) => ({
-      status: run.status,
-      stage: run.stage,
-      f1: scores[candidate.iteration]?.f1 ?? null,
-      objective: {
-        name: "f1",
-        value: scores[candidate.iteration]?.f1 ?? null,
-        direction: "maximize",
-      },
-      metrics: {
-        precision: scores[candidate.iteration]?.f1 ?? null,
-        recall: scores[candidate.iteration]?.f1 ?? null,
-      },
-      diff: { fp_total: 0, fn_total: 0, mistakes: [] },
-    }),
+    scoreCandidate: async (candidate, run) => {
+      const score = scores[candidate.iteration] || {};
+      return {
+        status: run.status,
+        stage: run.stage,
+        f1: score.f1 ?? null,
+        objective: score.objective || {
+          name: "f1",
+          value: score.f1 ?? null,
+          direction: "maximize",
+        },
+        metrics: {
+          precision: score.f1 ?? null,
+          recall: score.f1 ?? null,
+        },
+        diff: { fp_total: 0, fn_total: 0, mistakes: [] },
+      };
+    },
     promoteCandidate: async (candidate) => {
       calls.promoted = candidate.candidate_id;
     },
@@ -115,6 +128,25 @@ const noSignal = await scenario({
 assert.equal(noSignal.calls.generator.length, 1);
 assert.equal(noSignal.calls.optimizer, 0);
 
+const unavailableMetric = await scenario({
+  actions: ["PATCH_CODE"],
+  scores: [{
+    f1: 0.99,
+    objective: {
+      name: "query_metric_unavailable",
+      value: null,
+      direction: "maximize",
+      details: { reason: "multi-site query" },
+    },
+  }],
+  hasValidationSignal: true,
+});
+assert.equal(unavailableMetric.calls.generator.length, 1);
+assert.equal(unavailableMetric.calls.optimizer, 0,
+  "a successful candidate without a query-specific metric remains single-shot");
+assert.equal(unavailableMetric.result.bestObjective.name, "query_metric_unavailable");
+assert.equal(unavailableMetric.result.bestObjective.value, null);
+
 const compileRepair = await scenario({
   actions: ["PATCH_CODE"],
   scores: [
@@ -134,5 +166,44 @@ const budget = await scenario({
 assert.equal(budget.calls.replan, 1);
 assert.equal(budget.calls.generator.length, 2);
 assert.equal(budget.result.replansUsed, 1);
+
+const rejectedReplan = await scenario({
+  actions: ["REPLAN"],
+  scores: [{ f1: 0.4 }],
+  replanCompilability: "not_compilable",
+});
+assert.equal(rejectedReplan.calls.replan, 1);
+assert.equal(rejectedReplan.calls.generator.length, 1,
+  "a rejected replan does not enter the Generator");
+assert.equal(rejectedReplan.calls.promoted, "q-iter-0",
+  "the best runnable candidate survives a not-compilable replan");
+
+const ariSelection = await scenario({
+  actions: ["PATCH_CODE"],
+  scores: [
+    {
+      f1: 0.9,
+      objective: {
+        name: "adjusted_rand_index",
+        value: 0.2,
+        direction: "maximize",
+        details: { metric_type: "adjusted-rand-index" },
+      },
+    },
+    {
+      f1: 0.1,
+      objective: {
+        name: "adjusted_rand_index",
+        value: 0.7,
+        direction: "maximize",
+        details: { metric_type: "adjusted-rand-index" },
+      },
+    },
+  ],
+});
+assert.equal(ariSelection.result.bestIter, 1,
+  "PGO candidate selection follows ARI rather than the legacy F1 field");
+assert.equal(ariSelection.result.bestObjective.name, "adjusted_rand_index");
+assert.equal(ariSelection.result.bestObjective.value, 0.7);
 
 console.log("test_pgo_loop OK");

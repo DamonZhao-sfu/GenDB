@@ -26,6 +26,45 @@ If the plan is `not_compilable`, stop without generating a misleading program.
 9. Handle individual row/pair failures without corrupting unrelated results.
 10. Leave candidate metadata for the orchestrator to hash and finalize.
 
+## Implement the vis-operator runtime patterns
+
+For image plans:
+
+- Create one shared `semvision` encoder context and wrap resolved paths with
+  `imagepatch.ImagePatch`. Resolve filenames/URIs with
+  `semextract.resolve_image_path`; do not assume the process working directory.
+- Implement small enums with `classify`, multi-valued fields with `classify_multi`,
+  wordmarks with `best_ocr_match`, colors with `dominant_colors`, closed-vocabulary
+  objects with `detect`, and open-vocabulary objects with `detect_open`. Treat
+  `detect` hits as sub-images and preserve `bbox` coordinates when requested.
+- Implement whole-image-to-region fallback exactly when the plan requests it:
+  `regions_center`, `regions_grid`, `regions_propose`, or `crop`. Do not substitute
+  blind grids for content proposals.
+- Use `pair_score` for image pairs, `topk_similar` for one-to-many image retrieval,
+  `topk_text` before verifying a large text label space, `score` for
+  image-to-short-text relevance, and `embed` for reusable vectors.
+- Use `classify_detail`, `verify_detail`, `detect_detail`, `ocr_detail`, and
+  `best_ocr_match_detail` confidence only within the primitive that produced it.
+  Never compare confidence values from different primitive families.
+- Preserve a planned cheap gate before expensive OCR, open-vocabulary detection, or
+  region decomposition.
+- Keep CLIP phrases short; realize a long predicate as the plan's explicit helper DAG.
+
+For text plans, use ordinary strings plus the exact functions exported by
+`vadar.predefined_text` and Python standard-library regex/numeric/date operations.
+Do not import `semtext`, `TextPatch`, a model SDK, or a semantic service.
+
+Every solver must:
+
+- accept `<out.csv> --data-dir <dir>`, optional `--only-ids`, and the documented image
+  arguments when applicable;
+- form the correct row/pair/tuple validation unit before applying `--only-ids`;
+- emit a trace entry for both positive and negative decisions;
+- preserve duplicate rows and ordered-pair/diagonal semantics from the plan;
+- keep branch counters to at most eight short names, cap repeated per-row warnings,
+  print aggregate branch/warning counts and elapsed time to stderr, and isolate one
+  bad row/pair without aborting unrelated work.
+
 ## Apply optimizer actions
 
 For `PATCH_CODE`, edit only the named artifact or symbol and preserve every listed invariant. Use the parent candidate as the starting point.

@@ -26,11 +26,16 @@ export function classifyValidationCapability(validationPlan, options = {}) {
     };
   }
   if (unit === "row" || unit === "pair") {
+    const composition = candidate.composition?.kind || null;
     return {
       ...common,
       class: "executable",
-      reason_code: `${unit}_validation_frame`,
-      reason: `SemDB has a leakage-safe ${unit} validation-frame path.`,
+      reason_code: composition
+        ? `${unit}_${composition}_validation_frame`
+        : `${unit}_validation_frame`,
+      reason: composition
+        ? `SemDB has a leakage-safe ${unit} frame and typed ${composition} Oracle label.`
+        : `SemDB has a leakage-safe ${unit} validation-frame path.`,
       obligations: [],
     };
   }

@@ -44,3 +44,19 @@ def test_scenario_diff_id_sets(tmp_path, monkeypatch):
     pred = tmp_path / "pred.csv"; pred.write_text("id\n1\n2\n9\n")   # 9 fp, 3 fn
     d = E._scenario_diff(str(pred), str(tmp_path), "movie", "q1", "", 15)
     assert d["false_positives"] == ["9"] and d["false_negatives"] == ["3"]
+
+
+def test_scenario_diff_uses_shared_named_id_not_ground_truth_index(tmp_path,
+                                                                   monkeypatch):
+    import types, sys as _sys
+    import pandas as pd
+    fake = types.ModuleType("scenario_metrics")
+    fake._gt_path = lambda *args: str(tmp_path / "unused.csv")
+    fake._load_gt = lambda *args: pd.DataFrame({
+        "index": [40, 41], "car_id": [1, 2], "label": ["a", "b"]})
+    monkeypatch.setitem(_sys.modules, "scenario_metrics", fake)
+    pred = tmp_path / "pred-cars.csv"
+    pred.write_text("car_id,label\n1,a\n9,x\n")
+    d = E._scenario_diff(str(pred), str(tmp_path), "cars", "q10", "2", 15)
+    assert d["false_positives"] == ["9"]
+    assert d["false_negatives"] == ["2"]

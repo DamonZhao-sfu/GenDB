@@ -27,3 +27,16 @@ def test_duplicate_logical_ids_receive_distinct_source_ordinals(tmp_path):
         filter_col="id", filter_value="m")
     assert out.stat().st_mtime_ns == written_ns
     assert cached["spec"] == meta["spec"]
+
+
+def test_filter_accepts_a_proven_literal_value_set(tmp_path):
+    source = tmp_path / "movies.csv"
+    source.write_text("title,text\nA,one\nB,two\nC,three\n", encoding="utf-8")
+    out = tmp_path / "selected.csv"
+    PF.build_frame(
+        str(source), str(out), text_cols=["text"], filter_col="title",
+        filter_values=["A", "C"])
+    with open(out, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["_semdb_row_id"], row["title"]) for row in rows] == [
+        ("0", "A"), ("2", "C")]

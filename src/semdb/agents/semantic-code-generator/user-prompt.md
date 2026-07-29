@@ -14,6 +14,10 @@ Tables and data paths:
 
 {{tables_doc}}
 
+Authoritative local primitive files:
+
+{{local_primitive_files}}
+
 SemDB runtime directory: `{{semdb_dir}}`
 
 Import contract:

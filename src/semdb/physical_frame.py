@@ -19,7 +19,11 @@ PHYSICAL_ID = "_semdb_row_id"
 
 def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
                 filter_col: str | None = None,
-                filter_value: str | None = None) -> dict:
+                filter_value: str | None = None,
+                filter_values: list[str] | None = None) -> dict:
+    accepted_values = list(filter_values or [])
+    if filter_value is not None:
+        accepted_values.append(str(filter_value))
     source_stat = os.stat(corpus)
     spec = {
         "version": 1,
@@ -29,7 +33,7 @@ def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
             "mtime_ns": source_stat.st_mtime_ns,
         },
         "text_cols": text_cols or [],
-        "filter": ({filter_col: filter_value} if filter_col else None),
+        "filter": ({filter_col: accepted_values} if filter_col else None),
     }
     try:
         with open(out + ".meta.json", encoding="utf-8") as handle:
@@ -54,7 +58,7 @@ def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
 
     framed = []
     for source_index, source in enumerate(rows):
-        if filter_col and str(source.get(filter_col, "")) != str(filter_value):
+        if filter_col and str(source.get(filter_col, "")) not in accepted_values:
             continue
         row = {PHYSICAL_ID: str(source_index), **source}
         if text_cols:
@@ -81,7 +85,7 @@ def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
         "output_rows": len(framed),
         "physical_id_col": PHYSICAL_ID,
         "identity": "zero-based source CSV record ordinal",
-        "filter": ({filter_col: filter_value} if filter_col else None),
+        "filter": ({filter_col: accepted_values} if filter_col else None),
         "text_cols": text_cols or [],
     }
     with open(out + ".meta.json", "w", encoding="utf-8") as handle:
@@ -97,13 +101,13 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--text-col", action="append", default=[])
     parser.add_argument("--filter-col")
-    parser.add_argument("--filter-value")
+    parser.add_argument("--filter-value", action="append", default=[])
     args = parser.parse_args()
-    if bool(args.filter_col) != (args.filter_value is not None):
+    if bool(args.filter_col) != bool(args.filter_value):
         parser.error("--filter-col and --filter-value must be supplied together")
     build_frame(
         args.corpus, args.out, text_cols=args.text_col,
-        filter_col=args.filter_col, filter_value=args.filter_value,
+        filter_col=args.filter_col, filter_values=args.filter_value,
     )
     return 0
 

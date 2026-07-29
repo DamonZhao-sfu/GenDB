@@ -60,3 +60,21 @@ def test_boolean_multi_site_query_uses_one_ordered_root_tuple():
     assert candidate["base"] == "images"
     assert candidate["arity"] == 3
     assert candidate["composition"]["kind"] == "boolean_and"
+
+
+def test_filter_then_extract_uses_one_typed_pair_label():
+    sql = f"""WITH matched AS (
+      SELECT t.id, i.uri, i.ref FROM tracks t, images i
+      WHERE AI.IF(('logo?', t.name, i.uri), {TAIL})
+    )
+    SELECT id, uri, AI.GENERATE(('color?', m.ref), {TAIL}) FROM matched m"""
+    candidate = VP.build_plan(sql)["candidate"]
+    assert candidate["unit"] == "pair"
+    assert candidate["aliases"] == ["t", "i"]
+    assert candidate["composition"] == {
+        "kind": "filter_then_extract",
+        "gate_site": "s0",
+        "value_site": "s1",
+        "negative_value": "no_match",
+        "positive_prefix": "match:",
+    }

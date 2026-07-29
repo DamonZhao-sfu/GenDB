@@ -11,6 +11,7 @@
     "iteration",
     "execution",
     "objective",
+    "operator_fidelity",
     "errors",
     "runtime_branches",
     "history",
@@ -42,7 +43,16 @@
     "objective": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["name", "value", "precision", "recall", "weighted"],
+      "required": [
+        "name",
+        "value",
+        "precision",
+        "recall",
+        "weighted",
+        "direction",
+        "scope",
+        "details"
+      ],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "value": {
@@ -55,16 +65,75 @@
           "anyOf": [{ "type": "number" }, { "type": "null" }]
         },
         "weighted": { "type": "boolean" },
-        "direction": { "enum": ["maximize", "minimize"] }
+        "direction": { "enum": ["maximize", "minimize"] },
+        "scope": {
+          "enum": ["query_metric", "operator_fidelity", "unavailable"]
+        },
+        "details": { "type": "object" }
+      }
+    },
+    "operator_fidelity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "n",
+        "correct",
+        "weighted"
+      ],
+      "properties": {
+        "accuracy": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "precision": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "recall": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "f1": {
+          "anyOf": [{ "type": "number" }, { "type": "null" }]
+        },
+        "n": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        },
+        "correct": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        },
+        "weighted": { "type": "boolean" }
       }
     },
     "errors": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["false_positive_total", "false_negative_total", "mistakes"],
+      "required": [
+        "kind",
+        "false_positive_total",
+        "false_negative_total",
+        "mismatch_total",
+        "mistakes"
+      ],
       "properties": {
-        "false_positive_total": { "type": "integer", "minimum": 0 },
-        "false_negative_total": { "type": "integer", "minimum": 0 },
+        "kind": {
+          "enum": [
+            "classification",
+            "label_mismatch",
+            "metric_specific",
+            "execution"
+          ]
+        },
+        "false_positive_total": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        },
+        "false_negative_total": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        },
+        "mismatch_total": {
+          "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }]
+        },
         "mistakes": {
           "type": "array",
           "items": { "type": "object" }

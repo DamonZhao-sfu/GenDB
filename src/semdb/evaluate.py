@@ -278,7 +278,10 @@ def weighted_quality(labels, pred_rows, weights):
         else:
             tn += w
     precision, recall = _rate(tp, tp + fp), _rate(tp, tp + fn)
-    f1 = None
+    # SemBench's retrieval scorer defines the no-positive-prediction and
+    # double-empty cases as F1=0.0.  Keep precision/recall nullable for diagnostic
+    # honesty, but never turn a valid zero-quality query objective into "no signal".
+    f1 = 0.0
     if precision is not None and recall is not None and (precision + recall) > 0:
         f1 = round(2 * precision * recall / (precision + recall), 4)
     return {
@@ -305,8 +308,24 @@ EXACT_SINGLE_RESULT_RETRIEVAL = {
 ARI_REFINEMENT = {("ecomm", q) for q in (3, 4, 5, 6)}
 MACRO_F1_REFINEMENT = {("cars", 10), ("medical", 10)}
 RANKING_REFINEMENT = {("movie", 9), ("movie", 10)}
+# Queries whose official SemBench metric is retrieval/F1 and whose SELECT
+# validation unit provides the corresponding membership decisions.  Keep this
+# registry explicit: falling through to a generic predicate score must never make
+# an unknown or unsupported query look as though it has an official F1 objective.
+F1_REFINEMENT = (
+    {("mmqa", q) for q in range(1, 8)}
+    | {("movie", q) for q in (1, 2, 5, 6, 7)}
+    | {("animals", q) for q in range(5, 10)}
+    | {("cars", q) for q in (1, 2, 3, 6, 7, 8, 9)}
+    | {("medical", q) for q in (1, 2, 3, 6, 7, 8, 9)}
+    | {("ecomm", q) for q in (1, 2, 7, 8, 9, 10, 11, 12, 13, 14)}
+)
 MULTISITE_QUERY_OBJECTIVE_UNAVAILABLE = {
     ("movie", 8), ("cars", 5), ("medical", 5),
+}
+UNSUPPORTED_QUERY_METRIC = {
+    # The current SemBench MedicalEvaluator dispatches Q1-Q10 only.
+    ("medical", 11),
 }
 
 
@@ -345,6 +364,28 @@ def _column(row, wanted):
 
 def _sample_weight(weights, rid):
     return float(weights.get(str(rid), weights.get(rid, 1.0)))
+
+
+def _multi_label_set(value):
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        parts = value
+    else:
+        text = str(value).strip().strip("[]")
+        parts = re.split(r"[,;|]", text)
+    aliases = {
+        "sci fi": "science fiction",
+        "sci-fi": "science fiction",
+        "biographical": "biography",
+    }
+    out = set()
+    for part in parts:
+        label = str(part).strip().strip("'\"").lower().replace("_", " ")
+        label = " ".join(label.split())
+        if label:
+            out.add(aliases.get(label, label))
+    return out
 
 
 def _top_group(labels, pred_rows, weights, corpus_rows, group_columns, id_col):
@@ -465,6 +506,96 @@ def inference_objective(benchmark, query, labels, pred_rows, weights,
     population whenever the trace and corpus columns make that possible.
     """
     key = (str(benchmark or "").lower(), _query_number(query))
+    query_name = str(query).lower().lstrip("q")
+    if key[0] == "mmqa" and query_name == "4":
+        tp = fp = fn = 0.0
+        for rid, expected in labels.items():
+            weight = _sample_weight(weights, rid)
+            expected_set = _multi_label_set(expected)
+            predicted_set = _multi_label_set(
+                pred_rows.get(str(rid), pred_rows.get(rid)))
+            tp += weight * len(expected_set & predicted_set)
+            fp += weight * len(predicted_set - expected_set)
+            fn += weight * len(expected_set - predicted_set)
+        precision = tp / (tp + fp) if tp + fp else None
+        recall = tp / (tp + fn) if tp + fn else None
+        f1 = 0.0
+        if precision is not None and recall is not None and precision + recall:
+            f1 = 2 * precision * recall / (precision + recall)
+        return _objective(
+            "f1", f1, "maximize",
+            metric_family="QueryMetricRetrieval",
+            variant="multi_label_genre_tuple_f1",
+            precision=None if precision is None else round(precision, 6),
+            recall=None if recall is None else round(recall, 6),
+            f1_score=round(f1, 6),
+            tp=round(tp, 6), fp=round(fp, 6), fn=round(fn, 6),
+            validation_scope="per_movie_genre_membership")
+    if key[0] == "mmqa" and query_name == "5":
+        expected_rows = [_multi_label_set(value) for value in labels.values()]
+        predicted_rows = [
+            _multi_label_set(pred_rows.get(str(rid), pred_rows.get(rid)))
+            for rid in labels
+        ]
+        expected_common = set.intersection(*expected_rows) if expected_rows else set()
+        predicted_common = set.intersection(*predicted_rows) if predicted_rows else set()
+        tp = len(expected_common & predicted_common)
+        fp = len(predicted_common - expected_common)
+        fn = len(expected_common - predicted_common)
+        precision = tp / (tp + fp) if tp + fp else None
+        recall = tp / (tp + fn) if tp + fn else None
+        f1 = 0.0
+        if precision is not None and recall is not None and precision + recall:
+            f1 = 2 * precision * recall / (precision + recall)
+        return _objective(
+            "f1", f1, "maximize",
+            metric_family="QueryMetricRetrieval",
+            variant="cross_document_person_intersection_f1",
+            precision=None if precision is None else round(precision, 6),
+            recall=None if recall is None else round(recall, 6),
+            f1_score=round(f1, 6),
+            expected=sorted(expected_common), predicted=sorted(predicted_common),
+            validation_scope="complete_deterministic_target_movie_frame")
+    if key[0] == "mmqa" and query_name == "2b":
+        # q2b composes logo-pair membership and color extraction. A wrong color on
+        # an actual logo is both a false positive tuple and a missed expected tuple,
+        # matching the official tuple-membership F1 rather than treating every
+        # non-"false" string as the same positive decision.
+        tp = fp = fn = 0.0
+        for rid, expected in labels.items():
+            weight = _sample_weight(weights, rid)
+            predicted = _norm(pred_rows.get(str(rid), pred_rows.get(rid, "no_match")))
+            expected = _norm(expected)
+            expected_positive = bool(expected and expected != "no_match")
+            predicted_positive = bool(predicted and predicted != "no_match")
+            if expected_positive and predicted == expected:
+                tp += weight
+            elif expected_positive and predicted_positive:
+                fp += weight
+                fn += weight
+            elif expected_positive:
+                fn += weight
+            elif predicted_positive:
+                fp += weight
+        precision = tp / (tp + fp) if tp + fp else None
+        recall = tp / (tp + fn) if tp + fn else None
+        f1 = 0.0
+        if precision is not None and recall is not None and precision + recall:
+            f1 = 2 * precision * recall / (precision + recall)
+        return _objective(
+            "f1", f1, "maximize",
+            metric_family="QueryMetricRetrieval",
+            variant="filter_then_extract_tuple_f1",
+            precision=None if precision is None else round(precision, 6),
+            recall=None if recall is None else round(recall, 6),
+            f1_score=round(f1, 6),
+            tp=round(tp, 6), fp=round(fp, 6), fn=round(fn, 6),
+            validation_scope="joint_pair_sampling_unit")
+    if key in UNSUPPORTED_QUERY_METRIC:
+        return _objective(
+            "query_metric_unavailable", None, "maximize",
+            reason="the official SemBench evaluator does not define a metric "
+                   "for this query")
     if key in MULTISITE_QUERY_OBJECTIVE_UNAVAILABLE:
         return _objective(
             "query_metric_unavailable", None, "maximize",
@@ -536,10 +667,18 @@ def inference_objective(benchmark, query, labels, pred_rows, weights,
         kind, field = AGGREGATION_REFINEMENT[key]
         return _aggregation_objective(
             kind, field, labels, pred_rows, weights, corpus_rows, id_col)
+    if key in F1_REFINEMENT:
+        return _objective(
+            "f1", quality.get("f1"), "maximize",
+            metric_family="QueryMetricRetrieval",
+            metric_type=("f1-score" if key[0] == "ecomm" else None),
+            precision=quality.get("precision"),
+            recall=quality.get("recall"),
+            f1_score=quality.get("f1"),
+            validation_scope="select_sampling_unit")
 
-    # Membership queries optimize the same F1 family as their final evaluator.
-    # For generic/unmapped queries the name explicitly says this is operator-level
-    # fidelity, preventing it from being mistaken for a query-level metric.
+    # Unknown/custom queries still expose a useful operator diagnostic, but its
+    # explicit name prevents it from being mistaken for an official query metric.
     value = quality.get("f1")
     if value is None:
         value = quality.get("accuracy")
@@ -945,7 +1084,8 @@ def _scenario_diff(pred_path, gt_dir, bench, query, sf, cap):
     import csv as _csv, importlib, re as _re
     sm = importlib.import_module("scenario_metrics")
     qid = int(_re.match(r"(\d+)", query.lstrip("qQ")).group(1))     # q3a -> 3
-    gt_path = str(sm._gt_path(bench, qid, gt_dir, int(sf) if sf else None))
+    scale = int(sf) if sf else None
+    gt_path = str(sm._gt_path(bench, qid, gt_dir, scale))
 
     def _rows(p):
         try:
@@ -954,13 +1094,26 @@ def _scenario_diff(pred_path, gt_dir, bench, query, sf, cap):
         except FileNotFoundError:
             return []
 
-    pred_rows, gt_rows = _rows(pred_path), _rows(gt_path)
-    def _idcol(rows):
-        if not rows:
-            return None
-        keys = list(rows[0].keys())
-        return "id" if "id" in keys else keys[0]
-    pc, gc = _idcol(pred_rows), _idcol(gt_rows)
+    pred_rows = _rows(pred_path)
+    if hasattr(sm, "_load_gt"):
+        gt_rows = sm._load_gt(bench, qid, gt_dir, scale).to_dict("records")
+    else:
+        gt_rows = _rows(gt_path)
+    def _shared_idcols(predicted, expected):
+        if not predicted or not expected:
+            return None, None
+        pred_map = {key.lower(): key for key in predicted[0]}
+        gt_map = {key.lower(): key for key in expected[0]}
+        shared = set(pred_map) & set(gt_map)
+        for wanted in ("id", "car_id", "patient_id", "vin", "image_id",
+                       "audio_id", "reviewid"):
+            if wanted in shared:
+                return pred_map[wanted], gt_map[wanted]
+        if shared:
+            first = next(key.lower() for key in predicted[0] if key.lower() in shared)
+            return pred_map[first], gt_map[first]
+        return None, None
+    pc, gc = _shared_idcols(pred_rows, gt_rows)
     if pc and gc:
         pred_ids = [str(r[pc]).strip() for r in pred_rows]
         gt_ids = {str(r[gc]).strip() for r in gt_rows}
