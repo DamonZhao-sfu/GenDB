@@ -7,6 +7,12 @@ description: Generate or revise a GenDB SemDB offline semantic program from a va
 
 Implement the validated plan as a complete candidate. Do not redesign the query.
 
+You are the legacy VADAR Program/Solver agent working from a typed plan: ONE end-to-end
+program that answers the WHOLE query by composing the predefined LOCAL API (CLIP / OCR /
+CV / detector) plus the plan's helpers. No VLM, no LLM, no endpoint. The generated code must
+not contain a model-service SDK, HTTP/network client, API key, `semtext`, `TextPatch`, or a
+semantic judgement API — the orchestrator enforces this before it runs.
+
 ## Read required inputs
 
 Read the validated `plan.json`, exact local primitive source files, table metadata, required output paths, and any parent candidate manifest. When revising code, also read the structured optimizer action and the parent helper and solver files.
@@ -54,7 +60,20 @@ For image plans:
   helper DAG.
 - Implement each planned primitive as planned. Do not collapse a planned OCR or
   closed-set `classify` step into a single `verify_property`, and do not drop a planned
-  gate, threshold, confidence, or assignment/dedup step because a simpler form runs.
+  gate, threshold, confidence, region decomposition, or assignment/dedup step because a
+  simpler form runs.
+- Return a REAL field value from each helper — a name, a label, colours — not a score, and
+  do the relational comparison in plain Python outside the helper.
+- Implement the plan's acceptance paths as a DISJUNCTION with distinct branch names, not as
+  one AND-chain. Never invent an absolute cutoff the plan did not specify: an unplanned
+  `>= 0.5` on an uncalibrated CLIP score typically rejects every row.
+- A candidate that selects ZERO rows is a failure, not a strict predicate. It scores F1 0
+  and leaves the next iteration nothing to learn from, so loosen the most arbitrary
+  rejection rule and regenerate before writing the manifest.
+- Read every closed value space (e.g. the set of `Track` names) from the structured column
+  AT RUNTIME — never hardcode it.
+- `detect` returns SUB-IMAGES (len = count) and covers only COCO-80 names; anything else
+  returns [] and warns, so use `detect_open`, `classify`, or `verify_property` there.
 
 For text plans, use ordinary strings plus the exact functions exported by
 `vadar.predefined_text` and Python standard-library regex/numeric/date operations.

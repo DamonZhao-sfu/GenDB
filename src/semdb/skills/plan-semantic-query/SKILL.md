@@ -7,11 +7,38 @@ description: Plan GenDB SemDB semantic SQL operators into a typed, offline-execu
 
 Produce a typed semantic plan. Do not write implementation code.
 
+You carry both legacy VADAR planning roles at once: the **Signature agent** proposing the
+helper methods over the fixed predefined API, and the **API agent** specifying each
+helper's implementation as a composition of predefined primitives. The helper DAG you emit
+IS the implementation spec — the Generator transcribes it literally.
+
 ## Read required inputs
 
 Read the query SQL and natural-language description, table metadata, local primitive implementations, trace contract, and output schema. On a replan, also read the previous plan and the optimizer action.
 
-Treat the primitive implementation files as authoritative. Never invent a function, parameter, return type, score meaning, or model capability.
+Treat the primitive implementation files as authoritative — `MODULES_SIGNATURES` in
+`vadar/predefined.py` for images, `MODULES_SIGNATURES_TEXT` in `vadar/predefined_text.py`
+for text. Never invent a function, parameter, return type, score meaning, or model
+capability.
+
+## Propose the helpers, then specify their implementations
+
+- Build MINORLY on the existing API. Add a helper ONLY when a combination of existing
+  primitives is not already enough, and propose the FEWEST helpers necessary — for a text
+  plan, 1-3 general helpers is typical.
+- Every visual helper takes `image` first. Every helper returns a real field VALUE — a name,
+  a label, a colour list — not a score and not an opaque verdict. `logo_name(image, names)`
+  and `is_racetrack_logo(image)` are the right shape; `pair_predicate_holds(track, image)`
+  is not, because it buries the inferred value where neither the trace nor the optimizer
+  can see it.
+- Keep helpers general and reusable across the corpus's queries, not fitted to one row.
+- Each helper's `primitive_steps` composes ONLY predefined primitives and helpers already
+  defined earlier in the DAG.
+- Keep the relational comparison of an inferred value against a row's column outside the
+  visual helper: the helper infers, Python compares.
+- For a cross-table pair site the visual inference usually depends only on the IMAGE — plan
+  one inference per image, cached by image key, then evaluate the relational condition per
+  pair. A 13 x 200 frame then costs 200 visual calls, not 2600.
 
 ## Build the plan
 
@@ -63,12 +90,24 @@ For image sites, select primitives using the same rules as the legacy VADAR agen
   `"the logo of " + X` it answers true for nearly every image, scoring recall 1.0 at
   precision near zero. Never bind a whole named-entity, multi-clause, or
   identity-of-a-specific-thing predicate to a single `verify_property` call.
-- Give every row-filtering image site a discriminative step (OCR or closed-set
-  `classify` over the runtime value space), a cheap gate evaluated first, and a
-  comparable confidence. Bind the `classify_detail`, `verify_detail`, `detect_detail`,
-  `ocr_detail`, or `best_ocr_match_detail` variant and record the gating threshold in
-  `confidence_signal`; a filter site with `confidence_signal: null` leaves the
-  optimizer nothing to tune.
+- Give every row-filtering image site a discriminative step that reads the identity out
+  of the image: OCR against the runtime value space, or a closed-set `classify` over
+  that space. Make it an ARGMAX so it always returns a candidate and the site produces
+  output from the first iteration.
+- Express acceptance as a DISJUNCTION of named evidence paths — an OCR hit, a raw-text
+  word overlap, a closed-set classify hit, a region fallback — not as one AND-chain of
+  thresholds. Tightening one path must not be able to empty the result.
+- Bind the `classify_detail`, `verify_detail`, `detect_detail`, `ocr_detail`, or
+  `best_ocr_match_detail` variant when a path needs a confidence, and record it in
+  `confidence_signal` together with what it is compared AGAINST. A `*_detail` score is
+  comparable across rows for that one primitive, never across primitives. State a
+  threshold as a starting point to be tuned from evidence, and prefer a comparison the
+  data defines — an argmax between competing options, or a margin between two
+  confidences from the SAME primitive — over a guessed absolute cutoff.
+- Plan the FIRST version permissive and let the optimizer tighten it from observed false
+  positives. A site that returns zero rows for every input is as broken as one that
+  returns every row: both score F1 0, and the empty one also freezes the branch counters
+  so every later iteration sees identical evidence and learns nothing.
 - When the SQL implies a near one-to-one correspondence — one logo per airline, one
   portrait per person — plan the assignment or dedup step explicitly. Independent
   per-pair matching multiplies false positives.

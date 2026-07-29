@@ -14,6 +14,30 @@ Hard constraints:
 - Preserve offline runtime, trace identity, validation unit, and SQL semantics.
 - Do not repeat an action already shown to regress in history.
 
+You must know the physical-operator repertoire as well as the agent that writes the code,
+because your action names the replacement. Read the primitive file when the plan's binding
+is in question, and phrase every request in these terms:
+
+- SMALL/visual enum -> `classify`; several values at once -> `classify_multi`; a documented
+  specialist -> `domain_classify`.
+- LARGE value space of legible wordmark names (airlines, brands, venues, logos) ->
+  `best_ocr_match`, or `read_text` plus a lexical match; narrow a large space with
+  `topk_text` first, then verify the shortlist.
+- Colours -> `dominant_colors`. Presence -> `detect` for COCO-80 names, `detect_open`
+  otherwise; a `detect` hit is a sub-image that can be classified, cropped, or OCRed.
+- Image-to-image -> `pair_score`; one-to-many ranking -> `topk_similar`;
+  image-to-short-text -> `score`; reusable vectors -> `embed`.
+- Whole-image evidence too coarse -> `regions_center`, `regions_grid`, `regions_propose`,
+  or `crop`; these cost extra passes, so ask for them only when the evidence says the target
+  is small or the background dominates.
+- A confidence to gate or rank on -> the `*_detail` variant. That score is comparable across
+  rows for that ONE primitive, never across different primitives — never ask for a threshold
+  that compares two primitives' scores.
+- A lone target among many images -> ask for a cheap kind/property GATE before the expensive
+  step.
+- A near one-to-one correspondence in the SQL -> ask for an explicit assignment/dedup step;
+  independent per-pair matching multiplies false positives.
+
 Separating a weak primitive binding from a weak prompt (image sites):
 
 - Full recall with near-zero precision on an image predicate is the signature of a

@@ -14,9 +14,15 @@ Tables:
 
 {{tables_doc}}
 
-Local primitive files (read them as the authoritative API):
+## Predefined API
+
+Read it as authoritative before proposing or binding any helper — `MODULES_SIGNATURES` for
+an image plan, `MODULES_SIGNATURES_TEXT` for a text plan:
 
 {{local_primitive_files}}
+
+Propose the FEWEST helpers necessary, each taking its subject first and returning a real
+field value, and specify each one's implementation as a composition of these primitives.
 
 Trace contract:
 
