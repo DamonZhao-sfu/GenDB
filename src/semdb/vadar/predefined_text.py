@@ -71,6 +71,46 @@ def best_lexical_match(text, options, aliases: Mapping[str, Iterable[str]] | Non
     return best
 
 
+def classify_detail(text, options,
+                    descriptions: Mapping[str, str] | None = None,
+                    aliases: Mapping[str, Iterable[str]] | None = None,
+                    default="none") -> tuple[str, float]:
+    """Bounded offline text classification over an explicit database/SQL value space.
+
+    Scores label names, caller-supplied descriptions, and aliases by token overlap.
+    This is deliberately a bounded approximation—not a claim to reproduce a remote
+    model's behavior—and returns its confidence so a plan can expose that boundary.
+    """
+    best, best_score = default, 0.0
+    for option in options:
+        candidates = [str(option)]
+        if descriptions and option in descriptions:
+            candidates.append(str(descriptions[option]))
+        if aliases:
+            candidates.extend(str(value) for value in aliases.get(option, ()))
+        score = max((lexical_score(text, candidate) for candidate in candidates),
+                    default=0.0)
+        if score > best_score:
+            best, best_score = option, score
+    return best, float(best_score)
+
+
+def extract_from_candidates(text, candidates, default="none") -> tuple[str, float]:
+    """Extract the longest candidate occurring in text, else best lexical match.
+
+    Candidate values must come from an ordinary database column or SQL literal value
+    space, never validation labels. This supports bounded entity extraction such as a
+    brand name without network access.
+    """
+    values = [str(value).strip() for value in candidates if str(value).strip()]
+    contained = [value for value in values if contains_phrase(text, value)]
+    if contained:
+        value = max(contained, key=lambda item: (len(normalize(item)), item))
+        return value, 1.0
+    value = best_lexical_match(text, values, default=default)
+    return value, lexical_score(text, value) if value != default else 0.0
+
+
 def regex_extract(text, pattern, group=1, flags=re.IGNORECASE, default="none"):
     """Return a regex capture from text, or ``default`` when it is absent."""
     match = re.search(pattern, _plain_text(text), flags)
@@ -105,6 +145,8 @@ def contains_any(text, phrases) -> bool
 def contains_all(text, phrases) -> bool
 def lexical_score(text, query) -> float
 def best_lexical_match(text, options, aliases=None, default="none")
+def classify_detail(text, options, descriptions=None, aliases=None, default="none") -> tuple[str,float]
+def extract_from_candidates(text, candidates, default="none") -> tuple[str,float]
 def regex_extract(text, pattern, group=1, flags=re.IGNORECASE, default="none")
 def split_values(text, separators=r"[,;/|]", allowed=None) -> list[str]
 '''

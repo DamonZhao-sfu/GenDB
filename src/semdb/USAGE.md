@@ -157,11 +157,12 @@ refinement deliberately.
 ### Join queries are handled automatically
 
 When `predicate.py` reports the query's AI call site is **pairwise** and the two sides
-are different tables (mmqa q2a/q2b/q7), `--val-rate` builds a cross-table pair frame
-first, then samples it — no manual `build_pairs.py` step. The val set keys on
+are different tables (mmqa q2a/q2b/q7 and EComm q8), `--val-rate` builds a
+cross-table pair frame first, then samples it — no manual `build_pairs.py` step. The
+val set keys on
 `"<structured_id>-<image_filename>"`, and the solver is told to key `trace_<q>.json` the
 same way. The frame is the complete Cartesian product, and its validation size is
-`ceil(left_rows × right_rows × val_rate)`. For q7 at sf=200 and rate 0.1 this means
+`ceil(filtered_left_rows × right_rows × val_rate)`. For q7 at sf=200 and rate 0.1 this means
 `ceil(200 × 200 × 0.1) = 4,000` labeled pairs:
 
 ```bash
@@ -174,11 +175,38 @@ node src/semdb/orchestrator.mjs --benchmark mmqa --direct --query q2a \
 ```
 | `--val-seed` | 7 | Draw seed |
 
+EComm q8 applies its ordinary
+`CHAR_LENGTH(productDescriptors.description.value) >= 3000` CTE before pairing.
+At sf250, 4 of 250 products survive, so its candidate domain is `4 × 250 = 1,000`
+description-image pairs and `--val-rate 0.05` samples 50 pairs. Inspect that frame
+without invoking the Oracle or agents:
+
+```bash
+node src/semdb/orchestrator.mjs \
+  --benchmark ecomm --sembench-dir /localhome/hza214/SemBench --sf 250 \
+  --query q8 --direct --val-rate 0.05 --val-plan-only \
+  --out src/semdb/runs/ecomm
+```
+
 The question is read from the query's own `AI.IF` / `AI.GENERATE` / `AI.CLASSIFY` call,
 so nothing is retyped. Val sets are cached under `runs/_val/<bench>-<query>/<design>/`
 and labels under `runs/_val/<bench>-<query>/labels.json`, so raising the rate re-pays
-only for rows never labeled before. Without `--endpoint` the run falls back to full
-ground-truth scoring instead of failing.
+only for rows never labeled before.
+
+Text validation uses a validation-only `_semdb_row_id` equal to the zero-based source
+CSV record ordinal. This keeps repeated physical rows distinct even when their logical
+key (for example Movie `reviewId`) is duplicated. Solvers derive the ordinal while
+reading the original CSV; SQL result projection and duplicate multiplicity are
+unchanged. Movie Q5–Q7 additionally execute the ordinary movie-id filter and
+`r1.reviewId <> r2.reviewId` before sampling ordered semantic pairs.
+
+EComm materialization also exposes `ecomm_products.csv` as the documented offline
+adapter for the SQL image-mapping and `EXTERNAL_OBJECT_TRANSFORM` chain. Planner can
+therefore compile q4/q6 against local image files. Offline text primitives expose
+bounded, confidence-bearing classification and candidate extraction, allowing q3/q5
+to compile as explicit `bounded_approximation` plans instead of falsely reporting that
+no local implementation exists. Without `--endpoint`, an explicitly requested
+`--val-rate` run fails closed rather than exposing full-ground-truth feedback.
 
 **Why `--val-score-tilt` defaults to 2.** These predicates are highly selective — ecomm
 Q2 has 5 positives in 250 rows. A uniform 20% draw expects ~1 positive, and a val set

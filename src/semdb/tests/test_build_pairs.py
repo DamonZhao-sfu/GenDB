@@ -142,6 +142,14 @@ def test_text_pair_rows_keep_role_order_and_diagonal():
     assert by_id["b-a"]["text1"] == "beta"
 
 
+def test_ordinary_cross_alias_inequality_excludes_equal_logical_values():
+    rows = BP.text_pair_rows(
+        ["0", "1", "2"], ["same copy", "same copy", "different"],
+        np.eye(3, dtype=np.float32), ordered=True, top=None,
+        exclude_equal=["review-1", "review-1", "review-2"])
+    assert {row["pair_id"] for row in rows} == {"0-2", "2-0", "1-2", "2-1"}
+
+
 # --- frame restriction -----------------------------------------------------
 
 def _write_corpus(tmp_path, n):

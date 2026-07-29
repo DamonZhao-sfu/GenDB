@@ -30,6 +30,12 @@ Treat the primitive implementation files as authoritative. Never invent a functi
 
 - Use only local, offline primitives available in the repository.
 - Keep value spaces explicit. Read closed value spaces from database columns when allowed; do not infer them from validation labels.
+- A same-input/same-output local primitive may be planned as a declared
+  `bounded_approximation` even when it cannot reproduce remote connection or model
+  controls. Record that limitation; those controls alone are not a reason to reject
+  the plan.
+- Treat supplied normalized-view and external-object adapter contracts as authoritative
+  relational equivalences.
 - Preserve ordered-pair direction and diagonal rules for self-joins.
 - Apply `--only-ids` after forming the correct validation unit and before semantic inference.
 - Require a trace entry for every evaluated validation unit, including negative decisions.

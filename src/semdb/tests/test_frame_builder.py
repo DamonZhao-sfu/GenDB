@@ -4,6 +4,7 @@ import os
 import sys
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import frame_builder as FB  # noqa: E402
@@ -71,6 +72,54 @@ def test_q9_empty_colour_is_not_confused_with_literal_na(tmp_path):
     assert meta["candidate"]["include_diagonal"] is False
     written = json.load(open(str(out) + ".meta.json"))
     assert written["output_rows"] == 2
+
+
+def test_q8_filters_the_structured_side_before_cross_pairing(tmp_path):
+    products = tmp_path / "ecomm_products.csv"
+    pd.DataFrame([
+        {"id": "1", "productDisplayName": "short shoe",
+         "description": "x" * 2999},
+        {"id": "2", "productDisplayName": "long shirt",
+         "description": "y" * 3000},
+        {"id": "3", "productDisplayName": "long bag",
+         "description": "z" * 3100},
+    ]).to_csv(products, index=False)
+    sql = f"""WITH product_selection AS (
+      SELECT * FROM fashion_product_images.STYLES_DETAILS styles_details
+      WHERE true
+        AND CHAR_LENGTH(
+          styles_details.productDescriptors.description.value) >= 3000
+    )
+    SELECT styles_details.id
+    FROM product_selection AS styles_details
+    JOIN EXTERNAL_OBJECT_TRANSFORM(
+      TABLE `fashion_product_images.IMAGES`, ['SIGNED_URL']) AS images
+      ON AI.IF(('fits?', images.ref, styles_details.productDisplayName, ' ',
+                styles_details.productDescriptors.description.value), {TAIL})"""
+    source = _write(tmp_path, "q8.sql", sql)
+    out = tmp_path / "left.csv"
+    meta = FB.build_ecomm_cross_left_frame(
+        str(products), str(source), str(out), query="q8")
+    rows = pd.read_csv(out, keep_default_na=False)
+
+    assert set(rows["id"].astype(str)) == {"2", "3"}
+    assert rows.set_index("id").loc[2, "predicate_text"].startswith("long shirt ")
+    assert meta["output_rows"] == 2
+    assert "productDescriptors.description.value" in meta["source_where"]
+    assert "styles_details.description" in meta["where"]
+
+
+def test_filtered_cross_left_builder_is_fail_closed_outside_q8(tmp_path):
+    sql = f"""WITH product_selection AS (
+      SELECT * FROM fashion_product_images.STYLES_DETAILS styles_details
+      WHERE true
+    )
+    SELECT * FROM product_selection styles_details
+    JOIN fashion_product_images.IMAGES images
+      ON AI.IF(('fits?', images.ref, styles_details.productDisplayName), {TAIL})"""
+    with pytest.raises(ValueError, match="not implemented"):
+        FB.deterministic_cross_left_spec(
+            sql, benchmark="ecomm", query="q14")
 
 
 def test_ai_inside_deterministic_prefix_is_refused():

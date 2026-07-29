@@ -12,7 +12,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
-  selectedKeyCol, predicateCol, predicateTextCols, renderFeedback, validationPlan,
+  aliasMap, predicateAliasForTable, predicateCol, predicateCols, predicateTextCols,
+  renderFeedback, selectedKeyCol, validationPlan,
 } from "../orchestrator.mjs";
 
 // --- predicateCol: the text side comes from the PREDICATE, not the header ---
@@ -37,6 +38,37 @@ assert.deepStrictEqual(
                     "row_id,Airlines,Destinations,Airport"),
   ["Airlines", "Destinations"],
   "q6 validation uses every predicate column in stable corpus-header order");
+
+// EComm q8 hides its image table inside EXTERNAL_OBJECT_TRANSFORM. The orchestrator
+// must still plan IMAGES as the image corpus and resolve the structured operand even
+// though the prompt names the image first.
+const q8Wrapped = `WITH product_selection AS (
+  SELECT * FROM fashion_product_images.STYLES_DETAILS styles_details
+)
+SELECT * FROM product_selection styles_details
+JOIN EXTERNAL_OBJECT_TRANSFORM(
+  TABLE \`fashion_product_images.IMAGES\`, ['SIGNED_URL']) AS images
+ON AI.IF(('fits?', images.ref, styles_details.productDisplayName, ' ',
+          styles_details.productDescriptors.description.value),
+         connection_id => 'x')`;
+assert.deepStrictEqual(aliasMap(q8Wrapped, "ecomm"), {
+  styles_details: "STYLES_DETAILS",
+  images: "IMAGES",
+});
+const q8Site = {
+  aliases: ["images", "styles_details"],
+  bases: ["images", "styles_details"],
+  columns: [
+    "images.ref",
+    "styles_details.productDisplayName",
+    "styles_details.productDescriptors.description.value",
+  ],
+};
+assert.strictEqual(predicateAliasForTable(q8Site, "STYLES_DETAILS"), "styles_details");
+assert.deepStrictEqual(predicateCols(q8Site, "styles_details"), [
+  "productDisplayName",
+  "productDescriptors.description.value",
+]);
 
 // --- selectedKeyCol: the structured side's key is what the query SELECTs ----
 

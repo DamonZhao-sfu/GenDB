@@ -136,7 +136,8 @@ def cross_pair_rows(left_ids: list[str], left_texts: list[str], right_ids: list[
 
 def pair_rows(ids: list[str], files: list[str], sims: np.ndarray, *,
               ordered: bool, top: int | None,
-              include_diagonal: bool = False) -> list[dict[str, str]]:
+              include_diagonal: bool = False,
+              exclude_equal: list[str] | None = None) -> list[dict[str, str]]:
     """The pair frame, optionally pruned to the `top` most similar pairs.
 
     Pruning is a real restriction of the sampling frame, not an optimisation: pairs
@@ -152,6 +153,8 @@ def pair_rows(ids: list[str], files: list[str], sims: np.ndarray, *,
     rows = []
     for k in order:
         i, j = int(iu[0][k]), int(iu[1][k])
+        if exclude_equal is not None and exclude_equal[i] == exclude_equal[j]:
+            continue
         rows.append({"pair_id": pair_id(ids[i], ids[j]), "id1": ids[i], "id2": ids[j],
                      "file1": files[i], "file2": files[j],
                      "pair_score": f"{float(scores[k]):.6f}"})
@@ -173,7 +176,8 @@ def text_similarity_matrix(texts: list[str], clip_model: str) -> np.ndarray:
 
 def text_pair_rows(ids: list[str], texts: list[str], sims: np.ndarray, *,
                    ordered: bool, top: int | None,
-                   include_diagonal: bool = False) -> list[dict[str, str]]:
+                   include_diagonal: bool = False,
+                   exclude_equal: list[str] | None = None) -> list[dict[str, str]]:
     """Text analogue of :func:`pair_rows`, retaining ordered input roles."""
     n = len(ids)
     iu = np.triu_indices(n, k=0 if include_diagonal else 1)
@@ -184,6 +188,8 @@ def text_pair_rows(ids: list[str], texts: list[str], sims: np.ndarray, *,
     rows = []
     for k in order:
         i, j = int(iu[0][k]), int(iu[1][k])
+        if exclude_equal is not None and exclude_equal[i] == exclude_equal[j]:
+            continue
         rows.append({"pair_id": pair_id(ids[i], ids[j]),
                      "id1": ids[i], "id2": ids[j],
                      "text1": texts[i], "text2": texts[j],
@@ -271,6 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--include-diagonal", action="store_true",
                     help="Include (row,row). Required when the SQL self join does not "
                          "exclude equal aliases (EComm q7).")
+    ap.add_argument("--exclude-equal-col",
+                    help="Apply the ordinary SQL predicate left.col <> right.col "
+                         "before semantic sampling.")
     ap.add_argument("--top", type=int,
                     help="Keep only the N most similar pairs. This RESTRICTS the "
                          "sampling frame: pruned pairs get inclusion probability 0 and "
@@ -313,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         "clip_model": args.clip_model,
         "ordered": args.ordered,
         "include_diagonal": args.include_diagonal,
+        "exclude_equal_col": args.exclude_equal_col,
         "top": args.top,
     }
     if args.right:
@@ -337,11 +347,14 @@ def main(argv: list[str] | None = None) -> int:
 
     left = _read_csv(args.corpus,
                      [args.id_col] + ([args.text_col] if args.text_col
-                                      else [args.image_col]))
+                                      else [args.image_col])
+                     + ([args.exclude_equal_col] if args.exclude_equal_col else []))
     left = _keep_only(left, args.id_col, args.only_ids, "left" if cross else "corpus")
     ids = [str(r[args.id_col]) for r in left]
     if len(set(ids)) != len(ids):
         raise SystemExit("row ids must be unique to form pair ids")
+    exclude_equal = ([str(r[args.exclude_equal_col]) for r in left]
+                     if args.exclude_equal_col else None)
 
     if cross:
         right = _read_csv(args.right, [args.right_id_col, args.right_image_col])
@@ -371,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
               f"{f' (keeping the top {args.top})' if args.top else ''}", file=sys.stderr)
         sims = similarity_matrix(paths, args.clip_model)
         frame = pair_rows(ids, paths, sims, ordered=args.ordered, top=args.top,
-                          include_diagonal=args.include_diagonal)
+                          include_diagonal=args.include_diagonal,
+                          exclude_equal=exclude_equal)
         fields = ["pair_id", "id1", "id2", "file1", "file2", "pair_score"]
     else:
         texts = [str(r[args.text_col]) for r in left]
@@ -385,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         sims = text_similarity_matrix(texts, args.clip_model)
         frame = text_pair_rows(
             ids, texts, sims, ordered=args.ordered, top=args.top,
-            include_diagonal=args.include_diagonal)
+            include_diagonal=args.include_diagonal,
+            exclude_equal=exclude_equal)
         fields = ["pair_id", "id1", "id2", "text1", "text2", "pair_score"]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)

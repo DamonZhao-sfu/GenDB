@@ -24,6 +24,17 @@ def test_lexical_matching_regex_and_lists():
     ]
 
 
+def test_bounded_classification_and_candidate_extraction_expose_confidence():
+    label, confidence = pt.classify_detail(
+        "soft fabric clothing worn on the feet",
+        ["Topwear", "Socks"],
+        descriptions={"Socks": "clothing worn on the feet made of soft fabric"})
+    assert label == "Socks"
+    assert confidence > 0
+    assert pt.extract_from_candidates(
+        "The new Acme Sports running shoe", ["Acme", "Acme Sports"])[0] == "Acme Sports"
+
+
 def test_api_surface_has_no_endpoint_or_semantic_judge():
     public = set(pt.MODULES_SIGNATURES_TEXT.casefold().split())
     assert "judge" not in public
