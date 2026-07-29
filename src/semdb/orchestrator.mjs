@@ -394,7 +394,10 @@ const VADAR_RUNTIME_FORBIDDEN = [
   ["endpoint/API credential",
     /--endpoint\b|--api-key\b|\.endpoint\b|\.api_?key\b|\b(?:endpoint|api_?key)\s*(?:=|[,):])/i],
   ["OpenAI client", /\b(?:from|import)\s+openai\b|\bOpenAI\s*\(/i],
-  ["HTTP/network client", /\b(?:requests|httpx|aiohttp|urllib|socket)\b/i],
+  // urllib.parse is pure string processing and is needed to reproduce SQL URI
+  // basename operations over offline metadata. Block transport APIs, not parsing.
+  ["HTTP/network client",
+    /\b(?:requests|httpx|aiohttp|urllib3|socket)\b|urllib\s*\.\s*request|\burlretrieve\b/i],
   ["shell/network escape", /\b(?:subprocess|Popen|urlopen|curl)\b|\bos\.system\s*\(/i],
 ];
 
@@ -402,6 +405,21 @@ export function offlineVadarViolations(source) {
   return VADAR_RUNTIME_FORBIDDEN
     .filter(([, pattern]) => pattern.test(source))
     .map(([label]) => label);
+}
+
+export function localImportRootViolations(sources, semdbDir = __dirname) {
+  const combined = sources.join("\n");
+  const violations = [];
+  const bareLocal = /^\s*(?:from|import)\s+(?:semvision|imagepatch|semextract|vadar)\b/im;
+  const packaged = /^\s*(?:from|import)\s+semdb(?:\.|\b)/im;
+  if (bareLocal.test(combined) && !combined.includes(JSON.stringify(semdbDir))) {
+    violations.push(`bare SemDB imports require sys.path root ${semdbDir}`);
+  }
+  const parent = dirname(semdbDir);
+  if (packaged.test(combined) && !combined.includes(JSON.stringify(parent))) {
+    violations.push(`semdb.* imports require sys.path root ${parent}`);
+  }
+  return violations;
 }
 
 function validateOfflineVadarFile(path) {
@@ -2566,6 +2584,16 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     }
     validateOfflineVadarFile(helperPath);
     validateOfflineVadarFile(solverPath);
+    const importRootViolations = localImportRootViolations([
+      readFileSync(helperPath, "utf-8"),
+      readFileSync(solverPath, "utf-8"),
+    ]);
+    if (importRootViolations.length) {
+      throw new Error(
+        `[SemDB] [${query}] generated local imports are not runnable: `
+        + importRootViolations.join("; "),
+      );
+    }
     const manifestDraft = await readJSON(manifestPath);
     if (!manifestDraft || typeof manifestDraft !== "object") {
       throw new Error(`[SemDB] [${query}] Generator wrote an invalid manifest draft`);

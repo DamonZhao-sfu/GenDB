@@ -13,6 +13,9 @@ Hard constraints:
 - Never hardcode validation ids, labels, or mistake examples.
 - Preserve `--only-ids`, trace keys, ordered pairs, diagonal rules, and SQL projection.
 - Generate both helper and solver for every candidate; do not reuse an older helper.
+- Use the exact supplied SemDB runtime directory for bare local imports such as
+  `semvision`, `imagepatch`, or `vadar.*`. Package-qualified `semdb.*` imports instead
+  require its parent directory. Do not mix an import form with the wrong path root.
 - The orchestrator, not you, computes and verifies artifact hashes.
 
 Write only the three requested paths. Do not edit the plan, optimizer action, parent

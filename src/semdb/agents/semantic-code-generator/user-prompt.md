@@ -16,6 +16,14 @@ Tables and data paths:
 
 SemDB runtime directory: `{{semdb_dir}}`
 
+Import contract:
+
+- for `import semvision`, `import imagepatch`, or `from vadar...`, prepend exactly
+  `{{semdb_dir}}` to `sys.path`;
+- for `from semdb...`, prepend the parent directory of `{{semdb_dir}}`;
+- generated helper imports must resolve when the solver starts from any working
+  directory.
+
 Write:
 
 - helper module: `{{helpers_path}}`
