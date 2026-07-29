@@ -21,3 +21,9 @@ def test_duplicate_logical_ids_receive_distinct_source_ordinals(tmp_path):
     assert [row["reviewId"] for row in rows] == ["7", "7"]
     assert meta["input_rows"] == 3
     assert meta["output_rows"] == 2
+    written_ns = out.stat().st_mtime_ns
+    cached = PF.build_frame(
+        str(source), str(out), text_cols=["reviewText"],
+        filter_col="id", filter_value="m")
+    assert out.stat().st_mtime_ns == written_ns
+    assert cached["spec"] == meta["spec"]

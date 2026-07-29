@@ -26,7 +26,8 @@
  */
 
 import { readFile, writeFile, mkdir, readdir, copyFile } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync, realpathSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
@@ -58,6 +59,7 @@ import {
 } from "./agent-runtime/contracts.mjs";
 import { runPgoLoop } from "./agent-runtime/pgo-loop.mjs";
 import { assertSelectValidationPayload } from "./agent-runtime/feedback.mjs";
+import { classifyValidationCapability } from "./validation_capability.mjs";
 
 /** SQL table-qualifier prefix for a benchmark (e.g. mmqa, cars_dataset). */
 function benchPrefix(bench) { return (BENCHMARKS[bench] && BENCHMARKS[bench].prefix) || bench; }
@@ -121,6 +123,7 @@ export function parseArgs(argv) {
     valCallSite: null,      // which AI call site to label, for a multi-predicate query
     oracleModel: null,      // labeling model; defaults to the strong image/text model
     valPlanOnly: false,     // build/cardinality-check validation frames; no Oracle/agents
+    semanticPlanOnly: false, // PGO Planner artifact only; skip Generator/Optimizer/run
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -176,6 +179,10 @@ export function parseArgs(argv) {
     else if (a === "--val-call-site" && argv[i + 1]) args.valCallSite = parseInt(argv[++i], 10);
     else if (a === "--oracle-model" && argv[i + 1]) args.oracleModel = argv[++i];
     else if (a === "--val-plan-only") args.valPlanOnly = true;
+    else if (a === "--semantic-plan-only") {
+      args.semanticPlanOnly = true;
+      args.directOptionsSpecified = true;
+    }
     else if (a === "--val-pair-top" && argv[i + 1]) args.valPairTop = parseInt(argv[++i], 10);
     else if (a === "--no-refine") args.noRefine = true;
   }
@@ -183,6 +190,9 @@ export function parseArgs(argv) {
     throw new Error(
       `--agent-architecture must be "legacy" or "pgo" (got "${args.agentArchitecture}")`,
     );
+  }
+  if (args.semanticPlanOnly && args.agentArchitecture !== "pgo") {
+    throw new Error("--semantic-plan-only requires --agent-architecture pgo");
   }
   if (!Number.isInteger(args.maxReplans) || args.maxReplans < 0) {
     throw new Error("--max-replans must be a non-negative integer");
@@ -422,13 +432,32 @@ function validateOfflineVadarFile(path) {
  * fails closed when --val-rate was explicitly requested, preventing accidental
  * full-ground-truth feedback.
  */
+export function validationCorpusFingerprint(corpusPath) {
+  try {
+    const stat = statSync(corpusPath);
+    const identity = [
+      realpathSync(corpusPath),
+      String(stat.size),
+      String(stat.mtimeMs),
+    ].join("\0");
+    return createHash("sha256").update(identity).digest("hex").slice(0, 16);
+  } catch {
+    return createHash("sha256")
+      .update(resolve(corpusPath))
+      .digest("hex")
+      .slice(0, 16);
+  }
+}
+
 export function buildValSet(args, query, spec) {
+  const corpusFingerprint = validationCorpusFingerprint(spec.corpusCsv);
   const key = [args.valMethod, args.valRate, args.valCertRate ?? 0, args.valSeed,
     args.valStrataK, args.valScoreTilt, spec.oracleModel,
     args.valCallSite ?? "auto",
     // Sampling v2 adds a probability-valid certainty stratum at the score-ranked
     // head; it must not reuse a pre-v2 draw with a different inclusion design.
-    "oracleframes-v3",
+    "oracleframes-v5",
+    `corpus-${corpusFingerprint}`,
     spec.importanceBy || "default-score",
     ...(spec.textCols || []),
     // A pairwise design samples a different frame with different keys, so it must
@@ -469,7 +498,10 @@ export function buildValSet(args, query, spec) {
     "--concurrency", String(args.concurrency ?? 8),
     // One cache per (benchmark, query) rather than per design: raising the rate then
     // re-pays only for rows never labeled before.
-    "--label-cache", resolve(args.out, "_val", `${args.benchmark}-${query}`, "labels.json"),
+    "--label-cache", resolve(
+      args.out, "_val", `${args.benchmark}-${query}`,
+      `labels-${corpusFingerprint}.json`,
+    ),
     "--out", dir];
   console.log(`\n[SemDB] [${query}] building validation set (rate=${args.valRate}, `
     + `${args.valMethod}, oracle=${spec.oracleModel})`);
@@ -1839,6 +1871,23 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     ? resolve(args.queryDir, `${query}.sql`)
     : null;
   const directSites = directSqlPath ? callSites(directSqlPath) : [];
+  const directValidationPlan = args.valRate && directSqlPath
+    ? validationPlan(directSqlPath, args.benchmark, query)
+    : null;
+  const validationCapability = directValidationPlan
+    ? classifyValidationCapability(directValidationPlan, {
+        benchmark: args.benchmark,
+        query,
+      })
+    : null;
+  if (args.valRate && args.valCallSite == null
+      && validationCapability?.class === "not_compilable") {
+    const capabilityPath = resolve(runDir, "validation_capability.json");
+    await writeJsonAtomic(capabilityPath, validationCapability);
+    console.log(`[SemDB] [${query}] validation capability NOT_COMPILABLE `
+      + `(${validationCapability.reason_code}): ${validationCapability.reason}`);
+    return { query, validation_capability: validationCapability, capabilityPath };
+  }
   const directPairSite = directSites.find((site) => site.shape === "pairwise");
   const queryPairKind = directPairSite
     ? (new Set(directPairSite.bases || []).size < 2 ? "self" : "cross")
@@ -2095,19 +2144,15 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         }
       } else {
         const textCols = semanticTextCols.length ? semanticTextCols : [textCol];
-        const rowCorpus = isImage
-          ? corpus.path
-          : buildPhysicalRowFrame(args, query, {
-              corpusCsv: corpus.path,
-              textCols,
-            });
-        const rowIdCol = isImage ? idCol : "_semdb_row_id";
+        const rowCorpus = buildPhysicalRowFrame(args, query, {
+          corpusCsv: corpus.path,
+          textCols: isImage ? [] : textCols,
+        });
+        const rowIdCol = "_semdb_row_id";
         valCorpusCsv = rowCorpus;
         valRowIdCol = rowIdCol;
         if (args.valPlanOnly) {
-          const population = isImage
-            ? await countRows(rowCorpus)
-            : (await readJSON(rowCorpus + ".meta.json"))?.output_rows;
+          const population = (await readJSON(rowCorpus + ".meta.json"))?.output_rows;
           if (!Number.isInteger(population)) {
             throw new Error(`[SemDB] [${query}] row validation frame has no row count`);
           }
@@ -2309,14 +2354,17 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const rowTraceContract = isImage
     ? [`This query is scored PER ROW.`,
        ``,
-       `- \`<key>\` is the image manifest's primary-key value (a string) —`,
-       `  the \`${valRowIdCol || imgFilenameCol}\` column of \`${corpus.table}\`.`,
+       `- \`<key>\` is \`${valRowIdCol || imgFilenameCol}\`. For`,
+       `  \`_semdb_row_id\`, derive it as \`str(source_record_index)\` while`,
+       `  enumerating the original manifest before any SQL filter. It exists only`,
+       `  for trace identity and must not replace the SQL projection.`,
        `- \`--only-ids\` holds those row ids; apply it as a membership filter right`,
-       `  after the manifest is loaded:`,
+       `  after the manifest is loaded and enumerated:`,
        ``,
        "```python",
+       `rows = [dict(r, _semdb_row_id=str(i)) for i, r in enumerate(rows)]`,
        `if only is not None:`,
-       `    rows = [r for r in rows if str(r["${valRowIdCol || imgFilenameCol}"]).strip() in only]`,
+       `    rows = [r for r in rows if r["_semdb_row_id"] in only]`,
        "```"].join("\n")
     : [`This query is scored PER ROW.`,
        ``,
@@ -2681,6 +2729,20 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       ));
       return null;
     }
+    if (args.semanticPlanOnly) {
+      const iter0Dir = resolve(runDir, "iter_0");
+      await mkdir(iter0Dir, { recursive: true });
+      const planPath = resolve(iter0Dir, "plan.json");
+      const planned = await createInitialPlan({ iterDir: iter0Dir, planPath });
+      await copyFile(planPath, resolve(runDir, "plan.json"));
+      console.log(`[SemDB] [${query}] semantic plan complete; `
+        + `--semantic-plan-only skips Generator, Optimizer, and execution.`);
+      return {
+        query,
+        semantic_plan: planned.plan,
+        semantic_plan_path: planPath,
+      };
+    }
     loopResult = await runPgoLoop({
       args: { ...args, refineSampleCap: defaults.refineSampleCap },
       query: { query_id: query },
@@ -2891,7 +2953,10 @@ async function main() {
         + `Check --benchmark (got '${base.benchmark}') and --sf so the SQL prefix '${benchPrefix(base.benchmark)}.' matches.`);
       return false;
     }
-    if (base.valRate && base.valCallSite == null && base.queryDir) {
+    // Preserve the non-DIRECT pipeline's existing behavior. Typed whole-query
+    // capability artifacts are a DIRECT-PGO contract; legacy extract/compile still
+    // skips ambiguous multi-site refinement rather than reading partial feedback.
+    if (!base.direct && base.valRate && base.valCallSite == null && base.queryDir) {
       const sites = callSites(resolve(base.queryDir, `${p.query}.sql`));
       if (sites.length > 1 && !base.valPlanOnly) {
         console.warn(`[SemDB] [${p.query}] SKIP: query has ${sites.length} AI call `
@@ -2929,7 +2994,11 @@ async function main() {
     for (const p of runPlans) {
       console.log(`\n[SemDB] ==================== ${p.query} ====================`);
       try {
-        await runQueryDirect(base, p, csvPath);
+        const outcome = await runQueryDirect(base, p, csvPath);
+        if (outcome?.validation_capability?.class === "not_compilable") {
+          summary.push({ q: p.query, notCompilable: outcome.validation_capability });
+          continue;
+        }
         const tele = await readJSON(resolve(base.out, `${base.benchmark}-${p.query}`, "telemetry.json"));
         if (tele?.metrics) summary.push({ q: p.query, ...tele.metrics });
       } catch (e) {
@@ -2964,9 +3033,14 @@ async function main() {
   // 4) Workload summary.
   console.log(`\n[SemDB] ==================== SUMMARY ====================`);
   for (const s of summary) {
-    console.log(s.error
-      ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
-      : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`);
+    console.log(
+      s.notCompilable
+        ? `[SemDB]   ${s.q.padEnd(6)} NOT_COMPILABLE — `
+          + `${s.notCompilable.reason_code}: ${s.notCompilable.reason}`
+        : (s.error
+            ? `[SemDB]   ${s.q.padEnd(6)} FAILED — ${s.error}`
+            : `[SemDB]   ${s.q.padEnd(6)} P=${s.precision} R=${s.recall} F1=${s.f1}`),
+    );
   }
   const scored = summary.filter((s) => s.f1 != null);
   if (scored.length) {

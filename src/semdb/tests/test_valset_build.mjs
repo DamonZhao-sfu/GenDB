@@ -7,7 +7,9 @@ import assert from "assert";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
-import { buildValSet, renderFeedback } from "../orchestrator.mjs";
+import {
+  buildValSet, renderFeedback, validationCorpusFingerprint,
+} from "../orchestrator.mjs";
 
 const dir = mkdtempSync(resolve(tmpdir(), "semdb-valset-"));
 
@@ -42,7 +44,9 @@ test("a cached select.json is reused without spawning a build", () => {
 /** Seed the cache for the DEFAULT design, then report whether `over` hits it. */
 function hitsDefaultCache(out, over = {}, specOver = {}) {
   const key = ["stratified", 0.2, 0.1, 7, 5, 2, "test-model", "auto",
-    "oracleframes-v3", "default-score"].join("_")
+    "oracleframes-v5",
+    `corpus-${validationCorpusFingerprint(spec().corpusCsv)}`,
+    "default-score"].join("_")
     .replace(/[^\w.-]/g, "");
   const cacheDir = resolve(out, "_val", "ecomm-q2", key);
   mkdirSync(cacheDir, { recursive: true });
@@ -80,7 +84,16 @@ test("the same design hits the cache on a second call", () => {
   assert.ok(hitsDefaultCache(out), "a repeat run must not re-pay for labels");
 });
 
-test("a failed build never throws — the run falls back to full-GT scoring", () => {
+test("physical-row caches are scoped to one corpus snapshot", () => {
+  const corpus = resolve(dir, "snapshot.csv");
+  writeFileSync(corpus, "id,text\n0,a\n");
+  const before = validationCorpusFingerprint(corpus);
+  writeFileSync(corpus, "id,text\n0,a\n1,b\n");
+  const after = validationCorpusFingerprint(corpus);
+  assert.notStrictEqual(before, after);
+});
+
+test("a failed build reports null so the caller can fail closed", () => {
   assert.doesNotThrow(() => buildValSet(baseArgs(), "q2", spec()));
 });
 

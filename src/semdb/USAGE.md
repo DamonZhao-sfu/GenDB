@@ -190,13 +190,15 @@ node src/semdb/orchestrator.mjs \
 
 The question is read from the query's own `AI.IF` / `AI.GENERATE` / `AI.CLASSIFY` call,
 so nothing is retyped. Val sets are cached under `runs/_val/<bench>-<query>/<design>/`
-and labels under `runs/_val/<bench>-<query>/labels.json`, so raising the rate re-pays
-only for rows never labeled before.
+and labels under corpus-scoped
+`runs/_val/<bench>-<query>/labels-<fingerprint>.json`, so raising the rate re-pays only
+for rows never labeled before without reusing ordinal keys across scale factors.
 
-Text validation uses a validation-only `_semdb_row_id` equal to the zero-based source
-CSV record ordinal. This keeps repeated physical rows distinct even when their logical
-key (for example Movie `reviewId`) is duplicated. Solvers derive the ordinal while
-reading the original CSV; SQL result projection and duplicate multiplicity are
+Per-row validation uses a validation-only `_semdb_row_id` equal to the zero-based
+source CSV record ordinal for both text and image manifests. This keeps repeated
+physical rows distinct even when their logical key (for example Movie `reviewId` or a
+car/patient id with multiple media rows) is duplicated. Solvers derive the ordinal
+while reading the original CSV; SQL result projection and duplicate multiplicity are
 unchanged. Movie Q5–Q7 additionally execute the ordinary movie-id filter and
 `r1.reviewId <> r2.reviewId` before sampling ordered semantic pairs.
 
@@ -207,6 +209,27 @@ bounded, confidence-bearing classification and candidate extraction, allowing q3
 to compile as explicit `bounded_approximation` plans instead of falsely reporting that
 no local implementation exists. Without `--endpoint`, an explicitly requested
 `--val-rate` run fails closed rather than exposing full-ground-truth feedback.
+
+Audit only the typed PGO semantic plan (without Generator, Optimizer, or execution):
+
+```bash
+node src/semdb/orchestrator.mjs --benchmark ecomm --direct \
+  --semantic-plan-only --query q5 ...
+```
+
+Audit the validation capability of every configured SemBench SQL file:
+
+```bash
+node src/semdb/validation_matrix.mjs \
+  --sembench-dir /localhome/hza214/SemBench \
+  --out /tmp/semdb-validation-matrix.json
+```
+
+Whole-query validation for a typed tuple or multi-site composition is not silently
+reduced to one predicate. Until a joint Oracle protocol exists, DIRECT mode writes
+`validation_capability.json` and reports `NOT_COMPILABLE` with reason
+`joint_multi_site_oracle_not_implemented`. This is a validation-frame capability
+boundary; it does not claim that the semantic SQL itself lacks an offline solver.
 
 **Why `--val-score-tilt` defaults to 2.** These predicates are highly selective — ecomm
 Q2 has 5 positives in 250 rows. A uniform 20% draw expects ~1 positive, and a val set

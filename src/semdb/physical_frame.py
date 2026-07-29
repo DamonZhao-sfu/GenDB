@@ -20,6 +20,25 @@ PHYSICAL_ID = "_semdb_row_id"
 def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
                 filter_col: str | None = None,
                 filter_value: str | None = None) -> dict:
+    source_stat = os.stat(corpus)
+    spec = {
+        "version": 1,
+        "source": {
+            "path": os.path.abspath(corpus),
+            "size": source_stat.st_size,
+            "mtime_ns": source_stat.st_mtime_ns,
+        },
+        "text_cols": text_cols or [],
+        "filter": ({filter_col: filter_value} if filter_col else None),
+    }
+    try:
+        with open(out + ".meta.json", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if os.path.exists(out) and cached.get("spec") == spec:
+            print(f"[physical_frame] inputs unchanged; reusing {out}")
+            return cached
+    except (OSError, ValueError, TypeError):
+        pass
     with open(corpus, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         rows = list(reader)
@@ -56,6 +75,7 @@ def build_frame(corpus: str, out: str, *, text_cols: list[str] | None = None,
         writer.writerows(framed)
     meta = {
         "version": 1,
+        "spec": spec,
         "source": os.path.abspath(corpus),
         "input_rows": len(rows),
         "output_rows": len(framed),
