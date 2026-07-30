@@ -2698,37 +2698,46 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   // seeded candidate, so a stale reference degrades to today's cold start.
   let warm = mem?.warmStart || null;
 
-  const createInitialPlan = async ({ iterDir, planPath }) => {
-    // A non-discriminative image binding cannot be repaired downstream: the generator
-    // must implement the plan, and the optimizer can only reword its prompt. Catching it
-    // here costs one planner call instead of the query's whole iteration budget.
-    let lintText = "";
-    let plan = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      record("query_planner", await runPhase(
-        queryPlannerConfig,
-        plannerVars(planPath, "", "", lintText, warm?.planPath || ""),
-        iterDir,
-        args,
-      ));
-      plan = await readAndValidatePlan(planPath, { queryId: query });
-      if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
-        throw new Error(
-          `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
-        );
-      }
-      const findings = lintImagePlan(plan);
-      if (!findings.length) return { plan, planPath };
-      for (const finding of findings) {
-        console.log(`[SemDB]   [${query}] plan lint: ${finding.split(".")[0]}.`);
-      }
-      if (attempt === 1) {
-        // Advisory, not fatal: an unusual query may legitimately be property-shaped.
-        console.warn(`[SemDB]   [${query}] plan still flagged after one revision — proceeding.`);
-        break;
-      }
-      lintText = findings.map((f) => `- ${f}`).join("\n");
+  // Lint findings owed to the NEXT planner call. The lint catches plan-owned defects the
+  // optimizer cannot repair — the generator must implement the plan, and the optimizer can
+  // only reword prompts — but re-planning immediately would mean two planner calls in one
+  // iteration. Instead the findings ride along with the next replan, which is a planner
+  // call the loop was going to make anyway, so every iteration issues exactly one.
+  let pendingPlanLint = "";
+
+  /** Lint a freshly written plan, report it, and queue it for the next planner call. */
+  const carryPlanLint = (plan) => {
+    const findings = lintImagePlan(plan);
+    if (!findings.length) return;
+    for (const finding of findings) {
+      console.log(`[SemDB]   [${query}] plan lint: ${finding.split(".")[0]}.`);
     }
+    pendingPlanLint = findings.map((f) => `- ${f}`).join("\n");
+    console.log(`[SemDB]   [${query}] carried into the next replan's planner prompt `
+      + `(advisory — this iteration proceeds with the plan as written).`);
+  };
+
+  /** Drain the queued lint so a finding is delivered once, not on every later replan. */
+  const takePlanLint = () => {
+    const text = pendingPlanLint;
+    pendingPlanLint = "";
+    return text;
+  };
+
+  const createInitialPlan = async ({ iterDir, planPath }) => {
+    record("query_planner", await runPhase(
+      queryPlannerConfig,
+      plannerVars(planPath, "", "", "", warm?.planPath || ""),
+      iterDir,
+      args,
+    ));
+    const plan = await readAndValidatePlan(planPath, { queryId: query });
+    if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
+      throw new Error(
+        `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
+      );
+    }
+    carryPlanLint(plan);
     return { plan, planPath };
   };
   const replan = async ({
@@ -2740,7 +2749,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   }) => {
     record("query_planner", await runPhase(
       queryPlannerConfig,
-      plannerVars(planPath, previousPlanPath, actionPath),
+      plannerVars(planPath, previousPlanPath, actionPath, takePlanLint()),
       iterDir,
       args,
     ));
@@ -2748,6 +2757,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       queryId: query,
       previousPlan,
     });
+    carryPlanLint(plan);
     return { plan, planPath };
   };
   const generateCandidate = async ({
