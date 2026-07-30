@@ -84,6 +84,13 @@ node src/semdb/orchestrator.mjs --benchmark mmqa \
   --out src/semdb/runs/mmqa
 ```
 
+movie
+
+```
+node src/semdb/orchestrator.mjs     --benchmark movie     --sembench-dir /localhome/hza214/SemBench     --sf 1000     --direct     --run     --agent-provider codex     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct   --val-rate 0.05   --max-iterations 3   --out src/semdb/runs/movie_new
+```
+
+
 The `--endpoint` / `--oracle-model` here are for **validation labelling only** (building
 the val set the refinement loop scores against). The generated solver itself never sees
 them.
