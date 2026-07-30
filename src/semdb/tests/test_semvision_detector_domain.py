@@ -1,8 +1,13 @@
+"""Detector + domain-specialist backends in `vadar.backend`.
+
+The schema-driven `extract_record` / `validate_extractor_spec` dispatch these used to
+go through belonged to the compiled extract/compile pipeline and was removed with it —
+generated programs call the primitives directly through `vadar.predefined`.
+"""
 import os, sys
-import numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import semvision
+from vadar import backend as semvision
 
 
 class MockDetector:
@@ -24,28 +29,15 @@ def test_detect_presence_and_counts(tmp_path):
     assert found == ["zebra"] and conf == 0.9 and counts["zebra"] == 2
 
 
-def test_dispatch_detector_single_class_presence(tmp_path):
-    schema = {"attributes": [{"name": "has_zebra", "type": "boolean",
-              "extractor": {"tier": "detector", "classes": ["zebra"]}}]}
-    ctx = {"encoder": None, "palette": None, "detector": MockDetector([("zebra", 0.7)]), "domain": {}}
-    rec = semvision.extract_record(_img(tmp_path), schema, ctx)
-    assert rec["has_zebra"] == "yes" and rec["conf"] == 0.7
+def test_domain_classify_returns_yes_with_the_max_listed_probability(tmp_path):
+    model = MockDomain({"Pneumonia": 0.8, "Effusion": 0.1})
+    verdict, conf = semvision.domain_classify(_img(tmp_path), model,
+                                              ["Pneumonia", "Effusion"], 0.5)
+    assert verdict == "yes" and abs(conf - 0.8) < 1e-6
 
 
-def test_dispatch_domain_xray(tmp_path):
-    schema = {"attributes": [{"name": "xray_sick", "type": "boolean",
-              "extractor": {"tier": "domain", "model": "torchxrayvision:densenet121-res224-all",
-                            "labels": ["Pneumonia", "Effusion"], "params": {"threshold": 0.5}}}]}
-    ctx = {"encoder": None, "palette": None, "detector": None,
-           "domain": {"torchxrayvision:densenet121-res224-all": MockDomain({"Pneumonia": 0.8, "Effusion": 0.1})}}
-    rec = semvision.extract_record(_img(tmp_path), schema, ctx)
-    assert rec["xray_sick"] == "yes" and abs(rec["conf"] - 0.8) < 1e-6
-
-
-def test_validate_detector_domain_specs():
-    assert semvision.validate_extractor_spec(
-        {"name": "z", "type": "boolean", "extractor": {"tier": "detector", "classes": ["zebra"]}}) == []
-    assert any("classes" in e for e in semvision.validate_extractor_spec(
-        {"name": "z", "type": "boolean", "extractor": {"tier": "detector"}}))
-    assert any("model" in e for e in semvision.validate_extractor_spec(
-        {"name": "x", "type": "boolean", "extractor": {"tier": "domain", "labels": ["Pneumonia"]}}))
+def test_domain_classify_fails_closed_below_threshold(tmp_path):
+    model = MockDomain({"Pneumonia": 0.2, "Effusion": 0.1})
+    verdict, conf = semvision.domain_classify(_img(tmp_path), model,
+                                              ["Pneumonia", "Effusion"], 0.5)
+    assert verdict == "no" and abs(conf - 0.2) < 1e-6

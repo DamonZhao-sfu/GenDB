@@ -46,6 +46,7 @@ from typing import Any, Callable, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import predicate  # noqa: E402
+from vadar.paths import resolve_image_path  # noqa: E402
 import semextract  # noqa: E402
 import semvqa  # noqa: E402
 
@@ -287,7 +288,7 @@ def make_row_caller(rows_by_id: dict[str, dict[str, str]], *, question: str, cfg
             return Label(row_id, None, 0.0, "missing-row", 0, error="id not in corpus")
         images = None
         if image_col:
-            images = [semextract.resolve_image_path(str(row.get(image_col, "")), image_dir)]
+            images = [resolve_image_path(str(row.get(image_col, "")), image_dir)]
         text = None
         if text_cols:
             text = "\n".join(f"{c}: {row.get(c, '')}" for c in text_cols)
@@ -325,7 +326,7 @@ def make_pair_caller(rows_by_id: dict[str, dict[str, str]], *, question: str, cf
         row = rows_by_id.get(key)
         if row is None:
             return Label(key, None, 0.0, "missing-row", 0, error="pair id not in frame")
-        images = [semextract.resolve_image_path(str(row.get(c, "")), image_dir)
+        images = [resolve_image_path(str(row.get(c, "")), image_dir)
                   for c in image_cols]
         text = None
         if text_cols:

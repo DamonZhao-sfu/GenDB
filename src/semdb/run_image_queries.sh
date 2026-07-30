@@ -30,7 +30,6 @@
 #   ITERS=0 ./run_image_queries.sh             # single-shot (no refinement)
 #   QUERIES=q2a,q7 ./run_image_queries.sh mmqa # only these queries
 #   ALL=1 ./run_image_queries.sh movie         # drop --image-only (text/audio too)
-#   MODE=compiled ./run_image_queries.sh       # Schema-Designer + extract/compile
 #   FORCE=1 ./run_image_queries.sh mmqa        # regenerate agents/code even if cached
 #   DRY=1 ./run_image_queries.sh               # print rendered prompts only
 #
@@ -55,11 +54,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"        # GenDB repo r
 OUT="${OUT:-$REPO/src/semdb/runs}"
 PROVIDER="${PROVIDER:-claude}"
 CLIP="${CLIP:-openai/clip-vit-base-patch32}"
-MODE="${MODE:-direct}"                                            # direct | compiled
 ITERS="${ITERS:-5}"                                               # --max-iterations
 ORCH="$REPO/src/semdb/orchestrator.mjs"
 
-mode_flag="";  [ "$MODE" = "direct" ] && mode_flag="--direct"
 force_flag=""; [ "${FORCE:-0}" = "1" ] && force_flag="--force"
 dry_flag="";   [ "${DRY:-0}" = "1" ]   && dry_flag="--dry-run"
 # --image-only self-selects image queries; ALL=1 keeps text corpora too (movie).
@@ -105,7 +102,7 @@ SCENARIOS=(
 want=(); [ "$#" -gt 0 ] && want=("$@")
 selected() { [ "${#want[@]}" -eq 0 ] && return 0; for w in "${want[@]}"; do [ "$w" = "$1" ] && return 0; done; return 1; }
 
-echo "[run] provider=$PROVIDER mode=$MODE iters=$ITERS clip=$CLIP out=$OUT"
+echo "[run] provider=$PROVIDER iters=$ITERS clip=$CLIP out=$OUT"
 echo "[run] scope=${img_flag:-all-modalities}${QUERIES:+  queries=$QUERIES}"
 if [ ${#val_flags[@]} -gt 0 ]; then
   echo "[run] validation-set refinement: rate=$VAL_RATE endpoint=$ENDPOINT${VAL_PAIR_TOP:+ pair-top=$VAL_PAIR_TOP}"
@@ -131,7 +128,7 @@ for row in "${SCENARIOS[@]}"; do
     echo "[run] SKIP $bench — missing $QDIR or $DDIR"; continue
   fi
   echo "==================================================================="
-  echo "[run] SCENARIO $bench  ($ddir, $MODE, ${ITERS} iteration(s))"
+  echo "[run] SCENARIO $bench  ($ddir, ${ITERS} iteration(s))"
   echo "==================================================================="
   node "$ORCH" \
     --query-dir "$QDIR" \
@@ -142,7 +139,7 @@ for row in "${SCENARIOS[@]}"; do
     --clip-model "$CLIP" \
     --out "$OUT" \
     "${iter_flags[@]}" "${query_flags[@]}" "${val_flags[@]}" \
-    $img_flag $mode_flag $force_flag $dry_flag
+    $img_flag $force_flag $dry_flag
   rc=$?
   [ $rc -ne 0 ] && { echo "[run] $bench exited $rc"; fail=1; }
   echo

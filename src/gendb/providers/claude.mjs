@@ -14,7 +14,7 @@ import { formatDuration, estimateCost } from "../shared.mjs";
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(__filename), "../../..");
 
-export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, model, cwd, timeoutMs, configName, useSkills, domainSkillsPrompt, effortLevel: effortOverride, verbose = false }) {
+export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, model, cwd, timeoutMs, configName, useSkills, domainSkillsPrompt, skillRoot, settingSources, effortLevel: effortOverride, verbose = false }) {
   // Filter Skill from allowedTools if skills disabled
   const effectiveTools = useSkills === false
     ? allowedTools.filter(t => t !== "Skill")
@@ -56,8 +56,12 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
         systemPrompt: effectivePrompt,
         allowedTools: effectiveTools,
         model: model || undefined,
-        cwd: REPO_ROOT,  // Must point to repo root for .claude/skills/ discovery
-        settingSources: ['user', 'project'],  // Enable skill discovery from filesystem
+        // Skill discovery resolves .claude/skills relative to cwd. GenDB keeps the
+        // repo root; SemDB passes an isolated skillRoot with settingSources
+        // ['project'] so its agents discover only their own learned skills, not
+        // GenDB's C++ skills or the operator's global collection.
+        cwd: skillRoot || REPO_ROOT,
+        settingSources: settingSources || ['user', 'project'],
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         abortController,

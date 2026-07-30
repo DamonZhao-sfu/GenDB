@@ -25,14 +25,14 @@ Read `MODULES_SIGNATURES` in `{{semdb_dir}}/vadar/predefined.py`.
 ## Output contract (so the evaluator can score it)
 - Write a CSV whose header columns are EXACTLY the query's SELECT list, in order.
 - For an image-identity output column, write the image FILENAME (the evaluator takes its
-  basename). e.g. mmqa logo joins emit `ID,uri` where `uri` = the image filename.
+  basename), not a resolved absolute path.
 
 Write the program to `{{solve_path}}` with EXACTLY this shape (the orchestrator runs it as
 `python3 {{solve_path}} <out.csv> --data-dir D --image-dir I --clip-model M`):
 ```python
 import sys, os, csv, argparse
 sys.path.insert(0, "{{semdb_dir}}")
-import semvision, imagepatch, semextract
+from vadar import ImagePatch, get_encoder, resolve_image_path
 from vadar.predefined import (classify, classify_detail, classify_multi, best_ocr_match,
                               best_ocr_match_detail, dominant_colors, domain_classify,
                               verify_property, verify_detail, score, read_text, ocr_detail,
@@ -52,11 +52,11 @@ def main():
     ap.add_argument("--image-dir")
     ap.add_argument("--clip-model", default="openai/clip-vit-base-patch32")
     a = ap.parse_args()
-    ctx = {"encoder": semvision.get_encoder(a.clip_model), "palette": None}
-    P = lambda path: imagepatch.ImagePatch(path, ctx)
+    ctx = {"encoder": get_encoder(a.clip_model), "palette": None}
+    P = lambda path: ImagePatch(path, ctx)
     # 1) read structured + image-manifest CSVs from a.data_dir
     # 2) closed value space(s) from the structured column(s) at runtime
-    # 3) for each image row: path = semextract.resolve_image_path(row[<filename/filepath>], a.image_dir)
+    # 3) for each image row: path = resolve_image_path(row[<filename/filepath>], a.image_dir)
     #    field = <compose vision API + helpers over P(path)>
     # 4) relational join/filter → out_rows (tuples matching the SELECT columns)
     with open(a.out, "w", newline="") as f:

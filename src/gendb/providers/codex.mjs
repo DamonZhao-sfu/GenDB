@@ -16,11 +16,56 @@ import { Codex } from "@openai/codex-sdk";
 import { defaults, getProviderConfig } from "../gendb.config.mjs";
 import { formatDuration } from "../shared.mjs";
 
-export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, model, cwd, timeoutMs, configName, useSkills, domainSkillsPrompt, effortLevel: effortOverride, verbose = false }) {
+/**
+ * Codex exposes no Skill tool, but it does have full filesystem access, and a
+ * skill is just a directory of Markdown. This gives it the same capability
+ * through an explicit protocol: the skills are enumerated with absolute paths,
+ * and "loading" one means reading its SKILL.md. Without this section Codex agents
+ * would silently have no access to learned memory at all while Claude agents did,
+ * which would make any provider comparison meaningless.
+ */
+export function buildSkillProtocol(skillsDir, skills) {
+  if (!skillsDir || !skills || skills.length === 0) return "";
+  const lines = [
+    "## Skill tool (filesystem protocol)",
+    "",
+    `Skills available to you live under \`${skillsDir}\`. Each is a directory containing`,
+    "`SKILL.md` (instructions) and optionally `code-patterns/`, `evidence.json` and `gotchas.md`.",
+    "",
+    "To LOAD a skill, read its `SKILL.md` with your file tools, then follow it. Load a skill",
+    "whenever its description matches your situation — you may load several, or none.",
+    "After loading one, write a line `SKILL_LOADED: <name>` in your final message so the run",
+    "can record which knowledge was used.",
+    "",
+    "Available skills:",
+  ];
+  for (const s of skills) {
+    lines.push(`- **${s.name}** — ${String(s.description || "").replace(/\s+/g, " ").slice(0, 200)}`);
+    lines.push(`  path: \`${skillsDir}/${s.name}/SKILL.md\``);
+  }
+  return lines.join("\n");
+}
+
+/** Which skills the transcript shows were actually read. */
+export function extractSkillUsage(skills, commands, finalText) {
+  const used = {};
+  for (const s of skills || []) {
+    const readFromShell = commands.some((c) => c.includes(`${s.name}/SKILL.md`));
+    const declared = new RegExp(`SKILL_LOADED:\\s*${s.name}\\b`).test(finalText || "");
+    if (readFromShell || declared) used[s.name] = (used[s.name] || 0) + 1;
+  }
+  return used;
+}
+
+export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, model, cwd, timeoutMs, configName, useSkills, domainSkillsPrompt, skillRoot, skillsDir, skills, effortLevel: effortOverride, verbose = false }) {
   // Build the effective system prompt (same logic as Claude provider)
-  const effectivePrompt = (useSkills !== false && domainSkillsPrompt)
-    ? systemPrompt + "\n\n" + domainSkillsPrompt
-    : systemPrompt;
+  const resolvedSkillsDir = skillsDir || (skillRoot ? `${skillRoot}/.claude/skills` : null);
+  const skillProtocol = useSkills !== false ? buildSkillProtocol(resolvedSkillsDir, skills) : "";
+  const effectivePrompt = [
+    systemPrompt,
+    (useSkills !== false && domainSkillsPrompt) ? domainSkillsPrompt : "",
+    skillProtocol,
+  ].filter(Boolean).join("\n\n");
 
   const timeout = timeoutMs || defaults.agentTimeoutMs;
   const providerCfg = getProviderConfig("codex");
@@ -38,6 +83,7 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
   let costUsd = 0;
   let agentError = null;
   let numTurns = 0;
+  const commandsRun = [];
 
   let timer;
   const abortController = new AbortController();
@@ -71,6 +117,12 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
       // Collect agent message text from completed items
       if (event.type === "item.completed" && event.item?.type === "agent_message") {
         resultText += event.item.text;
+      }
+
+      // Track shell commands so skill reads can be attributed (Codex loads a
+      // skill by reading its file, so the command log is the usage log).
+      if (event.type === "item.completed" && event.item?.type === "command_execution") {
+        commandsRun.push(String(event.item.command || ""));
       }
 
       if (verbose && event.type === "item.completed" && event.item) {
@@ -121,13 +173,15 @@ export async function runAgent(name, { systemPrompt, userPrompt, allowedTools, m
     costUsd = estimateCodexCost(effectiveModel, tokens);
   }
 
+  const skillsUsed = extractSkillUsage(skills, commandsRun, resultText);
+
   if (agentError) {
     console.error(`\n[Orchestrator] Agent "${name}" failed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)}): ${agentError}`);
-    return { result: resultText, durationMs, tokens, costUsd, numTurns, error: agentError, skillsUsed: {} };
+    return { result: resultText, durationMs, tokens, costUsd, numTurns, error: agentError, skillsUsed };
   }
 
   console.log(`\n[Orchestrator] Agent "${name}" completed (${formatDuration(durationMs)}, ${tokens.input + tokens.output} tokens, $${costUsd.toFixed(2)})`);
-  return { result: resultText, durationMs, tokens, costUsd, numTurns, skillsUsed: {} };
+  return { result: resultText, durationMs, tokens, costUsd, numTurns, skillsUsed };
 }
 
 /**

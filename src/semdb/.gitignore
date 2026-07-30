@@ -2,3 +2,6 @@ runs/
 __pycache__/
 *.pyc
 *.meta.json
+.pytest_cache/
+.ruff_cache/
+*.log

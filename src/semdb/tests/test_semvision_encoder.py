@@ -1,6 +1,6 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import semvision
+from vadar import backend as semvision
 
 
 def test_get_encoder_is_cached(monkeypatch):

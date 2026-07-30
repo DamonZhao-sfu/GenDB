@@ -19,7 +19,9 @@ Treat `data_boundary` as a hard policy. Stop if feedback includes CERT or unauth
 2. Check runtime failures and missing outputs.
 3. Check trace coverage, key format, and sampling-unit errors.
 4. Check relational projection and join/filter placement.
-5. Check primitive arguments, value-space mapping, prompts, thresholds, and confidence semantics.
+5. Check primitive arguments, value-space mapping, prompts, thresholds, and confidence
+   semantics, then determine whether code mistranscribed the plan or the plan itself is
+   wrong.
 6. Diagnose according to `objective.name`, `objective.direction`, and
    `objective.details`; do not assume the objective is F1.
 7. Use capped mistakes as supporting evidence, not as cases to memorize.
@@ -48,9 +50,15 @@ must never replace a measurable query-specific objective during candidate select
 
 ## Choose one action
 
-Choose `PATCH_CODE` when the plan is sound and the defect is in implementation, mapping, threshold, prompt wording, control flow, trace handling, or error handling.
+Choose `PATCH_CODE` when the plan is sound and the defect is in its implementation:
+syntax/imports, argument plumbing, mistranscribed mappings/thresholds/prompts, control flow,
+cache plumbing, trace handling, CLI/output, or error handling. A patch must preserve every
+plan-owned semantic value.
 
-Choose `REPLAN` only when evidence shows a plan-level defect such as a wrong sampling unit, missing semantic input, invalid primitive choice, wrong value space, impossible helper type, or incorrect relational placement. Require remaining replan budget.
+Choose `REPLAN` when evidence shows a plan-level defect such as a wrong sampling unit,
+missing semantic input, invalid primitive choice, wrong value space, inappropriate planned
+prompt/threshold/confidence rule, impossible helper type, acceptance-path defect, or
+incorrect relational placement. Require remaining replan budget.
 
 Full recall with near-zero precision on an image predicate is an **invalid primitive
 choice**, not an imprecise prompt. When the site is bound to a single `verify_property`
@@ -63,15 +71,14 @@ wording: CLIP reads ~77 tokens, compares phrases rather than sentences, and does
 process negation, so a longer prompt lowers precision. Treat a repeated "make the prompt
 stricter" request as already shown to regress once precision has failed to rise.
 
-`execution.selected_rows == 0` is the emergency case, and it outranks every other
-diagnosis. An empty result scores F1 0 and freezes the branch counters, so every later
-iteration sees identical evidence and the loop learns nothing. Remove or loosen the most
-arbitrary rejection rule immediately — an absolute CLIP cutoff such as `>= 0.5` is
-almost always the cause, because CLIP scores are not calibrated across images or prompts.
-Restoring output outranks preserving strictness: a permissive candidate can be tightened
-from its false positives, an empty one cannot be tightened from anything. Identical
-`runtime_branches` across two iterations likewise mean the previous action had no effect;
-change a different factor and name the counter you expect to move.
+`execution.selected_rows == 0` is the emergency case because it freezes the branch
+counters. First diagnose ownership. If code introduced or mistranscribed the rejection
+rule, choose `PATCH_CODE`. If the planned threshold or acceptance chain itself rejects
+everything, choose `REPLAN`; do not ask the Generator to weaken it independently. An
+absolute CLIP cutoff such as `>= 0.5` is especially suspect because CLIP scores are not
+calibrated across images or prompts. Identical `runtime_branches` across two iterations
+mean the previous action had no effect; change a different factor and name the counter
+you expect to move.
 
 Choose `STOP` when no evidence-supported safe change remains, the candidate satisfies the configured goal, the budget is exhausted, or the query is not compilable with available primitives.
 

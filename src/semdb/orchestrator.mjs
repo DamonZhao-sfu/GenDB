@@ -40,16 +40,27 @@ import {
 } from "../gendb/shared.mjs";
 import { defaults, getAgentModel, getAgentEffort } from "./semdb.config.mjs";
 import { BENCHMARKS, SUPPORTED, tableDesc, tableFile } from "./benchmarks.mjs";
-import { config as schemaDesignerConfig } from "./agents/schema-designer/index.mjs";
-import { config as extractorConfig } from "./agents/extractor/index.mjs";
 import { config as vadarSignatureConfig } from "./agents/vadar-signature/index.mjs";
 import { config as vadarApiConfig } from "./agents/vadar-api/index.mjs";
-import { config as vadarProgramConfig } from "./agents/vadar-program/index.mjs";
 import { config as vadarSolverConfig } from "./agents/vadar-solver/index.mjs";
 import { config as queryPlannerConfig } from "./agents/query-planner/index.mjs";
 import { config as semanticCodeGeneratorConfig } from "./agents/semantic-code-generator/index.mjs";
 import { config as semanticOptimizerConfig } from "./agents/semantic-optimizer/index.mjs";
-import { loadBoundAgentSkill } from "./agent-runtime/skill-loader.mjs";
+import { config as memoryManagerConfig } from "./agents/memory-manager/index.mjs";
+import { applyMemoryUpdate } from "./memory/apply-update.mjs";
+import { getNodesByLayer } from "./memory/graph.mjs";
+import {
+  classifyQuery,
+  getMemorySummary,
+  initMemory,
+  initSkillRoot,
+  listSkills,
+  lintAllSkills,
+  publishRoleSkills,
+  recordSkillUsage,
+  resolveSkillRoot,
+  skillsDirFor,
+} from "./memory/index.mjs";
 import {
   assertPlanGeneratable,
   finalizeCandidateManifest,
@@ -62,12 +73,17 @@ import { runPgoLoop } from "./agent-runtime/pgo-loop.mjs";
 import { assertSelectValidationPayload } from "./agent-runtime/feedback.mjs";
 import { classifyValidationCapability } from "./validation_capability.mjs";
 
-/** SQL table-qualifier prefix for a benchmark (e.g. mmqa, cars_dataset). */
-function benchPrefix(bench) { return (BENCHMARKS[bench] && BENCHMARKS[bench].prefix) || bench; }
-function prefixRe(bench, tail) {
-  return new RegExp(String.raw`\b${benchPrefix(bench)}\.(\w+)` + (tail || ""), "gi");
-}
-import { config as codeGeneratorConfig } from "./agents/code-generator/index.mjs";
+// Shared SQL scanners (also used by memory/signature.mjs, so the retrieval key is
+// derived from exactly the same view of a query as the pipeline's own).
+import {
+  aliasMap,
+  benchPrefix,
+  prefixRe,
+  semanticArgs,
+  tablesInPredicate,
+} from "./sql-features.mjs";
+
+export { aliasMap };
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -102,13 +118,15 @@ export function parseArgs(argv) {
     force: false,          // re-run corpus schema design + extraction even if cached
     dryRun: false,
     imageOnly: false,      // run only queries whose corpus is an image table
-    direct: false,         // DIRECT mode: skip Schema Designer + extract/compile split;
-                           // VADAR 3 agents (Signature→API→Solver) write ONE end-to-end
-                           // solve_<q>.py that calls the local vision API and answers the query.
+    // The VADAR agents (Signature→API→Solver) write ONE end-to-end solve_<q>.py over
+    // the vadar/ operator library. This is the only pipeline — the Schema-Designer +
+    // extract/attrs/compile split was removed.
     agentArchitecture: defaults.directAgentArchitecture,
     maxReplans: defaults.maxReplans,
     enableAgentSkills: defaults.enableAgentSkills,
-    directOptionsSpecified: false,
+    memoryDir: defaults.memoryDir,   // cross-run memory; null disables it entirely
+    memoryReadonly: false,           // retrieve but never write — for clean A/B runs
+    noMemorySkills: false,           // keep L0/L1 push, drop the learned-skill namespace
     maxIterations: defaults.maxRefineIterations,
     noRefine: false,
     valFile: null,
@@ -155,19 +173,14 @@ export function parseArgs(argv) {
     else if (a === "--pred-cols" && argv[i + 1]) args.predCols = argv[++i];
     else if (a === "--force") args.force = true;
     else if (a === "--image-only") args.imageOnly = true;
-    else if (a === "--direct") args.direct = true;
-    else if (a === "--agent-architecture" && argv[i + 1]) {
-      args.agentArchitecture = argv[++i];
-      args.directOptionsSpecified = true;
-    }
-    else if (a === "--max-replans" && argv[i + 1]) {
-      args.maxReplans = Number(argv[++i]);
-      args.directOptionsSpecified = true;
-    }
-    else if (a === "--no-agent-skills") {
-      args.enableAgentSkills = false;
-      args.directOptionsSpecified = true;
-    }
+    else if (a === "--direct") { /* the only pipeline; accepted for compatibility */ }
+    else if (a === "--agent-architecture" && argv[i + 1]) args.agentArchitecture = argv[++i];
+    else if (a === "--max-replans" && argv[i + 1]) args.maxReplans = Number(argv[++i]);
+    else if (a === "--no-agent-skills") args.enableAgentSkills = false;
+    else if (a === "--memory-dir" && argv[i + 1]) args.memoryDir = resolve(argv[++i]);
+    else if (a === "--no-memory") args.memoryDir = null;
+    else if (a === "--memory-readonly") args.memoryReadonly = true;
+    else if (a === "--no-memory-skills") args.noMemorySkills = true;
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--max-iterations" && argv[i + 1]) args.maxIterations = parseInt(argv[++i], 10);
     else if (a === "--val-file" && argv[i + 1]) args.valFile = resolve(argv[++i]);
@@ -180,10 +193,7 @@ export function parseArgs(argv) {
     else if (a === "--val-call-site" && argv[i + 1]) args.valCallSite = parseInt(argv[++i], 10);
     else if (a === "--oracle-model" && argv[i + 1]) args.oracleModel = argv[++i];
     else if (a === "--val-plan-only") args.valPlanOnly = true;
-    else if (a === "--semantic-plan-only") {
-      args.semanticPlanOnly = true;
-      args.directOptionsSpecified = true;
-    }
+    else if (a === "--semantic-plan-only") args.semanticPlanOnly = true;
     else if (a === "--val-pair-top" && argv[i + 1]) args.valPairTop = parseInt(argv[++i], 10);
     else if (a === "--no-refine") args.noRefine = true;
   }
@@ -405,8 +415,21 @@ export function checkSemdbImprovement(prev, next) {
     // genuine query-metric regression.
     if (after.value === before.value
         && prev.f1 != null && next.f1 != null
-        && Number.isFinite(Number(prev.f1)) && Number.isFinite(Number(next.f1))) {
+        && Number.isFinite(Number(prev.f1)) && Number.isFinite(Number(next.f1))
+        && Number(next.f1) !== Number(prev.f1)) {
       return Number(next.f1) > Number(prev.f1);
+    }
+    // Still tied — and at objective 0 that is the common case, because "crashed on
+    // every row" and "ran correctly but matched nothing" both score 0. Fall back to
+    // execution health, which does separate them: a candidate that loses fewer rows to
+    // exceptions is strictly the better thing to keep iterating from, even when the
+    // score has not moved yet.
+    if (after.value === before.value) {
+      const beforeRate = runErrorRate(prev.health);
+      const afterRate = runErrorRate(next.health);
+      if (beforeRate !== null && afterRate !== null && afterRate !== beforeRate) {
+        return afterRate < beforeRate;
+      }
     }
     return false;
   }
@@ -455,10 +478,11 @@ export function directTimingBreakdown(
 const VADAR_RUNTIME_FORBIDDEN = [
   ["semantic judge API", /\bjudge\s*\(|\b(?:vlm_judge|gen_endpoint)\s*\(/i],
   // Endpoint-backed modules. semvqa (OpImgVQA) and semcaption (OpImgCap) DO call a VLM
-  // by design — they belong to the extraction/residual layer, which runs outside this
-  // guard. Naming them here keeps generated VADAR code from importing its way around it.
+  // by design — they belong to the oracle-labelling / residual layer, which lives OUTSIDE
+  // `vadar/` and runs outside this guard. Naming them here keeps generated code from
+  // importing its way around it.
   ["endpoint-backed module",
-    /\b(?:semtext|semvqa|semcaption|TextPatch|get_ctx|img_vqa)\b/i],
+    /\b(?:semvqa|semcaption|semextract|TextPatch|get_ctx|img_vqa)\b/i],
   ["endpoint/API credential",
     /--endpoint\b|--api-key\b|\.endpoint\b|\.api_?key\b|\b(?:endpoint|api_?key)\s*(?:=|[,):])/i],
   ["OpenAI client", /\b(?:from|import)\s+openai\b|\bOpenAI\s*\(/i],
@@ -478,7 +502,7 @@ export function offlineVadarViolations(source) {
 export function localImportRootViolations(sources, semdbDir = __dirname) {
   const combined = sources.join("\n");
   const violations = [];
-  const bareLocal = /^\s*(?:from|import)\s+(?:semvision|imagepatch|semextract|vadar)\b/im;
+  const bareLocal = /^\s*(?:from|import)\s+vadar\b/im;
   const packaged = /^\s*(?:from|import)\s+semdb(?:\.|\b)/im;
   if (bareLocal.test(combined) && !combined.includes(JSON.stringify(semdbDir))) {
     violations.push(`bare SemDB imports require sys.path root ${semdbDir}`);
@@ -987,6 +1011,103 @@ export function filterRunLog(text, opts = {}) {
   };
 }
 
+/** How healthy was one solver execution, read out of its own diagnostic contract?
+ *
+ *  The prompt makes every generated program isolate per-row failures so that one
+ *  unreadable file cannot kill a whole run. The cost is that a program which fails on
+ *  EVERY row still exits 0, still writes a well-formed trace, and therefore used to be
+ *  classified "ok" — indistinguishable from a program that ran fine and simply matched
+ *  nothing. mmqa q2a lost 200/200 rows to one TypeError that way: the optimizer
+ *  diagnosed it correctly three times, the generator fixed it in iter_1, and the loop
+ *  still promoted the crashing iter_0 because both scored objective 0.0.
+ *
+ *  Sources, in order of trust:
+ *    1. `[solve] rows_in=N rows_out=M errors=E` — the contract's own summary line.
+ *    2. `[solve] WARN-TOTAL <reason> n=K` where the reason names an error, for programs
+ *       written before `errors=` was part of the contract.
+ *    3. `[solve] ERROR ...` / `type=<Exception>` per-row lines, which the contract caps
+ *       at five per reason — a floor, never a count.
+ *
+ *  Returns null counts when the program said nothing; the caller must treat unknown as
+ *  healthy rather than punishing a silent program twice.
+ */
+/** Branch/warning names that denote a raised EXCEPTION rather than a negative outcome.
+ *
+ *  Deliberately excludes "fail": the contract asks for branch names describing HOW a row
+ *  was decided, and `equality_fail` / `predicate_fail` / `match_fail` are all ordinary
+ *  "the predicate did not hold" branches. Counting those as errors made a healthy run
+ *  look like it had lost 129 of its rows. */
+const ERROR_COUNTER_NAME = /error|exception|crash|traceback|throw/i;
+
+export function parseRunHealth(text) {
+  const log = String(text || "");
+  const num = (v) => (v === undefined ? null : Number(v));
+  const summary = /\[solve\]\s+rows_in=(\d+)\s+rows_out=(\d+)(?:\s+errors=(\d+))?/i.exec(log);
+  let rowsIn = summary ? num(summary[1]) : null;
+  let rowsOut = summary ? num(summary[2]) : null;
+  let errorRows = summary && summary[3] !== undefined ? num(summary[3]) : null;
+
+  if (errorRows === null) {
+    // WARN-TOTAL carries the true total; the per-row ERROR lines are capped and cannot.
+    let total = 0;
+    let sawErrorTotal = false;
+    const totals = /\[solve\]\s+WARN-TOTAL\s+(\S+)\s+n=(\d+)/gi;
+    for (let m = totals.exec(log); m; m = totals.exec(log)) {
+      if (ERROR_COUNTER_NAME.test(m[1])) { total += Number(m[2]); sawErrorTotal = true; }
+    }
+    if (sawErrorTotal) errorRows = total;
+  }
+  if (errorRows === null) {
+    const branches = /\[solve\]\s+branch=(\S+)\s+n=(\d+)/gi;
+    let total = 0;
+    let saw = false;
+    for (let m = branches.exec(log); m; m = branches.exec(log)) {
+      if (!ERROR_COUNTER_NAME.test(m[1])) continue;
+      total += Number(m[2]);
+      saw = true;
+    }
+    if (saw) errorRows = total;
+  }
+  // A program that emitted its contract summary and named no error branch reported ZERO
+  // errors — that is a measurement, not a silence. Collapsing the two would make a clean
+  // run incomparable to a failing one, which is exactly the tie the health check exists
+  // to break.
+  if (errorRows === null && summary) errorRows = 0;
+  return { rowsIn, rowsOut, errorRows };
+}
+
+/** Fraction of a run's rows that failed, or null when the program reported nothing.
+ *
+ *  `rowsIn` is the DOMAIN size (a join's pair count), while the error counters are
+ *  per unit of work actually attempted, so the two can legitimately differ by orders of
+ *  magnitude. Cap at 1 rather than pretending the ratio is meaningful above it.
+ */
+export function runErrorRate(health) {
+  if (!health || health.errorRows === null || health.errorRows === undefined) return null;
+  const denom = [health.rowsIn, health.rowsOut].find((v) => Number.isFinite(v) && v > 0);
+  if (!denom) return health.errorRows > 0 ? 1 : 0;
+  return Math.min(1, health.errorRows / denom);
+}
+
+/** Did this execution fail on enough of its rows that its score is not worth comparing?
+ *
+ *  Half is deliberate: a program losing most of its rows to exceptions is not a weaker
+ *  candidate, it is a broken one, and letting it tie on objective lets it win a
+ *  tie-break against a candidate that actually runs.
+ */
+export const RUN_ERROR_RATE_FATAL = 0.5;
+
+export function runIsBroken(health) {
+  // Produced nothing AND lost rows to exceptions. The row-rate test cannot catch this
+  // case: a join reports `rows_in` as its PAIR domain (mmqa q2a: 2600) while the errors
+  // are counted per image (74), so a run that failed on every image it touched still
+  // rates under 3%. An empty result is only a finding when nothing threw.
+  if (health && health.rowsOut === 0 && health.errorRows > 0) return true;
+  const rate = runErrorRate(health);
+  return rate !== null && rate >= RUN_ERROR_RATE_FATAL;
+}
+
+
 /**
  * Run a Python program, persisting its output to `<iterDir>/run.log` and timing it.
  *
@@ -1141,43 +1262,170 @@ function tablesInSql(sql, args) {
   });
 }
 
-/** alias → table map from FROM/JOIN clauses (<prefix>.table [AS] alias).
+/** Usage counts for learned skills only, "" when none were loaded. */
+async function renderLearnedSkillUsage(usagePath, skills) {
+  if (!existsSync(usagePath)) return "";
+  const log = await readJSON(usagePath);
+  if (!log) return "";
+  const learned = new Set(skills.filter((s) => !s.role).map((s) => s.name));
+  const lines = [];
+  for (const [queryId, entry] of Object.entries(log)) {
+    for (const [name, count] of Object.entries(entry.skills || {})) {
+      if (learned.has(name)) lines.push(`- ${name}: loaded ${count}× by ${queryId}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Post-run memory curation: the Memory Manager proposes, `applyMemoryUpdate` writes.
  *
- * BigQuery external-object tables hide the ordinary table reference inside
- * `EXTERNAL_OBJECT_TRANSFORM(TABLE `<prefix>.IMAGES`, ...) AS images`. Keep that
- * wrapper in this lightweight scanner: otherwise EComm q8 looks text-only and its
- * pairwise image join is incorrectly sent to per-row validation.
+ * The agent never touches `graph/`. It authors skill directories and one JSON
+ * proposal; code recomputes every retrieval key from this run's own SQL and
+ * re-checks every improvement claim. That split is why a mis-authored proposal can
+ * only cost a curation pass, not corrupt retrieval.
  */
-export function aliasMap(sql, bench) {
-  const m = {};
-  for (const x of sql.matchAll(prefixRe(bench, String.raw`\s+(?:AS\s+)?(\w+)`))) m[x[2]] = x[1];
-  const escapedPrefix = benchPrefix(bench).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const transformed = new RegExp(
-    String.raw`EXTERNAL_OBJECT_TRANSFORM\s*\(\s*TABLE\s+\`?`
-      + escapedPrefix
-      + String.raw`\.(\w+)\`?[\s\S]*?\)\s+(?:AS\s+)?(\w+)`,
-    "gi",
-  );
-  for (const x of sql.matchAll(transformed)) m[x[2]] = x[1];
-  return m;
+async function curateMemory(args, runPlans) {
+  const queries = {};
+  const evidenceLines = [];
+  for (const plan of runPlans) {
+    const runDir = resolve(args.out, `${args.benchmark}-${plan.query}`);
+    const telemetry = await readJSON(resolve(runDir, "telemetry.json"));
+    if (!telemetry) continue;
+    const refine = telemetry.refine || {};
+    const values = (refine.objective_history || [])
+      .map((e) => Number(e?.value))
+      .filter((v) => Number.isFinite(v));
+    const direction = refine.objective_direction === "minimize" ? "minimize" : "maximize";
+    const objective = {
+      name: refine.objective || "objective",
+      value: values.length
+        ? (direction === "minimize" ? Math.min(...values) : Math.max(...values))
+        : null,
+      direction,
+    };
+    queries[plan.query] = {
+      sql: plan.sql,
+      nl: plan.nl,
+      corpus: plan.corpus,
+      tables: plan.tables,
+      objective,
+      iterations: refine.iterations ?? 0,
+      replans: telemetry.replans ?? 0,
+      actionCounts: telemetry.optimizer_actions ?? null,
+      plan: await readJSON(resolve(runDir, "plan.json")),
+      promoted: {
+        plan_path: existsSync(resolve(runDir, "plan.json")) ? resolve(runDir, "plan.json") : null,
+        helpers_path: existsSync(resolve(runDir, `_semantic_helpers_${plan.query}.py`))
+          ? resolve(runDir, `_semantic_helpers_${plan.query}.py`) : null,
+        solver_path: existsSync(resolve(runDir, `solve_${plan.query}.py`))
+          ? resolve(runDir, `solve_${plan.query}.py`) : null,
+        manifest_path: existsSync(resolve(runDir, "candidate_manifest.json"))
+          ? resolve(runDir, "candidate_manifest.json") : null,
+        candidate_id: telemetry.best_candidate_id ?? null,
+      },
+      metricFamily: telemetry.metrics?.metric_family ?? null,
+      runDir,
+    };
+
+    const iterDirs = (await readdir(runDir, { withFileTypes: true }).catch(() => []))
+      .filter((e) => e.isDirectory() && /^iter_\d+$/.test(e.name))
+      .map((e) => e.name)
+      .sort();
+    const history = (refine.f1_history || [])
+      .map((h) => `${h.iteration}:${h.objective?.value ?? "n/a"}${h.improved ? "+" : ""}`)
+      .join(" → ");
+    evidenceLines.push(
+      `### ${plan.query}\n`
+      + `- run dir: \`${runDir}\`\n`
+      + `- objective: ${objective.name}=${objective.value ?? "n/a"} (${direction})\n`
+      + `- trajectory: ${history || "(single shot)"}\n`
+      + `- actions: ${JSON.stringify(telemetry.optimizer_actions || {})}, replans: ${telemetry.replans ?? 0}\n`
+      + `- iterations on disk: ${iterDirs.join(", ") || "(none)"}\n`
+      + `- memory match: \`${resolve(runDir, "memory_match.json")}\``,
+    );
+  }
+  if (!Object.keys(queries).length) {
+    console.log("[SemDB] memory curation: no telemetry to curate.");
+    return;
+  }
+
+  const skills = await listSkills(args.skillRoot);
+  const templates = await getNodesByLayer(1, args.memoryDir);
+  const usagePath = resolve(args.out, "skill_usage.json");
+  const updatePath = resolve(args.out, "memory_update.json");
+  const summaryPath = resolve(args.out, "memory_update_summary.json");
+
+  const template = readFileSync(memoryManagerConfig.userPromptPath, "utf-8");
+  const userPrompt = renderTemplate(template, {
+    run_id: args.runId,
+    benchmark: args.benchmark,
+    scale_factor: args.scaleFactor || "flat",
+    out_dir: args.out,
+    headroom_threshold: defaults.memory.differentialHeadroomThreshold,
+    query_evidence: evidenceLines.join("\n\n"),
+    skills_dir: skillsDirFor(args.skillRoot),
+    existing_skills: skills.filter((s) => !s.role)
+      .map((s) => `- **${s.name}**: ${s.description}`).join("\n"),
+    existing_templates: templates
+      .map((t) => `- ${t.id}: ${t.summary} (instances: ${t.content?.instance_count ?? 1})`)
+      .join("\n"),
+    // Only LEARNED skills. skill_usage.json also counts the three role procedures,
+    // and handing those to the Manager makes it dutifully write evidence.json into
+    // directories that are procedures, not knowledge — they are exempt from the
+    // evidence rule and never appear in the memory catalog.
+    skill_usage: await renderLearnedSkillUsage(usagePath, skills),
+    update_schema_path: resolve(__dirname, "contracts", "memory-update.schema.json"),
+    update_path: updatePath,
+  });
+
+  const systemPrompt = await readFile(memoryManagerConfig.promptPath, "utf-8");
+  const result = await runAgent(memoryManagerConfig.name, {
+    systemPrompt,
+    userPrompt,
+    allowedTools: memoryManagerConfig.allowedTools,
+    model: args.modelOverride || getAgentModel(memoryManagerConfig.configKey, args.agentProvider),
+    effortLevel: getAgentEffort(memoryManagerConfig.configKey, args.agentProvider),
+    configName: memoryManagerConfig.configKey,
+    cwd: args.out,
+    timeoutMs: defaults.agentTimeoutMs,
+    useSkills: false,
+  });
+  if (result.error) {
+    console.error(`[SemDB] memory curation: agent failed (non-fatal): ${result.error}`);
+    return;
+  }
+
+  const update = await readJSON(updatePath);
+  if (!update) {
+    console.warn(`[SemDB] memory curation: no proposal at ${updatePath}.`);
+    return;
+  }
+  const summary = await applyMemoryUpdate(update, {
+    memoryDir: args.memoryDir,
+    skillRoot: args.skillRoot,
+    runId: args.runId,
+    benchmark: args.benchmark,
+    queries,
+    config: defaults.memory,
+    groundTruthDir: args.groundTruthDir,
+  });
+  await writeJsonAtomic(summaryPath, summary);
+  const created = Object.entries(summary.nodes_created || {})
+    .map(([layer, count]) => `${layer}:${count}`).join(", ") || "none";
+  console.log(`[SemDB] memory curation: applied=${summary.applied} created=${created}`
+    + ` updated=${summary.nodes_updated} edges=${summary.edges_created}`
+    + ` skills=${summary.skills_accepted.length} rejected=${summary.rejected.length}`);
+  for (const r of summary.rejected) {
+    console.warn(`[SemDB]   rejected (${r.reason}): ${r.detail || r.field || ""}`);
+  }
+  console.log(`[SemDB] memory curation summary → ${summaryPath}`);
 }
 
-/** The argument text of the AI.IF / AI.GENERATE call (up to connection_id). */
-function semanticArgs(sql) {
-  const i = sql.search(/AI\.(IF|GENERATE)\s*\(/i);
-  if (i < 0) return "";
-  const j = sql.toLowerCase().indexOf("connection_id", i);
-  return sql.slice(i, j < 0 ? Math.min(i + 500, sql.length) : j);
-}
-
-/** Tables whose alias is referenced inside the semantic predicate. */
-function tablesInPredicate(sql, bench) {
-  const amap = aliasMap(sql, bench);
-  const arg = semanticArgs(sql);
-  const used = Object.keys(amap)
-    .filter((al) => new RegExp(`\\b${al}\\.`).test(arg))
-    .map((al) => amap[al]);
-  return [...new Set(used)];
+/** This query's skill loads from <out>/skill_usage.json ({} when nothing was loaded). */
+async function readSkillUsage(outDir, query) {
+  const log = await readJSON(resolve(outDir, "skill_usage.json"));
+  return log?.[query]?.skills || {};
 }
 
 /** First header line of a CSV, or "" if unreadable. */
@@ -1226,50 +1474,6 @@ async function chooseCorpus(sql, tables, args) {
     tables[tables.length - 1] || { table: "corpus", path: "", modality: "text", isImages: false };
 }
 
-/** Distinct non-empty values of a CSV column — the value space for CLIP classify. */
-async function distinctValues(path, column) {
-  try {
-    const lines = (await readFile(path, "utf-8")).split(/\r?\n/).filter((l) => l.length);
-    if (!lines.length) return [];
-    const idx = lines[0].split(",").map((c) => c.trim()).indexOf(column);
-    if (idx < 0) return [];
-    const vals = new Set();
-    for (const line of lines.slice(1)) {
-      const cell = (line.split(",")[idx] || "").trim();
-      if (cell) vals.add(cell);
-    }
-    return [...vals].sort();
-  } catch { return []; }
-}
-
-/** Fill each attribute's `labels` from its `labels_from: "table.column"` — the DB
- *  value space — so CLIP classify returns a real structured FIELD value, not a score.
- *  For a logo↔named-table join (mmqa q2a/q7), labels_from points at the structured
- *  side's name column. Mutates `schema`; returns true if it changed anything. */
-async function resolveLabelsFrom(schema, args) {
-  let changed = false;
-  const tableDir = args.tableDir || args.dataDir;
-  for (const a of schema.attributes || []) {
-    const lf = a.extractor && a.extractor.labels_from;
-    if (!lf || (a.extractor.labels && a.extractor.labels.length)) continue;
-    // Accept "table.column" OR a prefixed "<benchmark>.table.column" (as the SQL writes
-    // it): the LAST segment is the column, the one before it is the table.
-    const parts = String(lf).split(".");
-    const col = parts.pop();
-    const tbl = parts.pop();
-    const d = tableDesc(args.benchmark, tbl);
-    const file = d ? tableFile(d, args.scaleFactor) : `${tbl}.csv`;
-    const vals = await distinctValues(resolve(tableDir, file), col);
-    if (vals.length) {
-      a.extractor.labels = vals; changed = true;
-      console.log(`[SemDB] labels_from ${lf}: ${vals.length} value(s) -> attr '${a.name}'`);
-    } else {
-      console.warn(`[SemDB] labels_from ${lf}: no values at ${resolve(tableDir, file)}`);
-    }
-  }
-  return changed;
-}
-
 /** List query ids (<name>.sql → <name>) in a query dir, sorted. */
 async function listQueries(dir) {
   if (!dir) return [];
@@ -1284,18 +1488,25 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
   const systemPrompt = await readFile(systemPromptPath, "utf-8");
   const template = await readFile(userPromptPath, "utf-8");
   const userPrompt = renderTemplate(template, vars);
-  const skillRequested = args.enableAgentSkills === false
-    ? false
-    : (opts.useSkills ?? agentConfig.useSkills ?? args.enableAgentSkills ?? false);
-  const skillEnabled = Boolean(agentConfig.skillPath && skillRequested);
-  const boundSkill = skillEnabled && agentConfig.skillPath
-    ? await loadBoundAgentSkill(agentConfig, true)
-    : null;
-  const domainSkillsPrompt = boundSkill?.prompt;
+
+  // Skills are DISCOVERED, not bound. Each role's procedure and every learned
+  // memory skill live in one isolated root (args.skillRoot); the agent picks what
+  // to load. Scoping settingSources to 'project' with that root as cwd is what
+  // keeps discovery free without exposing GenDB's C++ skills or the operator's
+  // personal global skills.
+  const skillsEnabled = args.enableAgentSkills !== false
+    && Boolean(args.skillRoot)
+    && (agentConfig.allowedTools || []).includes("Skill");
+  const skills = skillsEnabled ? (args.availableSkills || []) : [];
+  const allowedTools = skillsEnabled
+    ? agentConfig.allowedTools
+    : (agentConfig.allowedTools || []).filter((t) => t !== "Skill");
 
   if (args.dryRun) {
     console.log(`\n[SemDB] --- ${agentConfig.name} (dry-run) ---`);
-    console.log(`[SemDB] bound skill: ${boundSkill?.name || "(disabled)"}`);
+    console.log(`[SemDB] discoverable skills: ${
+      skillsEnabled ? (skills.map((s) => s.name).join(", ") || "(none published)") : "(disabled)"
+    }`);
     console.log(userPrompt);
     return { dryRun: true };
   }
@@ -1303,16 +1514,23 @@ async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
   const result = await runAgent(agentConfig.name, {
     systemPrompt,
     userPrompt,
-    allowedTools: agentConfig.allowedTools,
+    allowedTools,
     model: args.modelOverride || getAgentModel(agentConfig.configKey, args.agentProvider),
     effortLevel: getAgentEffort(agentConfig.configKey, args.agentProvider),
     configName: agentConfig.configKey,
     cwd: runDir,
     timeoutMs: defaults.agentTimeoutMs,
-    useSkills: skillEnabled,
-    domainSkillsPrompt,
+    useSkills: skillsEnabled,
+    skillRoot: skillsEnabled ? args.skillRoot : undefined,
+    skillsDir: skillsEnabled ? skillsDirFor(args.skillRoot) : undefined,
+    skills,
+    settingSources: skillsEnabled ? ["project"] : undefined,
   });
   if (result.error) throw new Error(`${agentConfig.name} failed: ${result.error}`);
+  const usageQueryId = opts.queryId || vars.query_id;
+  if (skillsEnabled && usageQueryId) {
+    await recordSkillUsage(args.out, usageQueryId, result.skillsUsed);
+  }
   return result;
 }
 
@@ -1461,7 +1679,7 @@ function makeRecorder(args, phases) {
 
 function agentModelsLine(args) {
   const m = (k) => args.modelOverride || getAgentModel(k, args.agentProvider);
-  return `designer=${m("schema_designer")}, extractor=${m("extractor")}, codegen=${m("code_generator")}`;
+  return `planner=${m("query_planner")}, codegen=${m("semantic_code_generator")}, optimizer=${m("semantic_optimizer")}`;
 }
 
 /** Corpus columns + the small model for extraction. Prefer the benchmark config's
@@ -1496,187 +1714,6 @@ async function planQuery(args, query) {
   const plan = await computeNaive(sql, args);
   return { query, sql, nl, tables, corpus, structured,
            isImage: corpus.modality === "image", isAudio: corpus.modality === "audio", plan };
-}
-
-// ---------------------------------------------------------------------------
-// Corpus-level Phase A + B — run ONCE per corpus, shared by all its queries.
-// ---------------------------------------------------------------------------
-async function ensureCorpus(args, corpus, corpusQueries) {
-  const corpusDir = resolve(args.out, "_corpus", corpus.table);
-  await mkdir(corpusDir, { recursive: true });
-  const schemaPath = resolve(corpusDir, "schema.json");
-  const attrsPath = resolve(corpusDir, `${corpus.table}_attrs.json`);
-  const isImage = corpus.isImages;
-  const modality = isImage ? "image" : "text";
-  const { cols, idCol, textCol, imageCol, extractModel } = await corpusCols(corpus, args);
-  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
-
-  const phases = [];
-  const record = makeRecorder(args, phases);
-
-  console.log(`\n[SemDB] ===== CORPUS ${corpus.table} [${modality}] — ${corpusQueries.length} quer${corpusQueries.length === 1 ? "y" : "ies"}: ${corpusQueries.map((p) => p.query).join(", ")} =====`);
-
-  // Phase A — Schema Designer ONCE, seeing ALL queries over this corpus so the
-  // schema covers every attribute they need (skip if cached unless --force).
-  if (!existsSync(schemaPath) || args.force) {
-    const tableHeaders = await readTableHeaders(args.dataDir);
-    const querySqls = corpusQueries.map((p) => `-- ${p.query}\n${p.sql}`).join("\n\n");
-    record("schema_designer", await runPhase(schemaDesignerConfig, {
-      query_id: `${corpus.table} [${corpusQueries.map((p) => p.query).join(",")}]`,
-      query_sql: querySqls,
-      query_nl: corpusQueries.map((p) => p.nl).filter(Boolean).join(" | "),
-      table_schemas: tableHeaders,
-      corpus_name: corpus.table,
-      corpus_size: "(rows in " + basename(corpus.path || "corpus") + ")",
-      modality,
-      structured_name: "(varies per query)",
-      structured_size: "N/A",
-      schema_path: schemaPath,
-      existing_schema: "",
-    }, corpusDir, args));
-  } else {
-    console.log(`[SemDB] reuse cached corpus schema: ${schemaPath}`);
-  }
-
-  const schema = args.dryRun ? null : await readJSON(schemaPath);
-  // Bake the DB value space into any `labels_from` attribute (structured field
-  // extraction: CLIP classify over a column's distinct values → a real field value).
-  if (schema && !args.dryRun && await resolveLabelsFrom(schema, args)) {
-    await writeFile(schemaPath, JSON.stringify(schema, null, 2));
-  }
-  if (schema && schema.decomposable === false) {
-    console.log(`[SemDB] corpus ${corpus.table} not decomposable: ${schema.rationale}`);
-  }
-
-  // Phase B — Extractor ONCE, in two steps mirroring Phase C (Code Generator):
-  //   1. GENERATE a thin per-corpus driver (agent) -> extract_<corpus>.py that
-  //      composes a local modality API and calls its offline execution engine.
-  //   2. EXECUTE it (orchestrator) on the full corpus -> attrs + <attrs>.meta.json.
-  // Both cache per corpus (amortized across all its queries).
-  const driverPath = resolve(corpusDir, `extract_${corpus.table}.py`);
-  if (!existsSync(driverPath) || args.force) {          // agent artifact step (like schema design); runPhase handles --dry-run
-    if (isImage) {
-      // IMAGE corpora: strict VADAR 3-agent dynamic-API synthesis (arXiv 2502.06787).
-      // Signature -> API -> Program (each a codex/claude agent) compose the predefined
-      // vision API (vadar/predefined.py) into extract(image); the program calls
-      // vadar_engine.run over the corpus. All 3 share the corpus queries + schema.
-      const corpusSql = corpusQueries.map((p) => `-- ${p.query}\n${p.sql}`).join("\n\n");
-      const schemaJson = schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}";
-      const sigPath = resolve(corpusDir, "_vadar_signatures.txt");
-      const helpersPath = resolve(corpusDir, "_vadar_helpers.py");
-      const common = { corpus_name: corpus.table, semdb_dir: __dirname };
-      record("vadar_signature", await runPhase(vadarSignatureConfig, {
-        ...common, query_sql: corpusSql, schema_json: schemaJson, sig_path: sigPath,
-      }, corpusDir, args));
-      record("vadar_api", await runPhase(vadarApiConfig, {
-        ...common, sig_path: sigPath, helpers_path: helpersPath,
-      }, corpusDir, args));
-      if (!args.dryRun && existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
-      record("vadar_program", await runPhase(vadarProgramConfig, {
-        ...common, schema_json: schemaJson, helpers_path: helpersPath, driver_path: driverPath,
-        header: cols.join(", "), id_col: idCol, image_col: imageCol,
-      }, corpusDir, args));
-      if (!args.dryRun && existsSync(driverPath)) validateOfflineVadarFile(driverPath);
-    } else {
-      record("extractor", await runPhase(extractorConfig, {
-        corpus_name: corpus.table,
-        schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
-        schema_path: schemaPath,
-        header: cols.join(", "),
-        modality,
-        id_col: idCol, text_col: textCol, image_col: imageCol,
-        image_dir: args.imageDir || "",
-        small_model: extractModel,
-        escalation_model: defaults.extraction.escalationImageModel,
-        corpus_manifest: corpus.path,
-        corpus_size: `(rows in ${basename(corpus.path)})`,
-        driver_path: driverPath,
-        attrs_path: attrsPath,
-        semextract_path: resolve(__dirname, "semextract.py"),
-      }, corpusDir, args));
-      if (!args.dryRun && existsSync(driverPath)) validateOfflineVadarFile(driverPath);
-    }
-  } else if (existsSync(driverPath)) {
-    console.log(`[SemDB] reuse cached corpus extractor driver: ${driverPath}`);
-  }
-  if (doRun && !args.dryRun && existsSync(driverPath) && (!existsSync(attrsPath) || args.force)) {
-    // Generated extraction drivers run locally. Image drivers use CV+CLIP; text drivers
-    // use deterministic string/regex helpers. Neither generated runtime receives an
-    // endpoint or API key.
-    const imageModel = args.clipModel || defaults.extraction.clipModel;
-    validateOfflineVadarFile(driverPath);
-    if (isImage) {
-      const helpersPath = resolve(corpusDir, "_vadar_helpers.py");
-      if (existsSync(helpersPath)) validateOfflineVadarFile(helpersPath);
-    }
-    const exArgs = [driverPath, corpus.path, attrsPath, "--schema", schemaPath,
-      "--model", (isImage ? imageModel : extractModel),
-      ...(isImage ? ["--image-dir", args.imageDir] : []),
-      ...(args.theta != null ? ["--theta", String(args.theta)] : [])];
-    console.log(`\n[SemDB] Extracting corpus ${corpus.table} (once): python3 ${exArgs.join(" ")}`);
-    const ex = spawnSync("python3", exArgs, { stdio: "inherit" });
-    if (ex.status !== 0) console.warn(`[SemDB] extraction exited ${ex.status}.`);
-  } else if (existsSync(attrsPath)) {
-    console.log(`[SemDB] reuse cached corpus attrs: ${attrsPath}`);
-  }
-
-  // --- OpImgCap: one caption per corpus image, amortized like the attribute table ----
-  // A caption is the cross-modal proxy that lets the cheap TEXT side answer an image
-  // predicate. It needs a VLM, so it cannot live in the (offline) generated program —
-  // it runs here, once per CORPUS, and every query in the family reads the column.
-  const captionsPath = resolve(corpusDir, "captions.json");
-  if (args.caption && isImage && doRun && !args.dryRun) {
-    if (!args.endpoint) {
-      console.warn("[SemDB] --caption needs --endpoint (OpImgCap is a VLM call); skipping.");
-    } else if (existsSync(captionsPath) && !args.force) {
-      console.log(`[SemDB] reuse cached corpus captions: ${captionsPath}`);
-    } else {
-      const capArgs = [resolve(__dirname, "semcaption.py"), corpus.path, captionsPath,
-        "--id-col", idCol, "--image-col", imageCol,
-        ...(args.imageDir ? ["--image-dir", args.imageDir] : []),
-        "--model", args.captionModel || defaults.extraction.captionModel,
-        "--endpoint", args.endpoint, "--concurrency", String(args.concurrency ?? 8)];
-      console.log(`\n[SemDB] Captioning corpus ${corpus.table} (once): python3 ${capArgs.join(" ")}`);
-      const cap = spawnSync("python3", capArgs, { stdio: "inherit" });
-      if (cap.status !== 0) console.warn(`[SemDB] captioning exited ${cap.status}.`);
-    }
-  }
-
-  const extMeta = await readJSON(attrsPath + ".meta.json");
-  const capMeta = await readJSON(captionsPath + ".meta.json");
-  const sd = phases.filter((p) => p.phase === "schema_designer");
-  const ext = phases.filter((p) => p.phase === "extractor" || p.phase.startsWith("vadar_"));
-  const corpusTelemetry = {
-    corpus: corpus.table,
-    modality,
-    queries: corpusQueries.map((p) => p.query),
-    query_count: corpusQueries.length,
-    schema_design: {
-      ms: sd.reduce((s, p) => s + p.duration_ms, 0),
-      calls: sd.reduce((s, p) => s + p.llm_calls, 0),
-      cost_usd: sd.reduce((s, p) => s + p.cost_usd, 0),
-      model: agentModelsLine(args),
-    },
-    extractor_codegen: {
-      ms: ext.reduce((s, p) => s + p.duration_ms, 0),
-      calls: ext.reduce((s, p) => s + p.llm_calls, 0),
-      cost_usd: ext.reduce((s, p) => s + p.cost_usd, 0),
-    },
-    extraction: {
-      sec: extMeta?.elapsed_sec ?? null,
-      calls: extMeta?.llm_calls ?? null,
-      model: extractModel,
-    },
-    // Amortized across the whole query family, like extraction — not per query.
-    captioning: capMeta ? {
-      sec: capMeta.elapsed_sec ?? null,
-      calls: capMeta.llm_calls ?? null,
-      rows: capMeta.rows ?? null,
-      model: args.captionModel || defaults.extraction.captionModel,
-    } : null,
-  };
-  if (!args.dryRun) await writeFile(resolve(corpusDir, "corpus_telemetry.json"), JSON.stringify(corpusTelemetry, null, 2));
-  return { corpusDir, schemaPath, attrsPath, captionsPath, schema, corpusTelemetry, idCol, textCol, imageCol, extractModel, isImage, modality };
 }
 
 /** Per-row validation scoring for one iteration: run evaluate.py --score-inference on
@@ -1827,177 +1864,6 @@ async function refineLoop({ args, query, runDir, codeBasename, resultsCsv, genFi
            bestObjective: semdbObjective(best.outcome), stopReason: history, history };
 }
 
-// ---------------------------------------------------------------------------
-// Per-query Phase C + execute + evaluate (reuses the corpus schema + attrs).
-// ---------------------------------------------------------------------------
-async function runQueryCodegen(args, planObj, art, csvPath) {
-  const { query, sql, structured, plan, corpus } = planObj;
-  const wallStart = Date.now();
-  const runDir = resolve(args.out, `${args.benchmark}-${query}`);
-  await mkdir(runDir, { recursive: true });
-  const resultsCsv = resolve(runDir, `${query}_results.csv`);
-  const { schemaPath, attrsPath, schema, corpusTelemetry, extractModel } = art;
-  const doRun = !args.dryRun && (args.run || !!args.groundTruthDir) && !args.noRun;
-
-  const phases = [];
-  const record = makeRecorder(args, phases);
-
-  console.log(`\n[SemDB] ---- ${query}  (corpus ${corpus.table}, ${plan.type}) ----`);
-
-  const codeBasename = `compiled_${query}.py`;
-  const telePath = resolve(runDir, "telemetry.json");
-
-  const cgVars = (iterCode, querySql) => ({
-    query_id: query, query_sql: querySql,
-    schema_json: schema ? JSON.stringify(schema, null, 2) : "{{corpus schema.json}}",
-    attrs_path: attrsPath, attrs_columns: "(schema attributes + conf)",
-    structured_path: structured.path || "(structured table path)",
-    structured_columns: "(see table headers)",
-    code_path: iterCode, code_basename: codeBasename,
-  });
-
-  const runCompiled = (iterDir, iterCode, iterCsv) => {
-    if (!(doRun && existsSync(iterCode) && existsSync(attrsPath))) return { status: "empty", stderr: "" };
-    const pre = runPreflight([iterCode], resolve(iterDir, "preflight.json"));
-    if (!pre.ok) {
-      console.warn(`[SemDB] [${query}] preflight failed (${pre.stage}) — not executing.\n${pre.text}`);
-      return { status: "crash", stage: "compile", preflight: pre.report, stderr: pre.text };
-    }
-    const cqArgs = [iterCode, structured.path, attrsPath, iterCsv,
-      ...(args.endpoint ? ["--endpoint", args.endpoint, "--api-key", args.apiKey, "--model", extractModel] : [])];
-    console.log(`\n[SemDB] Running compiled query: python3 ${cqArgs.join(" ")}`);
-    const { proc, stdout, stderr, execMs, logPath } =
-      runPythonLogged(cqArgs, resolve(iterDir, "run.log"), "compiled query");
-    const out = { stderr, stdout, execMs, logPath };
-    if (proc.status !== 0) {
-      console.warn(`[SemDB] compiled query exited ${proc.status} (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
-      return { status: "crash", ...out };
-    }
-    console.log(`[SemDB] compiled query ok (${(execMs / 1000).toFixed(1)}s) — log: ${logPath}`);
-    return { status: "ok", ...out };
-  };
-
-  const genFirst = async (iterDir, iterCode, iterCsv) => {
-    record("code_generator", await runPhase(codeGeneratorConfig, cgVars(iterCode, sql), iterDir, args));
-    return runCompiled(iterDir, iterCode, iterCsv);
-  };
-  const regen = async (iterDir, iterCode, iterCsv, feedback) => {
-    record("code_generator", await runPhase(codeGeneratorConfig, cgVars(iterCode, sql + "\n\n" + feedback), iterDir, args));
-    return runCompiled(iterDir, iterCode, iterCsv);
-  };
-  const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
-    const diffPath = resolve(iterDir, "diff.json");
-    const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
-    const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
-    return { ...scored, status, stage: run.stage ?? null,
-             execMs: run.execMs ?? null,
-             runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
-             stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
-  };
-
-  const { bestIter, bestF1, bestObjective, history } = await refineLoop({
-    args, query, runDir, codeBasename, resultsCsv,
-    genFirst, regen, scoreIter,
-  });
-
-  if (args.dryRun) return null;
-
-  // --- Per-query telemetry (codegen + residual) + shared corpus (amortized) ---
-  // record("code_generator", ...) pushes one phase per iteration; sum across all of them
-  // rather than taking only the first (iter_0) via .find, which would undercount cost.
-  const cgPhases = phases.filter((p) => p.phase === "code_generator");
-  const cg = {
-    duration_ms: cgPhases.reduce((s, p) => s + (p.duration_ms || 0), 0),
-    cost_usd:    cgPhases.reduce((s, p) => s + (p.cost_usd || 0), 0),
-    llm_calls:   cgPhases.reduce((s, p) => s + (p.llm_calls || 0), 0),
-    tokens: cgPhases.reduce((t, p) => ({ input: (t.input || 0) + (p.tokens?.input || 0),
-                                         output: (t.output || 0) + (p.tokens?.output || 0) }), {}),
-  };
-  const cqMeta = await readJSON(resolve(runDir, `iter_${bestIter}`, `compiled_${query}.meta.json`));
-  const residualCalls = cqMeta?.residual_calls || 0;
-  const N = await countRows(corpus.path);
-  const extractionCalls = corpusTelemetry.extraction.calls ?? (N ?? 0);
-  const schemaCalls = corpusTelemetry.schema_design.calls || 0;
-  const K = corpusTelemetry.query_count || 1;
-  const naiveCalls = plan.naive;
-  const compiledExecCalls = extractionCalls + residualCalls;
-  const reduction = (naiveCalls && compiledExecCalls) ? Number((naiveCalls / compiledExecCalls).toFixed(1)) : null;
-  const amortizedTotal = cg.llm_calls + residualCalls + (schemaCalls + extractionCalls) / K;
-  const codegenCost = cg.cost_usd;
-  const amortizedCost = codegenCost + (corpusTelemetry.schema_design.cost_usd || 0) / K;
-  const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
-
-  const report = {
-    query, corpus: corpus.table, provider: args.agentProvider, operator: plan.type,
-    wall_clock_ms: Date.now() - wallStart,
-    per_query: {
-      codegen_ms: cg.duration_ms, codegen_calls: cg.llm_calls,
-      codegen_cost_usd: Number(codegenCost.toFixed(4)),
-      codegen_tokens: (cg.tokens.input || 0) + (cg.tokens.output || 0),
-      compiled_query_sec: cqMeta?.elapsed_sec ?? null, residual_calls: residualCalls,
-    },
-    shared_corpus: {
-      corpus: corpus.table, query_count: K,
-      schema_design_calls: schemaCalls,
-      schema_design_cost_usd: Number((corpusTelemetry.schema_design.cost_usd || 0).toFixed(4)),
-      extraction_calls: extractionCalls, extraction_sec: corpusTelemetry.extraction.sec,
-      amortized_schema_design_calls: Number((schemaCalls / K).toFixed(2)),
-      amortized_extraction_calls: Number((extractionCalls / K).toFixed(2)),
-    },
-    llm_calls: {
-      schema_design: schemaCalls, extraction: extractionCalls,
-      codegen: cg.llm_calls, residual: residualCalls,
-      amortized_total: Number(amortizedTotal.toFixed(2)),
-    },
-    naive_llm_calls: naiveCalls ?? null,
-    compiled_execution_calls: compiledExecCalls,
-    call_reduction: reduction,
-    total_estimated_cost_usd: Number(amortizedCost.toFixed(4)),
-    ground_truth: gt ? { file: gt.file, count: gt.count } : null,
-    refine: { iterations: history.length - 1, best_iteration: bestIter,
-              max_iterations: args.noRefine ? 0 : args.maxIterations,
-              objective: bestObjective.name,
-              objective_direction: bestObjective.direction,
-              objective_history: history.map((item) => item.objective),
-              f1_history: history },
-    phases,
-  };
-  await writeFile(telePath, JSON.stringify(report, null, 2));
-
-  // --- Summary print ---
-  console.log(`\n[SemDB] === ${query} ===`);
-  console.log(`[SemDB]   code_generator     ${(cg.duration_ms / 1000).toFixed(1)}s  ${cg.llm_calls} calls  $${cg.cost_usd.toFixed(4)}  (${report.phases[0]?.model || ""})`);
-  console.log(`[SemDB]   shared/corpus      schema_design ${schemaCalls} + extraction ${extractionCalls} calls  ÷ ${K} queries  (amortized ${(schemaCalls / K).toFixed(1)}+${(extractionCalls / K).toFixed(1)})`);
-  console.log(`[SemDB]   residual           ${residualCalls}`);
-  const naiveExpr = plan.type === "join"
-    ? `= ${plan.tables.map((t) => plan.counts[t]).join(" × ")} (${plan.tables.join(" × ")})`
-    : (plan.naive != null ? `= ${plan.naive} rows` : "");
-  console.log(`[SemDB]   ORIGINAL (naive)   ${naiveCalls != null ? naiveCalls : "?"} [${plan.type}] ${naiveExpr}`);
-  console.log(`[SemDB]   COMPILED exec      ${compiledExecCalls} (extraction ${extractionCalls} + residual ${residualCalls})${reduction ? `  → ${reduction}× fewer` : ""}`);
-
-  // (3) finalize: score the promoted best CSV → merge metrics into telemetry + append results.csv row
-  if (doRun) {
-    const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
-    if (gt && existsSync(resultsCsv)) {
-      await scoreWithDiff(args, query, planObj, telePath, resultsCsv, resolve(runDir, "diff.json"), csvPath, true);
-    }
-  }
-
-  // --- Score against ground truth + append CSV (re-read telePath, merged by finalize above) ---
-  if (doRun && gt && existsSync(resultsCsv)) {
-    const scored = await readJSON(telePath);
-    const m = scored?.metrics;
-    if (m) {
-      const shown = formatQueryMetric(m);
-      console.log(`[SemDB]   METRICS            ${m.metric || "unknown"}: ${shown.label}`);
-      console.log(`[SemDB]   saved -> ${telePath} and ${csvPath}`);
-    }
-  } else if (gt) {
-    console.log(`[SemDB]   (compiled output not found — score later with evaluate.py --pred ${resultsCsv})`);
-  }
-  return report;
-}
-
 /** Pick the filename + absolute-path columns from an image-manifest header. */
 function pickImageCols(header) {
   const cols = header.split(",").map((c) => c.trim());
@@ -2025,6 +1891,34 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const phases = [];
   const record = makeRecorder(args, phases);
   console.log(`\n[SemDB] ---- ${query}  (DIRECT ${architecture}: solver over ${corpus.table}) ----`);
+
+  // Cross-run memory for this query (pre-computed in main(); absent = disabled).
+  const mem = args.memoryClassifications?.[query] || null;
+  if (mem) {
+    console.log(`[SemDB] [${query}] memory: tier=${mem.tier} score=${mem.score.toFixed(2)}`
+      + ` L1=${mem.matchedL1 || "none"}${mem.warmStart ? " warm-start" : ""}`);
+    try {
+      await writeJsonAtomic(resolve(runDir, "memory_match.json"), {
+        tier: mem.tier,
+        score: mem.score,
+        matched_l1: mem.matchedL1,
+        matched_l0: mem.matchedL0,
+        warm_start: Boolean(mem.warmStart),
+        skills_available: mem.skillsAvailable,
+        injected_tokens: mem.injectedTokens,
+        signature: mem.signature,
+      });
+    } catch (error) {
+      console.warn(`[SemDB] [${query}] could not write memory_match.json (non-fatal): ${error.message}`);
+    }
+  }
+  /** Memory prompt variables for one role; all empty when memory is off. */
+  const memoryVars = (role) => ({
+    memory_pre_injection: mem?.blocks?.[role] || "",
+    memory_catalog: mem?.catalog || "",
+    memory_inline_skills: mem?.inlineSkills || "",
+    memory_note: mem && mem.tier !== "novel" ? "true" : "",
+  });
 
   // Describe every referenced table (header + path) for the solver.
   const tableLines = [];
@@ -2712,6 +2606,10 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   };
   const scoreIter = async (iterDir, iterCode, iterCsv, run) => {
     const diffPath = resolve(iterDir, "diff.json");
+    // A program that threw on most of its rows exits 0 and still writes a trace, so
+    // without this it scores as "ok" and can win a tie against a candidate that runs.
+    const health = parseRunHealth([run.stdout, run.stderr].filter(Boolean).join("\n"));
+    const broken = runIsBroken(health);
     // A candidate that selects nothing scores F1 0 like any other bad candidate, but it
     // is strictly worse for the loop: with no selected rows the branch counters stop
     // moving and every later iteration sees the same empty output. It was only visible
@@ -2724,25 +2622,34 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       const scored = await scoreInference(args, query, iterDir, valCorpusCsv, valFile, diffPath);
       // "ok" requires a trace to score; without one the agent must fix-first.
       const traceOk = existsSync(resolve(iterDir, `trace_${query}.json`));
-      const status = run.status === "crash" ? "crash" : (traceOk ? "ok" : "empty");
-      return { ...scored, status, stage: run.stage ?? null, selectedRows,
+      const status = (run.status === "crash" || broken) ? "crash" : (traceOk ? "ok" : "empty");
+      if (broken) {
+        console.warn(`[SemDB] [${query}] ${health.errorRows}/${health.rowsIn} rows failed `
+          + `inside the per-row guard — treating this candidate as a crash, not a score.`);
+      }
+      return { ...scored, status, health, stage: run.stage ?? null, selectedRows,
                execMs: run.execMs ?? null,
                runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
                stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
     }
     const scored = await scoreWithDiff(args, query, planObj, telePath, iterCsv, diffPath, csvPath, false);
-    const status = run.status === "crash" ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
-    return { ...scored, status, stage: run.stage ?? null, selectedRows,
+    const status = (run.status === "crash" || broken) ? "crash" : (existsSync(iterCsv) ? "ok" : "empty");
+    if (broken) {
+      console.warn(`[SemDB] [${query}] ${health.errorRows}/${health.rowsIn} rows failed `
+        + `inside the per-row guard — treating this candidate as a crash, not a score.`);
+    }
+    return { ...scored, status, health, stage: run.stage ?? null, selectedRows,
              execMs: run.execMs ?? null,
              runLog: filterRunLog([run.stdout, run.stderr].filter(Boolean).join("\n")),
              stderrTail: (run.stderr || "").split("\n").slice(-40).join("\n") };
   };
 
-  const primitiveFiles = isImage
-    ? [resolve(__dirname, "vadar", "predefined.py")]
-    : [resolve(__dirname, "vadar", "predefined_text.py")];
+  // ONE operator library for both modalities: vadar/predefined.py holds the VISION
+  // functions (over an ImagePatch) and the TEXT functions (over strings) together, so a
+  // query that joins an image predicate against a text column reads a single file.
+  const primitiveFiles = [resolve(__dirname, "vadar", "predefined.py")];
   const plannerVars = (planPath, previousPlanPath = "", optimizerActionPath = "",
-                       plannerLint = "") => ({
+                       plannerLint = "", referencePlanPath = "") => ({
     query_id: query,
     query_sql: sql,
     query_nl: nl || "(none)",
@@ -2754,9 +2661,13 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     previous_plan_path: previousPlanPath,
     optimizer_action_path: optimizerActionPath,
     planner_lint: plannerLint,
+    plan_schema_path: resolve(__dirname, "contracts", "semantic-plan.schema.json"),
+    memory_reference_plan_path: referencePlanPath,
+    ...memoryVars("planner"),
   });
   const generatorVars = ({
     planPath,
+    generationMode = "INITIAL",
     parentManifestPath = "",
     actionPath = "",
     helpersPath,
@@ -2764,9 +2675,12 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     manifestPath,
   }) => ({
     query_id: query,
+    generation_mode: generationMode,
     plan_path: planPath,
+    plan_schema_path: resolve(__dirname, "contracts", "semantic-plan.schema.json"),
     parent_candidate_manifest_path: parentManifestPath,
     optimizer_action_path: actionPath,
+    replan_action_path: generationMode === "REPLAN" ? actionPath : "",
     helpers_path: helpersPath,
     solve_path: solverPath,
     manifest_draft_path: manifestPath,
@@ -2774,7 +2688,15 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
     semdb_dir: __dirname,
     runtime_args: isImage ? " --image-dir <dir> --clip-model <model>" : "",
+    ...memoryVars("generator"),
   });
+
+  // An exact memory match may warm-start iteration 0. The stored plan is passed as
+  // a REFERENCE, not as replan context: the replan branch requires
+  // plan_version = previous + 1, which would break the initial plan's
+  // plan_version === 1 contract. `warm` is cleared if preflight later rejects the
+  // seeded candidate, so a stale reference degrades to today's cold start.
+  let warm = mem?.warmStart || null;
 
   const createInitialPlan = async ({ iterDir, planPath }) => {
     // A non-discriminative image binding cannot be repaired downstream: the generator
@@ -2785,7 +2707,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       record("query_planner", await runPhase(
         queryPlannerConfig,
-        plannerVars(planPath, "", "", lintText),
+        plannerVars(planPath, "", "", lintText, warm?.planPath || ""),
         iterDir,
         args,
       ));
@@ -2844,12 +2766,29 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     if (action?.action === "PATCH_CODE" && parentCandidate) {
       await copyFile(parentCandidate.helperPath, helperPath);
       await copyFile(parentCandidate.solverPath, solverPath);
+    } else if (!action && warm?.helpersPath && warm?.solverPath) {
+      // Warm start: seed iteration 0 with the previously promoted implementation.
+      // generationMode stays INITIAL — the generator must reconcile these files
+      // with the plan it was given, exactly as it does for a patch.
+      try {
+        await copyFile(warm.helpersPath, helperPath);
+        await copyFile(warm.solverPath, solverPath);
+        console.log(`[SemDB] [${query}] warm start: seeded iter_0 from ${warm.candidateId || "a past candidate"}`);
+      } catch (error) {
+        console.warn(`[SemDB] [${query}] warm start failed, falling back to a cold start`
+          + ` (non-fatal): ${error.message}`);
+        warm = null;
+      }
     }
     record("semantic_code_generator", await runPhase(
       semanticCodeGeneratorConfig,
       generatorVars({
         planPath,
-        parentManifestPath: parentCandidate?.manifestPath || "",
+        generationMode: action?.action || "INITIAL",
+        parentManifestPath:
+          action?.action === "PATCH_CODE"
+            ? (parentCandidate?.manifestPath || "")
+            : "",
         actionPath,
         helpersPath: helperPath,
         solverPath,
@@ -2939,8 +2878,15 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         iteration_feedback_path: feedbackPath,
         history_manifest_paths: historyManifestPaths,
         optimizer_action_path: actionPath,
+        optimizer_action_schema_path: resolve(
+          __dirname,
+          "contracts",
+          "optimizer-action.schema.json",
+        ),
+        local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
         remaining_iteration_budget: remainingIterationBudget,
         remaining_replan_budget: remainingReplanBudget,
+        ...memoryVars("optimizer"),
       },
       iterDir,
       args,
@@ -2951,13 +2897,42 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     });
     return { actionObject, actionPath };
   };
-  const executePgoCandidate = async (candidate) => runSolver(
-    candidate.iterDir,
-    candidate.solverPath,
-    candidate.csvPath,
-    valMode ? valIdsPath : null,
-    candidate.helperPath,
-  );
+  const executePgoCandidate = async (candidate, context = {}) => {
+    const run = await runSolver(
+      candidate.iterDir,
+      candidate.solverPath,
+      candidate.csvPath,
+      valMode ? valIdsPath : null,
+      candidate.helperPath,
+    );
+    // A warm-started iteration 0 that will not even compile means the seeded
+    // implementation no longer fits this corpus. Spend one extra generator call to
+    // redo it cold rather than burning the whole iteration budget repairing
+    // someone else's code.
+    if (warm && candidate.iteration === 0 && run.status === "crash" && run.stage === "compile") {
+      console.warn(`[SemDB] [${query}] warm-started iter_0 failed preflight —`
+        + ` regenerating cold and discarding the memory reference.`);
+      warm = null;
+      const cold = await generateCandidate({
+        query: context.query,
+        iteration: 0,
+        iterDir: candidate.iterDir,
+        plan: candidate.plan,
+        planPath: candidate.planPath,
+        action: null,
+        parentCandidate: null,
+      });
+      Object.assign(candidate, cold);
+      return runSolver(
+        candidate.iterDir,
+        candidate.solverPath,
+        candidate.csvPath,
+        valMode ? valIdsPath : null,
+        candidate.helperPath,
+      );
+    }
+    return run;
+  };
   const scorePgoCandidate = async (candidate, run) => {
     if (valMode) {
       return scoreIter(
@@ -3030,8 +3005,15 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
           iteration_feedback_path: resolve(iter0Dir, "iteration_feedback.json"),
           history_manifest_paths: `- ${dryManifestPath}`,
           optimizer_action_path: resolve(iter1Dir, "optimizer_action.json"),
+          optimizer_action_schema_path: resolve(
+            __dirname,
+            "contracts",
+            "optimizer-action.schema.json",
+          ),
+          local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
           remaining_iteration_budget: args.maxIterations,
           remaining_replan_budget: args.maxReplans,
+          ...memoryVars("optimizer"),
         },
         iter1Dir,
         args,
@@ -3112,6 +3094,19 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     replans: replansUsed,
     optimizer_actions: actionCounts,
     best_candidate_id: bestCandidate?.candidate_id ?? null,
+    // Memory's only observability. `skills_used` in particular is the sole signal
+    // that free discovery is being exercised rather than ignored.
+    memory: {
+      enabled: Boolean(mem),
+      tier: mem?.tier ?? null,
+      score: mem?.score ?? null,
+      matched_l1: mem?.matchedL1 ?? null,
+      matched_l0: mem?.matchedL0 ?? null,
+      warm_start: Boolean(mem?.warmStart) && Boolean(warm),
+      skills_available: (args.availableSkills || []).filter((s) => !s.role).length,
+      skills_used: await readSkillUsage(args.out, query),
+      injected_tokens: mem?.injectedTokens ?? null,
+    },
     direct: { agent_stage_ms: agentMs, agent_calls: agentCalls,
               agent_cost_usd: Number(agentCost.toFixed(4)),
               timing_breakdown_ms: timingBreakdown,
@@ -3196,17 +3191,47 @@ async function runQueryDirect(args, planObj, csvPath) {
 async function main() {
   const base = parseArgs(process.argv);
   await validateDataDirectory(base);
-  if (!base.direct && base.directOptionsSpecified) {
-    console.warn(
-      "[SemDB] --agent-architecture/--max-replans/--no-agent-skills "
-      + "only affect --direct and are ignored.",
-    );
-  }
   if (base.valRate && !base.valPlanOnly && base.endpoint && base.oracleModel) {
     await validateEndpointModel(base.endpoint, base.oracleModel, base.apiKey);
   }
   setAgentProvider(base.agentProvider);
+  base.runId = new Date().toISOString().replace(/[:.]/g, "-");
   const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
+
+  // --- Skills and cross-run memory ------------------------------------------
+  // The skill root exists even without --memory-dir: the three role procedures
+  // are discovered from it, and before this change they were injected into every
+  // system prompt unconditionally. Memory only adds learned semdb-* skills and
+  // the L0/L1 push channel on top.
+  base.memoryReady = false;
+  base.skillRoot = null;
+  base.availableSkills = [];
+  if (base.enableAgentSkills !== false) {
+    try {
+      base.skillRoot = resolveSkillRoot(base);
+      await initSkillRoot(base.skillRoot);
+      await publishRoleSkills(base.skillRoot);
+      if (base.memoryDir) {
+        const init = await initMemory(base.memoryDir, {
+          ...defaults.memory,
+          groundTruthDir: base.groundTruthDir,
+        });
+        base.memoryReady = init.ready;
+        if (init.ready) console.log(`[SemDB] ${await getMemorySummary(base.memoryDir)}`);
+      } else {
+        await lintAllSkills(base.skillRoot, { skillNamePrefix: defaults.memory.skillNamePrefix });
+      }
+      base.availableSkills = await listSkills(base.skillRoot);
+      const learned = base.availableSkills.filter((s) => !s.role).length;
+      console.log(`[SemDB] skills: ${base.availableSkills.length} discoverable`
+        + ` (${learned} learned) at ${base.skillRoot}`);
+    } catch (error) {
+      console.warn(`[SemDB] skill root unavailable (non-fatal): ${error.message}`);
+      base.skillRoot = null;
+      base.availableSkills = [];
+    }
+  }
+  if (base.noMemorySkills) base.availableSkills = base.availableSkills.filter((s) => s.role);
 
   // --query takes ONE id or a list (comma/space separated): --query q2,q4  OR  --query "q2 q4".
   const queries = base.query
@@ -3263,19 +3288,6 @@ async function main() {
         + `Check --benchmark (got '${base.benchmark}') and --sf so the SQL prefix '${benchPrefix(base.benchmark)}.' matches.`);
       return false;
     }
-    // Preserve the non-DIRECT pipeline's existing behavior. Typed whole-query
-    // capability artifacts are a DIRECT-PGO contract; legacy extract/compile still
-    // skips ambiguous multi-site refinement rather than reading partial feedback.
-    if (!base.direct && base.valRate && base.valCallSite == null && base.queryDir) {
-      const sites = callSites(resolve(base.queryDir, `${p.query}.sql`));
-      if (sites.length > 1 && !base.valPlanOnly) {
-        console.warn(`[SemDB] [${p.query}] SKIP: query has ${sites.length} AI call `
-          + `sites but one per-predicate validation frame cannot score the complete `
-          + `multi-predicate query. Run it explicitly with --val-call-site N, or omit `
-          + `--val-rate.`);
-        return false;
-      }
-    }
     return true;
   });
   // --image-only: keep only queries whose chosen corpus is an image table.
@@ -3293,44 +3305,43 @@ async function main() {
   }
   console.log(`[SemDB] ${corpora.size} corpus/corpora: ${[...corpora.entries()].map(([k, v]) => `${k}(${v.queries.length})`).join(", ")}`);
 
-  // DIRECT mode: skip Schema Designer + extract/compile; the VADAR 3 agents write one
-  // end-to-end solver per query. Otherwise: Schema Designer + Extractor once per corpus.
-  const summary = [];
-  if (base.direct) {
-    console.log(
-      `[SemDB] DIRECT mode (${base.agentArchitecture}): agent solver per query `
-      + "(no schema design, no extract/compile split).",
-    );
+  // Classify every query against memory up front: the tier decides whether a
+  // query warm-starts from a past candidate, so it has to be known before the
+  // per-query pipeline begins. Failures here are never fatal — a query that
+  // cannot be classified simply runs as it does today.
+  base.memoryClassifications = {};
+  if (base.memoryReady) {
     for (const p of runPlans) {
-      console.log(`\n[SemDB] ==================== ${p.query} ====================`);
       try {
-        const outcome = await runQueryDirect(base, p, csvPath);
-        if (outcome?.validation_capability?.class === "not_compilable") {
-          summary.push({ q: p.query, notCompilable: outcome.validation_capability });
-          continue;
-        }
-        const tele = await readJSON(resolve(base.out, `${base.benchmark}-${p.query}`, "telemetry.json"));
-        if (tele?.metrics) summary.push({ q: p.query, ...tele.metrics });
-      } catch (e) {
-        console.error(`[SemDB] [${p.query}] failed: ${e.message}`);
-        summary.push({ q: p.query, error: e.message });
+        base.memoryClassifications[p.query] = await classifyQuery(
+          p, base, base.memoryDir, { ...defaults.memory, skillRoot: base.skillRoot },
+        );
+      } catch (error) {
+        console.warn(`[SemDB] [${p.query}] memory classification failed (non-fatal): ${error.message}`);
       }
     }
-  } else {
-  // 2) Schema Designer + Extractor ONCE per corpus (shared by its queries).
-  const corpusArt = new Map();
-  for (const [key, info] of corpora) {
-    try { corpusArt.set(key, await ensureCorpus(base, info.corpus, info.queries)); }
-    catch (e) { console.error(`[SemDB] corpus ${key} failed: ${e.message}`); }
+    const tiers = { exact: 0, structural: 0, novel: 0 };
+    for (const c of Object.values(base.memoryClassifications)) tiers[c.tier] += 1;
+    console.log(`[SemDB] memory tiers: ${tiers.exact} exact, ${tiers.structural} structural,`
+      + ` ${tiers.novel} novel`);
   }
 
-  // 3) Code Generator + execute + evaluate PER query.
+  // The VADAR agents (Signature → API → Solver) write ONE end-to-end solver per query.
+  // There is no Schema Designer and no extract/attrs/compile split — that pipeline was
+  // removed; `solve_<q>.py` composes the `vadar/` operator library and answers the whole
+  // query itself.
+  const summary = [];
+  console.log(
+    `[SemDB] ${base.agentArchitecture}: agent solver per query over the vadar operator library.`,
+  );
   for (const p of runPlans) {
     console.log(`\n[SemDB] ==================== ${p.query} ====================`);
-    const art = corpusArt.get(p.corpus.table);
-    if (!art) { summary.push({ q: p.query, error: "corpus artifacts missing" }); continue; }
     try {
-      await runQueryCodegen(base, p, art, csvPath);
+      const outcome = await runQueryDirect(base, p, csvPath);
+      if (outcome?.validation_capability?.class === "not_compilable") {
+        summary.push({ q: p.query, notCompilable: outcome.validation_capability });
+        continue;
+      }
       const tele = await readJSON(resolve(base.out, `${base.benchmark}-${p.query}`, "telemetry.json"));
       if (tele?.metrics) summary.push({ q: p.query, ...tele.metrics });
     } catch (e) {
@@ -3338,6 +3349,17 @@ async function main() {
       summary.push({ q: p.query, error: e.message });
     }
   }
+
+  // 3b) Memory curation. Runs once, after every query, so the Manager can see
+  //     cross-query recurrences (which is what L2 and L5 need). Entirely non-fatal:
+  //     a failed curation costs future speed, never this run's results.
+  if (base.memoryReady && !base.memoryReadonly && !base.dryRun) {
+    console.log(`\n[SemDB] ==================== MEMORY CURATION ====================`);
+    try {
+      await curateMemory(base, runPlans);
+    } catch (error) {
+      console.error(`[SemDB] memory curation failed (non-fatal): ${error.message}`);
+    }
   }
 
   // 4) Workload summary.

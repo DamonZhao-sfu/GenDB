@@ -10,6 +10,5 @@ export const config = {
   userPromptPath: resolve(here, "user-prompt.md"),
   skillPath: resolve(here, "..", "..", "skills", "optimize-semantic-program", "SKILL.md"),
   skillName: "optimize-semantic-program",
-  useSkills: true,
-  allowedTools: ["Read", "Write", "Glob", "Grep"],
+  allowedTools: ["Read", "Write", "Glob", "Grep", "Skill"],
 };

@@ -66,14 +66,59 @@
   "allOf": [
     {
       "if": {
+        "properties": { "action": { "const": "PATCH_CODE" } },
+        "required": ["action"]
+      },
+      "then": {
+        "properties": {
+          "replan_reason": false,
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "artifact": { "enum": ["helpers", "solver"] }
+              },
+              "required": ["artifact"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": { "action": { "const": "REPLAN" } },
         "required": ["action"]
       },
       "then": {
         "properties": {
-          "replan_reason": { "type": "string", "minLength": 1 }
+          "replan_reason": { "type": "string", "minLength": 1 },
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "artifact": { "const": "plan" }
+              },
+              "required": ["artifact"]
+            }
+          }
         },
         "required": ["replan_reason"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "action": { "const": "STOP" } },
+        "required": ["action"]
+      },
+      "then": {
+        "properties": {
+          "replan_reason": false,
+          "targets": { "type": "array", "maxItems": 0 }
+        }
       }
     }
   ]

@@ -2,7 +2,7 @@ import os, sys
 import numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import semvision
+from vadar import backend as semvision
 
 
 def _write_half(tmp, top_rgb, bottom_rgb):

@@ -1,118 +1,101 @@
 # SemDB — Semantic Operator Compilation & Execution
 
-SemDB compiles **semantic operators over multimodal data** (`AI.IF`,
-`AI.GENERATE`, semantic join / map / filter / rank / classify) into **vectorized
-relational programs** that call a live vision/language model only on a residual.
+SemDB answers **semantic operators over multimodal data** (`AI.IF`, `AI.GENERATE`,
+semantic join / map / filter / rank / classify) by having agents synthesize **one
+offline Python program per query** that composes a local, non-generative operator
+library — CLIP / OCR / CV / detectors for images, deterministic string primitives for
+text — instead of issuing a VLM call per row.
 
-It is a sibling of [GenDB](../../README.md): the same "agents generate execution
-code" idea, but the thing being designed is an **extracted schema over
-unstructured data**, and the expensive primitive is a model call, not a disk
-scan. It reuses GenDB's Claude Agent SDK plumbing (`src/gendb/providers`,
-`src/gendb/shared.mjs`) verbatim.
+It is a sibling of [GenDB](../../README.md): the same "agents generate execution code"
+idea, but the expensive primitive is a model call, not a disk scan. It reuses GenDB's
+Claude Agent SDK plumbing (`src/gendb/providers`, `src/gendb/shared.mjs`) verbatim.
 
-Target workload: [SemBench](https://github.com/SemBench/SemBench) (MMQA first).
-Theory: semantic-operator decomposition / compilation (arXiv 2607.13407).
+Target workload: [SemBench](https://github.com/SemBench/SemBench).
+Theory: semantic-operator decomposition / compilation (arXiv 2607.13407), VADAR
+dynamic-API synthesis (arXiv 2502.06787).
 
 ## The idea in one query
 
-`AI.IF("does this image show the logo of {airline}?")` joining airlines × images
-is **M×N** VLM calls. SemDB decomposes it:
+`AI.IF("does this image show the logo of {airline}?")` joining airlines × images is
+**M×N** VLM calls. SemDB replaces it with **zero**: the planner binds the predicate to
+a local primitive (`best_ocr_match` over the airline value space read from the
+structured column at runtime), the generator writes `solve_q7.py` around it, and the
+join/filter/projection happen in plain Python over the primitive's output.
 
-1. **Schema Designer** notices the image side has a nameable slot (`logo_brand`)
-   while the airline side is already structured → extract one side only.
-2. **Extractor** runs a *small* VLM once per image → a reusable `img_attrs` table.
-3. **Code Generator** compiles the join to normalize + hash-join, with a **masked
-   residual** VLM call only for images the small model was unsure about.
-
-Result: identical answers, `M×N → N extractions + hash join + k residual`, and
-the extraction is shared across every logo query (q2a, q2b, q7).
-
-## Three agents (mirroring GenDB's layout)
+## Layout
 
 ```
+vadar/                 # THE OPERATOR LIBRARY — everything generated code runs on
+  __init__.py          #   ImagePatch / get_encoder / resolve_image_path
+  predefined.py        #   the operators: VISION (over an ImagePatch) + TEXT (over str)
+  imagepatch.py        #   an image, or a region of one, with the primitives bound to it
+  backend.py           #   model loading + raw proxies (CLIP / OCR / CV / YOLO / OWL)
+  paths.py             #   corpus reference -> real file
+  models/              #   bundled detector weights
+  API.md               #   the ImagePatch API spec shown to the agents
+
 agents/
-  schema-designer/   {index.mjs, prompt.md, user-prompt.md}   # decomposability + schema
-  extractor/         {index.mjs, prompt.md, user-prompt.md}   # small VLM → attribute table
-  code-generator/    {index.mjs, prompt.md, user-prompt.md}   # relational program + residual
-orchestrator.mjs     # wires A→B→C, imports ../gendb/shared.mjs
-semdb.config.mjs     # models / thresholds
+  query-planner/            # SQL -> a typed semantic plan (which primitive, which value space)
+  semantic-code-generator/  # plan -> solve_<q>.py + helpers
+  semantic-optimizer/       # scored run -> the next action (patch / replan / reprompt)
+  vadar-signature/          # propose new helper signatures over the operator library
+  vadar-api/                # implement one proposed signature
+  vadar-solver/             # write the end-to-end solver
+skills/                # the shared instruction bodies those agents load
+
+orchestrator.mjs       # wires the agents, runs the solver, scores, iterates
+semdb.config.mjs       # models / effort / thresholds
 ```
 
-## Runnable PoC (no GPU, no API key)
+Everything under `vadar/` is **offline**: no VLM, no LLM, no HTTP client, no API key.
+`orchestrator.mjs` enforces that on every generated file before executing it
+(`offlineVadarViolations`). The endpoint-backed tools — `semvqa.py` (oracle labelling),
+`semcaption.py` (captions), `semextract.py` (the guided-JSON client they share) — live
+OUTSIDE the package and import from it, never the other way round.
+
+## What a generated program looks like
+
+One import root, and every value space read at runtime:
+
+```python
+import sys
+sys.path.insert(0, "<semdb_dir>")
+from vadar import ImagePatch, get_encoder, resolve_image_path
+from vadar.predefined import classify, best_ocr_match, dominant_colors, contains_any
+```
+
+## Run it
 
 ```bash
-bash src/semdb/poc/run_poc.sh
+./run_image_queries.sh                 # all image scenarios
+QUERIES=q2a,q7 ./run_image_queries.sh mmqa
+ITERS=0 ./run_image_queries.sh         # single-shot, no refinement loop
 ```
 
-Extracts a synthetic image corpus with a deterministic small-VLM stand-in,
-compiles the airline-logo join, runs the naive M×N oracle, and **asserts the two
-produce identical results** while reporting the model-call reduction (60 → 12 on
-the sample). Swap `mock_extractor.py` for `vlm_extractor.py` (SmolVLM-256M /
-Qwen3-VL-2B) to run the same contract on real pixels.
-
-Dry-run the live agent pipeline (renders the three prompts, no credentials):
+Or drive the orchestrator directly — see [`USAGE.md`](USAGE.md):
 
 ```bash
-node src/semdb/orchestrator.mjs --query q7 --dry-run
+node src/semdb/orchestrator.mjs --benchmark mmqa \
+  --sembench-dir /localhome/hza214/SemBench --sf 200 \
+  --run --agent-provider codex \
+  --endpoint http://localhost:8000/v1 --api-key EMPTY \
+  --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+  --val-rate 0.05 --max-iterations 5 \
+  --out src/semdb/runs/mmqa
 ```
 
-## Use it on your own SemBench data
-Point it at your query folder + data folder and a query id — see
-[`USAGE.md`](USAGE.md):
-
-```bash
-node src/semdb/orchestrator.mjs --query q3a \
-  --query-dir /localhome/hza214/SemBench/files/mmqa/query/bigquery \
-  --data-dir  /localhome/hza214/SemBench/files/mmqa/data/sf_200
-```
+The `--endpoint` / `--oracle-model` here are for **validation labelling only** (building
+the val set the refinement loop scores against). The generated solver itself never sees
+them.
 
 ## Docs
-- [`USAGE.md`](USAGE.md) — how to run it on your SemBench paths (both autonomous and step-by-step).
-- [`docs/PLAN.md`](docs/PLAN.md) — implementation roadmap (PoC → real VLM → full SemBench → optimizer).
+- [`USAGE.md`](USAGE.md) — running it on your SemBench paths, autonomous and step-by-step.
+- [`vadar/API.md`](vadar/API.md) — the ImagePatch API surface.
 - [`docs/SEMBENCH_ANALYSIS.md`](docs/SEMBENCH_ANALYSIS.md) — which SemBench queries compile, and why.
-- [`docs/Q2A_COMPILED_EXAMPLE.md`](docs/Q2A_COMPILED_EXAMPLE.md) — the airline-logo join, phase by phase.
 
-## Status
-Phase 0 (PoC) complete and verifiable. Phase 1 (real small-VLM extraction on an
-MMQA image subset) is the next step — the extractor and gating are already in
-place. See `docs/PLAN.md`.
-
-# Command to run codegen with validation set
-
-node src/semdb/orchestrator.mjs     --benchmark mmqa     --sembench-dir /localhome/hza214/SemBench     --sf 200 --direct     --run     --agent-provider codex     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct     --val-rate 0.05     --max-iterations 5     --out src/semdb/runs/mmqa
-
-
-node src/semdb/orchestrator.mjs   --benchmark animals   --sembench-dir /localhome/hza214/SemBench   --sf 100   --query Q1,Q3,Q10   --direct   --run   --agent-provider codex   --endpoint http://localhost:8000/v1   --api-key EMPTY   --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct   --val-rate 0.05  --max-iterations 3   --out src/semdb/runs/animals   2>&1 | tee animals-qwen-val05.log
-
-
-node src/semdb/orchestrator.mjs \
---benchmark ecomm \
---sembench-dir /localhome/hza214/SemBench \
---sf 250 \
---direct \
---run \
---agent-provider codex \
---endpoint http://localhost:8000/v1 \
---api-key EMPTY \
---oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
---val-rate 0.05 \
---max-iterations 3 \
---out src/semdb/runs/ecomm \
-2>&1 | tee ecomm-qwen-val05.log
-
-
-node src/semdb/orchestrator.mjs \
---benchmark cars \
---sembench-dir /localhome/hza214/SemBench \
---sf 9836 \
---query Q10 \
---direct \
---run \
---agent-provider codex \
---endpoint http://localhost:8000/v1 \
---api-key EMPTY \
---oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
---val-rate 0.05 \
---max-iterations 3 \
---out src/semdb/runs/cars \
-2>&1 | tee cars-qwen-val05.log
+### Historical
+`poc/`, `examples/mmqa_q3/`, `docs/Q2A_COMPILED_EXAMPLE.md` and `docs/PLAN.md` document
+the earlier **Schema-Designer → Extractor → Code-Generator** pipeline (extract an
+attribute table once per corpus, then compile the SQL against it). That pipeline was
+removed; those artifacts are self-contained and still run, but they no longer describe
+how the system works.

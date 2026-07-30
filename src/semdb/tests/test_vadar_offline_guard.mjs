@@ -4,14 +4,15 @@ import {
 } from "../orchestrator.mjs";
 
 const localImage = `
-import semvision, imagepatch
+from vadar import ImagePatch, get_encoder, resolve_image_path
 from vadar.predefined import classify
 value = classify(patch, ["a", "b"])
 `;
 assert.deepEqual(offlineVadarViolations(localImage), []);
 
+// Vision and text operators come from the SAME module now.
 const localText = `
-from vadar.predefined_text import contains_phrase
+from vadar.predefined import contains_phrase, text_classify_detail
 keep = contains_phrase(row["description"], "comedy")
 `;
 assert.deepEqual(offlineVadarViolations(localText), []);
@@ -32,17 +33,20 @@ sim = pair_score(crop(image, 0.5, 0, 1, 1), regions_center(other, 0.6))
 assert.deepEqual(offlineVadarViolations(localRegions), []);
 
 assert.deepEqual(localImportRootViolations([
-  `import sys\nsys.path.insert(0, "/repo/src/semdb")\nimport semvision`,
+  `import sys\nsys.path.insert(0, "/repo/src/semdb")\nfrom vadar import ImagePatch`,
 ], "/repo/src/semdb"), []);
 assert.deepEqual(localImportRootViolations([
   `import sys\nsys.path.insert(0, "/repo/src")\nfrom semdb.vadar import predefined`,
 ], "/repo/src/semdb"), []);
 assert.match(localImportRootViolations([
-  `import sys\nsys.path.insert(0, "/repo/src")\nimport semvision`,
+  `import sys\nsys.path.insert(0, "/repo/src")\nfrom vadar import ImagePatch`,
 ], "/repo/src/semdb")[0], /bare SemDB imports require/);
 
 for (const source of [
-  "import semtext\nctx = semtext.get_ctx(model, url)",
+  // `semextract` is the endpoint-backed extraction client; it lives outside `vadar/`
+  // and must never be imported by a generated program.
+  "import semextract\nraw = semextract.gen_endpoint(cfg, schema, prompt)",
+  "ctx = get_ctx(model, url)",
   "from openai import OpenAI\nclient = OpenAI()",
   "import requests\nrequests.post(url)",
   "from urllib.request import urlopen\nbody = urlopen(url).read()",

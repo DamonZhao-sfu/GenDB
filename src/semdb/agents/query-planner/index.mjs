@@ -10,6 +10,5 @@ export const config = {
   userPromptPath: resolve(here, "user-prompt.md"),
   skillPath: resolve(here, "..", "..", "skills", "plan-semantic-query", "SKILL.md"),
   skillName: "plan-semantic-query",
-  useSkills: true,
-  allowedTools: ["Read", "Write", "Glob", "Grep"],
+  allowedTools: ["Read", "Write", "Glob", "Grep", "Skill"],
 };

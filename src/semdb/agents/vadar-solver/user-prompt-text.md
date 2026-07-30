@@ -13,7 +13,7 @@ Natural language: {{query_nl}}
 Read: `{{helpers_path}}`
 
 ## Offline text API
-Read `MODULES_SIGNATURES_TEXT` in `{{semdb_dir}}/vadar/predefined_text.py`.
+Read `MODULES_SIGNATURES` in `{{semdb_dir}}/vadar/predefined.py`.
 
 ## TRACE CONTRACT — the key `trace_{{query_id}}.json` and `--only-ids` use
 {{trace_contract}}
@@ -27,4 +27,5 @@ Read `MODULES_SIGNATURES_TEXT` in `{{semdb_dir}}/vadar/predefined_text.py`.
 
 The generated Python may use only ordinary strings, the offline text API, generated
 helpers, and Python's standard library. It must not contain model/network clients,
-endpoint/API-key plumbing, `semtext`, `TextPatch`, or a semantic judgement API.
+endpoint/API-key plumbing, `semvqa`/`semcaption`/`semextract`, `TextPatch`, or a
+semantic judgement API.

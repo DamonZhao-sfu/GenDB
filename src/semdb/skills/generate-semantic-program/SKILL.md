@@ -7,11 +7,12 @@ description: Generate or revise a GenDB SemDB offline semantic program from a va
 
 Implement the validated plan as a complete candidate. Do not redesign the query.
 
-You are the legacy VADAR Program/Solver agent working from a typed plan: ONE end-to-end
-program that answers the WHOLE query by composing the predefined LOCAL API (CLIP / OCR /
-CV / detector) plus the plan's helpers. No VLM, no LLM, no endpoint. The generated code must
-not contain a model-service SDK, HTTP/network client, API key, `semtext`, `TextPatch`, or a
-semantic judgement API — the orchestrator enforces this before it runs.
+Write one end-to-end program that answers the whole query by composing the predefined local
+API (CLIP / OCR / CV / detector) plus the plan's helpers. No VLM, no LLM, no endpoint. The
+generated code must not contain a model-service SDK, HTTP/network client, API key,
+`semvqa`/`semcaption`/`semextract`, `TextPatch`, or a semantic judgement API — the
+orchestrator enforces this
+before it runs.
 
 ## Read required inputs
 
@@ -36,9 +37,12 @@ If the plan is `not_compilable`, stop without generating a misleading program.
 
 For image plans:
 
-- Create one shared `semvision` encoder context and wrap resolved paths with
-  `imagepatch.ImagePatch`. Resolve filenames/URIs with
-  `semextract.resolve_image_path`; do not assume the process working directory.
+- The whole runtime is one package: `from vadar import ImagePatch, get_encoder,
+  resolve_image_path` (plus `from vadar.predefined import ...` for the operators), with
+  the SemDB runtime root on `sys.path`.
+- Create one shared encoder context with `get_encoder(model)` and wrap resolved paths
+  with `ImagePatch(path, ctx)`. Resolve filenames/URIs with `resolve_image_path`; do not
+  assume the process working directory.
 - Implement small enums with `classify`, multi-valued fields with `classify_multi`,
   wordmarks with `best_ocr_match`, colors with `dominant_colors`, closed-vocabulary
   objects with `detect`, and open-vocabulary objects with `detect_open`. Treat
@@ -67,17 +71,36 @@ For image plans:
 - Implement the plan's acceptance paths as a DISJUNCTION with distinct branch names, not as
   one AND-chain. Never invent an absolute cutoff the plan did not specify: an unplanned
   `>= 0.5` on an uncalibrated CLIP score typically rejects every row.
-- A candidate that selects ZERO rows is a failure, not a strict predicate. It scores F1 0
-  and leaves the next iteration nothing to learn from, so loosen the most arbitrary
-  rejection rule and regenerate before writing the manifest.
+- A candidate that selects ZERO rows is a failure, not a strict predicate. Remove an
+  unplanned rejection rule introduced by the implementation. If the planned predicate
+  itself selects zero rows, preserve it, emit diagnostics showing where rows were lost,
+  and let the Optimizer request a replan.
 - Read every closed value space (e.g. the set of `Track` names) from the structured column
   AT RUNTIME — never hardcode it.
 - `detect` returns SUB-IMAGES (len = count) and covers only COCO-80 names; anything else
   returns [] and warns, so use `detect_open`, `classify`, or `verify_property` there.
 
-For text plans, use ordinary strings plus the exact functions exported by
-`vadar.predefined_text` and Python standard-library regex/numeric/date operations.
-Do not import `semtext`, `TextPatch`, a model SDK, or a semantic service.
+For text plans, use ordinary strings plus the TEXT functions exported by
+`vadar.predefined` (the same module as the vision ones — `normalize`, `contains_any`,
+`text_classify_detail`, `any_value_in_set`, `regex_extract`, `split_values`, …) and
+Python standard-library regex/numeric/date operations. Every value space they classify
+against is an argument you read from a column at runtime; the library has no built-in
+taxonomy.
+Do not import `semvqa`/`semcaption`/`semextract`, `TextPatch`, a model SDK, or a
+semantic service.
+
+When the plan's site is a `pair`/`ordered_pair`, keep the predicate binary in the code
+too: decide each `(image, value)` pair rather than inferring one label per image and
+comparing it with `==`. One image legitimately matches two values of the paired column
+when one is a qualified form of the other (`"X"` alongside `"<qualifier> at X"`), so use
+normalized containment, not string equality. Extract per-image evidence
+once into a cache, then decide per pair — the model work stays O(images), the predicate
+stays O(pairs).
+
+Never let a single backend decide everything. A path built only on OCR returns "none" for
+every row when easyocr is absent, and a path built only on a closed-set `classify` labels
+every row; bind a fallback on a different backend and count both branches separately so
+the log shows which one carried the run.
 
 Every solver must:
 

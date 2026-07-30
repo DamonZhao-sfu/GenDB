@@ -151,14 +151,14 @@ const action = {
   candidate_id: "q-iter-0",
   action: "PATCH_CODE",
   diagnosis: {
-    category: "threshold_or_mapping",
-    summary: "Recall is low",
+    category: "implementation",
+    summary: "The helper inverted the plan's acceptance condition",
     evidence: ["feedback.errors.false_negative_total"],
   },
   targets: [{
     artifact: "helpers",
     symbol: "matches_predicate",
-    intent: "broaden the positive condition",
+    intent: "implement the plan's acceptance expression without the unintended negation",
   }],
   preserve: ["trace key format"],
   expected_effect: {
@@ -186,10 +186,78 @@ await assert.rejects(
   /query id mismatch/,
 );
 
-await writeJsonAtomic(actionPath, { ...action, action: "REPLAN" });
+await writeJsonAtomic(actionPath, {
+  ...action,
+  targets: [{ artifact: "plan", symbol: "site_0", intent: "replace an invalid primitive" }],
+  action: "REPLAN",
+});
 await assert.rejects(
   () => readAndValidateOptimizerAction(actionPath),
   /replan_reason/,
+);
+
+const replanAction = {
+  ...action,
+  action: "REPLAN",
+  targets: [{
+    artifact: "plan",
+    symbol: "site_0",
+    intent: "replace the invalid primitive binding",
+  }],
+  replan_reason: "The planned primitive cannot discriminate the runtime value space",
+};
+await writeJsonAtomic(actionPath, replanAction);
+assert.equal(
+  (await readAndValidateOptimizerAction(actionPath)).action,
+  "REPLAN",
+);
+
+await writeJsonAtomic(actionPath, {
+  ...replanAction,
+  targets: [{
+    artifact: "helpers",
+    symbol: "matches_predicate",
+    intent: "change semantic behavior outside the plan",
+  }],
+});
+await assert.rejects(
+  () => readAndValidateOptimizerAction(actionPath),
+  /must be equal to constant/,
+);
+
+const stopAction = {
+  ...action,
+  action: "STOP",
+  diagnosis: {
+    category: "converged",
+    summary: "No evidence-supported safe change remains",
+    evidence: ["feedback.objective.value"],
+  },
+  targets: [],
+  expected_effect: {
+    primary_metric: "f1",
+    direction: "unchanged",
+    risk: "none",
+  },
+};
+delete stopAction.replan_reason;
+await writeJsonAtomic(actionPath, stopAction);
+assert.equal(
+  (await readAndValidateOptimizerAction(actionPath)).action,
+  "STOP",
+);
+
+await writeJsonAtomic(actionPath, {
+  ...stopAction,
+  targets: [{
+    artifact: "solver",
+    symbol: "main",
+    intent: "must not accompany STOP",
+  }],
+});
+await assert.rejects(
+  () => readAndValidateOptimizerAction(actionPath),
+  /must NOT have more than 0 items/,
 );
 
 await writeFile(helpersPath, "def changed(): return False\n");

@@ -21,81 +21,153 @@
     "invariants"
   ],
   "properties": {
-    "schema_version": { "const": "1.0" },
-    "query_id": { "type": "string", "minLength": 1 },
-    "plan_version": { "type": "integer", "minimum": 1 },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "query_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_version": {
+      "type": "integer",
+      "minimum": 1
+    },
     "parent_plan_version": {
       "anyOf": [
-        { "type": "integer", "minimum": 1 },
-        { "type": "null" }
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
       ]
     },
-    "modality": { "enum": ["image", "text", "mixed"] },
+    "modality": {
+      "enum": [
+        "image",
+        "text",
+        "mixed"
+      ]
+    },
     "compilability": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["class", "obligations", "unresolved"],
+      "required": [
+        "class",
+        "obligations",
+        "unresolved"
+      ],
       "properties": {
         "class": {
-          "enum": ["exact", "bounded_approximation", "not_compilable"]
+          "enum": [
+            "exact",
+            "bounded_approximation",
+            "not_compilable"
+          ]
         },
         "obligations": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "unresolved": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
     "semantic_sites": {
       "type": "array",
-      "items": { "$ref": "#/$defs/semanticSite" }
+      "items": {
+        "$ref": "#/$defs/semanticSite"
+      }
     },
     "helper_dag": {
       "type": "array",
-      "items": { "$ref": "#/$defs/helperNode" }
+      "items": {
+        "$ref": "#/$defs/helperNode"
+      }
     },
     "relational_plan": {
       "type": "array",
       "items": {
         "anyOf": [
-          { "type": "string", "minLength": 1 },
-          { "type": "object" }
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object"
+          }
         ]
       }
     },
-    "trace_contract": { "type": "object" },
-    "runtime_contract": { "type": "object" },
-    "validation_contract": { "type": "object" },
+    "trace_contract": {
+      "type": "object"
+    },
+    "runtime_contract": {
+      "type": "object"
+    },
+    "validation_contract": {
+      "type": "object"
+    },
     "assumptions": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "invariants": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     }
   },
   "$defs": {
     "typedValue": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type"],
+      "required": [
+        "name",
+        "type"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "type": { "type": "string", "minLength": 1 }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "semanticInput": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["table", "column", "type"],
+      "required": [
+        "table",
+        "column",
+        "type"
+      ],
       "properties": {
-        "table": { "type": "string", "minLength": 1 },
-        "column": { "type": "string", "minLength": 1 },
-        "type": { "type": "string", "minLength": 1 }
+        "table": {
+          "type": "string",
+          "minLength": 1
+        },
+        "column": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "semanticSite": {
@@ -111,23 +183,50 @@
         "value_space"
       ],
       "properties": {
-        "site_id": { "type": "string", "minLength": 1 },
-        "operator": { "type": "string", "minLength": 1 },
-        "predicate": { "type": "string" },
+        "site_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "predicate": {
+          "type": "string"
+        },
         "inputs": {
           "type": "array",
-          "items": { "$ref": "#/$defs/semanticInput" }
+          "items": {
+            "$ref": "#/$defs/semanticInput"
+          }
         },
         "sampling_unit": {
-          "enum": ["row", "pair", "ordered_pair", "tuple", "group"]
+          "enum": [
+            "row",
+            "pair",
+            "ordered_pair",
+            "tuple",
+            "group"
+          ]
         },
-        "output_type": { "type": "string", "minLength": 1 },
+        "output_type": {
+          "type": "string",
+          "minLength": 1
+        },
         "value_space": {
           "anyOf": [
-            { "type": "array" },
-            { "type": "object" },
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "array"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
@@ -135,30 +234,66 @@
     "primitiveStep": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["primitive", "source", "inputs", "output_type"],
+      "required": [
+        "primitive",
+        "source",
+        "inputs",
+        "output_type"
+      ],
       "properties": {
-        "primitive": { "type": "string", "minLength": 1 },
-        "source": { "type": "string", "minLength": 1 },
+        "primitive": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
         "inputs": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
-        "output_type": { "type": "string", "minLength": 1 }
+        "output_type": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "confidenceSignal": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["source", "range", "higher_is_more_confident"],
+      "required": [
+        "source",
+        "range",
+        "higher_is_more_confident"
+      ],
       "properties": {
-        "source": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
         "range": {
           "type": "array",
-          "prefixItems": [{ "type": "number" }, { "type": "number" }],
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
           "minItems": 2,
           "maxItems": 2
         },
-        "higher_is_more_confident": { "type": "boolean" }
+        "higher_is_more_confident": {
+          "type": "boolean"
+        },
+        "threshold": {
+          "type": "number",
+          "description": "The numeric cutoff the generated code must apply to this signal. REQUIRED when the helper decides row membership with an argmax primitive (classify / classify_detail), which cannot otherwise abstain. This is the knob the optimizer tunes."
+        }
       }
     },
     "helperNode": {
@@ -174,25 +309,44 @@
         "confidence_signal"
       ],
       "properties": {
-        "helper_id": { "type": "string", "minLength": 1 },
-        "name": { "type": "string", "minLength": 1 },
+        "helper_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
         "args": {
           "type": "array",
-          "items": { "$ref": "#/$defs/typedValue" }
+          "items": {
+            "$ref": "#/$defs/typedValue"
+          }
         },
-        "return_type": { "type": "string", "minLength": 1 },
+        "return_type": {
+          "type": "string",
+          "minLength": 1
+        },
         "depends_on": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "primitive_steps": {
           "type": "array",
-          "items": { "$ref": "#/$defs/primitiveStep" }
+          "items": {
+            "$ref": "#/$defs/primitiveStep"
+          }
         },
         "confidence_signal": {
           "anyOf": [
-            { "$ref": "#/$defs/confidenceSignal" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/confidenceSignal"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }

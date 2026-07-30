@@ -56,6 +56,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import semextract  # noqa: E402
+from vadar.paths import resolve_image_path  # noqa: E402
 
 PAIR_SEP = "-"
 
@@ -77,7 +78,7 @@ def similarity_matrix(image_paths: list[str], clip_model: str) -> np.ndarray:
     """[N, N] CLIP image-image similarity, on the same [0,1] scale as
     `semvision.img_pair_score`. One encode of the corpus and one matmul -- computing
     it pairwise would be N^2 encoder calls for the identical numbers."""
-    import semvision
+    from vadar import backend as semvision
 
     encoder = semvision.get_encoder(clip_model)
     matrix = np.asarray(semvision.embed_corpus(image_paths, encoder, on_error="zero"),
@@ -97,7 +98,7 @@ def text_image_similarity(texts: list[str], image_paths: list[str],
     0.47%, a ~200x lift over uniform. Logo recognition is what CLIP is strongest at, so
     the lift here is far larger than the ~2x the image-image score gets on ecomm q9.
     """
-    import semvision
+    from vadar import backend as semvision
 
     encoder = semvision.get_encoder(clip_model)
     imgs = np.asarray(semvision.embed_corpus(image_paths, encoder, on_error="zero"),
@@ -167,7 +168,7 @@ def pair_rows(ids: list[str], files: list[str], sims: np.ndarray, *,
 
 def text_similarity_matrix(texts: list[str], clip_model: str) -> np.ndarray:
     """[N,N] similarity for a text-text self join using the configured CLIP encoder."""
-    import semvision
+    from vadar import backend as semvision
 
     encoder = semvision.get_encoder(clip_model)
     matrix = np.vstack([semvision.embed_text(text, encoder) for text in texts])
@@ -362,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         if len(set(rids)) != len(rids):
             raise SystemExit(f"--right-id-col {args.right_id_col!r} is not unique in "
                              f"{args.right}; pair ids would collide")
-        rpaths = [semextract.resolve_image_path(str(r[args.right_image_col]),
+        rpaths = [resolve_image_path(str(r[args.right_image_col]),
                                                 args.right_image_dir or args.image_dir)
                   for r in right]
         texts = [str(r[args.text_col]) for r in left]
@@ -374,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         fields = ["pair_id", "id1", "id2", "text1", "file2", "pair_score"]
     elif args.image_col:
         files = [str(r[args.image_col]) for r in left]
-        paths = [semextract.resolve_image_path(f, args.image_dir) for f in files]
+        paths = [resolve_image_path(f, args.image_dir) for f in files]
         n = len(ids)
         total = (n * n if args.ordered and args.include_diagonal
                  else n * (n - 1) if args.ordered

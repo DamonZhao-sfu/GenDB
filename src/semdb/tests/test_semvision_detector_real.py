@@ -1,6 +1,6 @@
 import os, sys, csv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import semvision
+from vadar import backend as semvision
 
 CSV = "/localhome/hza214/SemBench/files/animals/data/sf_200/image_data.csv"
 

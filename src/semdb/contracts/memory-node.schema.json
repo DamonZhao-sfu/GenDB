@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gendb.local/semdb/memory-node.schema.json",
+  "title": "SemDB memory graph node",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "layer", "summary", "content", "data_boundary"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^L[0-5]_[A-Za-z0-9_]+$" },
+    "layer": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "signature_version": { "type": "integer", "minimum": 1 },
+    "benchmark": {
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "signature": {
+      "anyOf": [{ "$ref": "#/$defs/signature" }, { "type": "null" }]
+    },
+    "skill_name": {
+      "anyOf": [
+        { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        { "type": "null" }
+      ]
+    },
+    "skill_path": {
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "content": { "type": "object" },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "evidence_count": { "type": "integer", "minimum": 0 },
+    "data_boundary": { "$ref": "#/$defs/dataBoundary" },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "created_at": { "type": "string" },
+    "updated_at": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "$comment": "Instance and template layers are keyed by a signature and scoped to one benchmark.",
+      "if": { "properties": { "layer": { "enum": [0, 1] } }, "required": ["layer"] },
+      "then": {
+        "required": ["signature", "benchmark", "signature_version"],
+        "properties": {
+          "signature": { "$ref": "#/$defs/signature" },
+          "benchmark": { "type": "string", "minLength": 1 },
+          "signature_version": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    {
+      "$comment": "Skill layers must point at a linted skill directory and carry at least one piece of evidence.",
+      "if": { "properties": { "layer": { "enum": [2, 3, 4, 5] } }, "required": ["layer"] },
+      "then": {
+        "required": ["skill_name", "skill_path", "evidence"],
+        "properties": {
+          "skill_name": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "skill_path": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "array", "minItems": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signature_version",
+        "modality",
+        "operator_kind",
+        "sampling_unit",
+        "tables",
+        "predicate_tokens",
+        "relational_skeleton",
+        "projection_arity",
+        "flags",
+        "sql_template",
+        "template_hash"
+      ],
+      "properties": {
+        "signature_version": { "type": "integer", "minimum": 1 },
+        "modality": { "type": "string", "minLength": 1 },
+        "operator_kind": {
+          "enum": ["join", "group", "agg", "topk", "filter", "map"]
+        },
+        "sampling_unit": { "enum": ["row", "pair", "ordered_pair", "tuple", "group"] },
+        "corpus_table": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }]
+        },
+        "tables": { "type": "array", "items": { "type": "string" } },
+        "predicate_tokens": { "type": "array", "items": { "type": "string" } },
+        "relational_skeleton": { "type": "array", "items": { "type": "string" } },
+        "projection_arity": { "type": "integer", "minimum": 0 },
+        "flags": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["group_by", "order_by", "limit", "aggregate", "distinct"],
+          "properties": {
+            "group_by": { "type": "boolean" },
+            "order_by": { "type": "boolean" },
+            "limit": { "type": "boolean" },
+            "aggregate": { "type": "boolean" },
+            "distinct": { "type": "boolean" }
+          }
+        },
+        "sql_template": { "type": "string" },
+        "template_hash": { "type": "string", "minLength": 8 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "benchmark", "query_id", "objective"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "benchmark": { "type": "string", "minLength": 1 },
+        "query_id": { "type": "string", "minLength": 1 },
+        "objective": { "$ref": "#/$defs/objective" },
+        "before": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "after": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "iteration": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+        "action": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "usage_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "direction"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "direction": { "enum": ["maximize", "minimize"] }
+      }
+    },
+    "dataBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "cert_accessed", "full_ground_truth_accessed"],
+      "properties": {
+        "source": { "enum": ["select_validation", "none"] },
+        "cert_accessed": { "const": false },
+        "full_ground_truth_accessed": { "const": false }
+      }
+    }
+  }
+}

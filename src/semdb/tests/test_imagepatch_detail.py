@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import imagepatch  # noqa: E402
+from vadar import imagepatch  # noqa: E402
 
 
 class FakeEncoder:

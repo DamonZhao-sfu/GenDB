@@ -9,7 +9,7 @@ MAN = "/local-scratch/localhome/hza214/GenDB/src/semdb/runs/_materialized/ecomm_
 
 
 def _ctx():
-    import semvision
+    from vadar import backend as semvision
     return {"encoder": semvision.get_encoder("openai/clip-vit-base-patch32"), "palette": None}
 
 
@@ -21,7 +21,7 @@ def _skip_if_absent(*paths):
 
 def test_q2a_classify_small_valuespace():
     _skip_if_absent(f"{MM}/data/sf_200/ap_warrior.csv")
-    import imagepatch
+    from vadar import imagepatch
     ctx = _ctx()
     tracks = sorted({r["Track"] for r in csv.DictReader(open(f"{MM}/data/sf_200/ap_warrior.csv"))})
     id2t = {r["ID"]: r["Track"] for r in csv.DictReader(open(f"{MM}/data/sf_200/ap_warrior.csv"))}
@@ -38,7 +38,7 @@ def test_q2a_classify_small_valuespace():
 
 def test_q7_ocr_match_large_valuespace():
     _skip_if_absent(f"{MM}/data/sf_200/tampa_international_airport.csv")
-    import imagepatch
+    from vadar import imagepatch
     ctx = _ctx()
     airl = sorted({r["Airlines"] for r in csv.DictReader(open(f"{MM}/data/sf_200/tampa_international_airport.csv")) if r.get("Airlines")})
     gt = json.load(open(f"{MM}/raw_results/ground_truth/Q7.json"))["ground_truth"]
@@ -53,7 +53,7 @@ def test_q7_ocr_match_large_valuespace():
 
 def test_ecomm_q2_classify_plus_colors():
     _skip_if_absent(MAN)
-    import imagepatch
+    from vadar import imagepatch
     ctx = _ctx()
     gt = set(r["id"] for r in csv.DictReader(open(f"{EC}/raw_results/ground_truth/Q2.csv")))
     labels = ["sports_shoes", "sandal", "boot", "other_footwear", "not_footwear"]

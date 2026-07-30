@@ -38,8 +38,32 @@ export const defaults = {
   refineStallThreshold: 2,    // stop after this many consecutive non-improving iterations
   refineSampleCap: 15,        // max FP and FN rows shown to the agent per iteration
   directAgentArchitecture: "pgo", // pgo | legacy; only affects --direct
-  enableAgentSkills: true,    // inject one fixed repository-local skill per PGO role
+  enableAgentSkills: true,    // publish role + learned skills into a discoverable root
   maxReplans: 1,              // evidence-backed Planner revisions per query
+
+  // --- Cross-run agent memory (opt-in: --memory-dir enables it) ---
+  // Layers follow GenDB exactly:
+  //   L0 Query Instances / L1 Query Templates      → HAG, pushed into the prompt
+  //   L2 Sub-Structure Patterns / L3 Operator Techniques /
+  //   L4 Optimization Strategies / L5 Performance Principles
+  //                                                → skills, discovered by the agent
+  memoryDir: null,
+  memory: {
+    exactMatchMinScore: 0.98,       // seed iter_0 from a past candidate at/above this
+    structuralMatchMinScore: 0.55,  // inject advice at/above this
+    maxPreInjectionTokens: 3000,    // L0/L1 push, per role
+    maxCatalogTokens: 700,          // L2-L5 discovery hint, per role
+    maxInlineSkills: 3,             // codex fallback: skills inlined as text
+    maxInlineSkillTokens: 2000,
+    differentialHeadroomThreshold: 0.30,
+    maxNodesPerLayer: 40,
+    // Every discoverable skill's description enters context whether or not it is
+    // loaded, so an uncapped namespace is a per-call tax on all three roles.
+    maxSkills: 30,
+    crossBenchmarkLayers: [2, 3, 4, 5],
+    skillNamePrefix: "semdb-",
+    warmStart: true,
+  },
 
   // --- Provider-specific settings for the three compiler agents ---
   providers: {
@@ -52,6 +76,7 @@ export const defaults = {
         query_planner: "opus",
         semantic_code_generator: "opus",
         semantic_optimizer: "opus",
+        memory_manager: "opus",
       },
       // Claude effort: "low" | "medium" | "high" | "max"
       agentEffortLevels: {
@@ -61,6 +86,7 @@ export const defaults = {
         query_planner: "high",
         semantic_code_generator: "medium",
         semantic_optimizer: "high",
+        memory_manager: "high",
       },
       escalationModel: "opus",
     },
@@ -77,6 +103,7 @@ export const defaults = {
         query_planner: "gpt-5.6-luna",
         semantic_code_generator: "gpt-5.6-luna",
         semantic_optimizer: "gpt-5.6-luna",
+        memory_manager: "gpt-5.6-luna",
       },
       // Codex effort: "minimal" | "low" | "medium" | "high" | "xhigh"
       agentEffortLevels: {
@@ -86,6 +113,7 @@ export const defaults = {
         query_planner: "high",
         semantic_code_generator: "medium",
         semantic_optimizer: "high",
+        memory_manager: "high",
       },
       escalationModel: "gpt-5.6-luna",
     },

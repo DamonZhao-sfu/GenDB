@@ -72,6 +72,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sampling  # noqa: E402
+from vadar.paths import resolve_image_path  # noqa: E402
 
 # Labels a ground-truth-backed source emits. Kept as strings because
 # evaluate.score_inference compares str(v).strip().lower().
@@ -296,7 +297,7 @@ def scores_by_clip_text_similarity(texts: Sequence[str], query_text: str,
     """
     if not query_text.strip():
         raise SystemExit("--importance-by clip-text-similarity needs query text")
-    import semvision
+    from vadar import backend as semvision
 
     encoder = semvision.get_encoder(clip_model)
     query_vec = np.asarray(semvision.embed_text(query_text, encoder), dtype=np.float32)
@@ -316,7 +317,7 @@ def scores_by_clip_similarity(image_paths: Sequence[str], query_text: str,
     the corpus plus one text encode -- no VLM calls, so it costs a fraction of a
     single label. Unreadable images score 0 rather than aborting the build.
     """
-    import semvision
+    from vadar import backend as semvision
 
     if not query_text.strip():
         raise SystemExit("--importance-by clip-similarity needs --sql or --query-nl")
@@ -689,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
         import semextract
         if args.image_col not in rows[0]:
             raise SystemExit(f"--image-col {args.image_col!r} not in {args.corpus}")
-        image_paths = [semextract.resolve_image_path(str(r.get(args.image_col, "")),
+        image_paths = [resolve_image_path(str(r.get(args.image_col, "")),
                                                      args.image_dir) for r in rows]
 
     n = resolve_size(args.n, args.rate, len(ids), "--n/--rate", required=True)

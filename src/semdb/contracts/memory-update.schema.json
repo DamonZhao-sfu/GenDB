@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gendb.local/semdb/memory-update.schema.json",
+  "title": "SemDB memory update proposal",
+  "$comment": "What the Memory Manager PROPOSES. Graph nodes are written by memory/apply-update.mjs, never by the agent: signatures must be computed by code, or writer and reader stop sharing a representation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "benchmark", "queries", "skills"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "benchmark": { "type": "string", "minLength": 1 },
+    "queries": { "type": "array", "items": { "$ref": "#/$defs/queryUpdate" } },
+    "skills": { "type": "array", "items": { "$ref": "#/$defs/skillRef" } },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "queryUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query_id", "classification"],
+      "properties": {
+        "query_id": { "type": "string", "minLength": 1 },
+        "classification": {
+          "enum": ["NOVEL_SUCCESS", "SIGNIFICANT_IMPROVEMENT", "FAMILIAR"]
+        },
+        "reason": { "type": "string" },
+        "template": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "proven_strategies": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 8, "maxLength": 400 },
+              "maxItems": 8
+            },
+            "anti_patterns": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 8, "maxLength": 400 },
+              "maxItems": 8
+            }
+          }
+        },
+        "breakthroughs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["iteration", "action", "before", "after", "technique"],
+            "properties": {
+              "iteration": { "type": "integer", "minimum": 0 },
+              "action": { "enum": ["INITIAL", "PATCH_CODE", "REPLAN"] },
+              "before": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+              "after": { "type": "number" },
+              "technique": { "type": "string", "minLength": 8, "maxLength": 600 }
+            }
+          }
+        }
+      }
+    },
+    "skillRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "layer", "summary", "evidence"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "layer": {
+          "$comment": "2 Sub-Structure Patterns, 3 Operator Techniques, 4 Optimization Strategies, 5 Performance Principles",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 5
+        },
+        "summary": { "type": "string", "minLength": 8, "maxLength": 300 },
+        "description": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["query_id"],
+            "properties": {
+              "query_id": { "type": "string", "minLength": 1 },
+              "before": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+              "after": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+              "iteration": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+              "action": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            }
+          }
+        },
+        "links_queries": {
+          "$comment": "Query ids whose templates should point at this skill.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

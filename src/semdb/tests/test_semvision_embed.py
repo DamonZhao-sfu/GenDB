@@ -5,7 +5,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import semvision  # noqa: E402
+from vadar import backend as semvision  # noqa: E402
 
 
 class FakeEncoder:
