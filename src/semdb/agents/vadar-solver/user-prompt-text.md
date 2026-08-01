@@ -29,3 +29,20 @@ The generated Python may use only ordinary strings, the offline text API, genera
 helpers, and Python's standard library. It must not contain model/network clients,
 endpoint/API-key plumbing, `semvqa`/`semcaption`/`semextract`, `TextPatch`, or a
 semantic judgement API.
+
+CLASSIFY THE COLUMN ONCE, NOT ROW BY ROW. When a helper classifies text, hoist it out of
+the row loop and call `text_classify_batch(texts, options, ...)` on the whole column,
+then zip the results back onto the rows:
+
+```python
+rows = _read(args.data_dir, "reviews.csv")
+verdicts = text_classify_batch([r["reviewText"] for r in rows], ["positive", "negative"],
+                               descriptions={"positive": "a positive movie review",
+                                             "negative": "a negative movie review"})
+for row, (value, confidence) in zip(rows, verdicts):
+    ...
+```
+
+One batched encoder pass replaces one forward pass per row. The confidence is a softmax
+over the options and is comparable across rows, so use it directly for ranking, gating
+and cascades rather than inventing a score of your own.

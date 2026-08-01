@@ -431,6 +431,94 @@ class ClipEncoder:
 
 
 # ---------------------------------------------------------------------------
+# Real TEXT encoder (sentence-transformers), lazy + process-cached
+#
+# The text dual of ClipEncoder. It exists because the previous text classifier scored
+# by TOKEN OVERLAP, which is not a semantic signal at all: over 1,000 real movie
+# reviews, scoring against the bare labels ["positive","negative"] put 998 of them at
+# exactly 0.0 — only the two reviews that literally contain the word "positive" or
+# "negative" scored anything. A ranking metric over a score with two distinct values is
+# noise, which is why every Spearman and ARI query lagged.
+# ---------------------------------------------------------------------------
+
+DEFAULT_TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+_TEXT_ENCODER_CACHE = {}
+
+
+def get_text_encoder(model_id=DEFAULT_TEXT_MODEL):
+    if model_id not in _TEXT_ENCODER_CACHE:
+        _TEXT_ENCODER_CACHE[model_id] = TextEncoder(model_id)
+    return _TEXT_ENCODER_CACHE[model_id]
+
+
+class TextEncoder:
+    """Sentence embeddings with mean pooling + L2 normalization.
+
+    Mirrors ClipEncoder deliberately: same lazy construction, same bounded caches, and
+    a batched `encode_texts` that is the exact dual of `encode_images`. Corpus-scale
+    work MUST go through the batched call — encoding row by row is the mistake that
+    made the image path slow (638 single-image forward passes at ~24 ms each).
+    """
+
+    _CACHE_CAP = 4096          # label/description/alias side: small set, reused per row
+
+    def __init__(self, model_id=DEFAULT_TEXT_MODEL, device=None):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        self.torch = torch
+        self.model_id = model_id
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tok = AutoTokenizer.from_pretrained(model_id)
+        self.model = AutoModel.from_pretrained(model_id).to(self.device).eval()
+        self.dim = int(self.model.config.hidden_size)
+        self._cache = {}
+
+    def _norm(self, t):
+        return (t / t.norm(dim=-1, keepdim=True)).detach().cpu().numpy()
+
+    def _forward(self, texts):
+        """Mean-pool the token states under the attention mask, then normalize.
+
+        Mean pooling (not the CLS/pooler output) is what all-MiniLM-L6-v2 was trained
+        to be read with; using pooler_output silently degrades the embedding.
+        """
+        inp = self.tok(list(texts), return_tensors="pt", padding=True,
+                       truncation=True, max_length=512).to(self.device)
+        with self.torch.no_grad():
+            out = self.model(**inp).last_hidden_state
+        mask = inp["attention_mask"].unsqueeze(-1).to(out.dtype)
+        pooled = (out * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+        return self._norm(pooled)
+
+    def encode_texts(self, texts, batch=256):
+        """Batched corpus encoding → [N, D], row-aligned with `texts`.
+
+        The dual of `encode_images`. Empty/missing strings become zero rows so the
+        matrix keeps its alignment rather than shifting every later row.
+        """
+        texts = [("" if t is None else str(t)) for t in texts]
+        out = np.zeros((len(texts), self.dim), np.float32)
+        idx = [i for i, t in enumerate(texts) if t.strip()]
+        for i in range(0, len(idx), batch):
+            chunk = idx[i:i + batch]
+            out[chunk] = self._forward([texts[j] for j in chunk])
+        return out
+
+    def encode_cached(self, texts):
+        """Encode with a bounded cache — for the LABEL side, which repeats every row."""
+        texts = [str(t) for t in texts]
+        missing = [t for t in dict.fromkeys(texts) if t not in self._cache]
+        if missing:
+            vectors = self._forward(missing)
+            if len(self._cache) + len(missing) > self._CACHE_CAP:
+                self._cache.clear()          # same cheap bounded eviction as ClipEncoder
+            for text, vector in zip(missing, vectors):
+                self._cache[text] = vector
+        return np.stack([self._cache[t] for t in texts])
+
+
+# ---------------------------------------------------------------------------
 # ③ Detectors (YOLO) — object/species presence & counting
 # ---------------------------------------------------------------------------
 
@@ -595,3 +683,63 @@ class XrayClassifier:
         with self.torch.no_grad():
             out = self.model(t)[0]
         return {p: float(v) for p, v in zip(self.model.pathologies, out) if p}
+
+
+# ---------------------------------------------------------------------------
+# ④ OCR (easyocr) — process-wide, like every other heavy model here
+# ---------------------------------------------------------------------------
+#
+# This cache is module-level for the same reason _ENCODER_CACHE / _DETECTOR_CACHE /
+# _DOMAIN_CACHE are. OCR used to be memoized on the per-patch `ctx` instead, and a
+# generated solver that builds one ImagePatch per image (mmqa q2a: 200 of them) got a
+# FRESH ctx per patch, so easyocr.Reader was constructed once per image and never
+# freed: 275s of a 288s run was model loading, and once the accumulated readers filled
+# the GPU the last 68 of 200 images failed OCR outright and were silently dropped from
+# the result. Standalone, the same 200 images OCR in 9.2s with zero failures.
+
+_OCR_CACHE = {}
+_OCR_WARNED = set()
+
+
+def get_ocr_reader(langs=("en",), gpu=None):
+    """The shared easyocr reader, built at most once per (langs, device).
+
+    Deliberately NOT `cudnn_benchmark=True`, despite an OCR-only microbenchmark showing
+    1.14x (8.59s -> 7.56s, text byte-identical). Inside the real solver it was 5.9x
+    SLOWER: 18.5s -> 108.5s on mmqa q2a. easyocr sets the flag PROCESS-WIDE, so it also
+    governs the interleaved CLIP calls, and cuDNN re-runs its exhaustive algorithm
+    search on every new input shape — a 200-image corpus has ~200 distinct shapes, and
+    the autotune workspaces have to fit alongside a co-resident vLLM holding ~83 GB per
+    device. The microbenchmark missed all of that by running OCR alone.
+
+    Other easyocr knobs measured on the same corpus and rejected: `batch_size` is ~1.45x
+    but changed the recognized text on 39 of 200 images, `workers>0` is 16x slower (a
+    DataLoader spawn per call), `readtext_batched` needs 10-26 GB that vLLM leaves
+    unavailable.
+
+    Returns None — warning ONCE — when easyocr is not installed. That distinction
+    matters: OCR is often a plan's primary discriminative path, and a missing
+    dependency that reads as "this image has no text" produces a plausible, wrong,
+    exit-code-0 result.
+    """
+    key = (tuple(langs), gpu)
+    if key in _OCR_CACHE:
+        return _OCR_CACHE[key]
+    try:
+        import easyocr
+    except Exception as e:               # noqa: BLE001 — optional heavy dependency
+        if "load" not in _OCR_WARNED:
+            _OCR_WARNED.add("load")
+            print(f"[vadar] OCR unavailable ({e}) — read_text returns \"\" and "
+                  f"best_ocr_match returns \"none\" for EVERY image. Install easyocr, "
+                  f"or bind classify/classify_or_none instead of an OCR path.")
+        _OCR_CACHE[key] = None
+        return None
+    if gpu is None:
+        try:
+            import torch
+            gpu = torch.cuda.is_available()
+        except Exception:
+            gpu = False
+    _OCR_CACHE[key] = easyocr.Reader(list(langs), gpu=gpu, verbose=False)
+    return _OCR_CACHE[key]

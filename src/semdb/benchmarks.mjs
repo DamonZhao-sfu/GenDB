@@ -86,6 +86,38 @@ export const BENCHMARKS = {
     },
   },
 
+  supg: {                             // SUPG/BARGAIN approximate-selection datasets
+    // NOT a SemBench scenario — a SemBench-SHAPED tree built by
+    // data/supg/build_supg_scenario.py from the SUPG artifact
+    // (github.com/stanford-futuredata/supg). SUPG ships only (id, label,
+    // proxy_score), so each dataset lands in one of two corpus modes:
+    //
+    //   image/text  — the real content was rehydrated (only `imagenet`, via
+    //                 fetch_imagenet.py); AI.IF runs a real VLM over it.
+    //   proxy       — the content was never published. The corpus is `id,proxy_score`
+    //                 and the label is reachable ONLY through the metered
+    //                 supg_oracle (ORACLE LIMIT distinct ids). This is SUPG's own
+    //                 protocol, not a degraded fallback.
+    //
+    // `proxy` tables carry no unstructured content, so they never enter the
+    // extraction path; `col` names the free numeric evidence column instead.
+    prefix: "supg",
+    queryDir: "query/bigquery",
+    dataLayout: "sf",
+    gtDir: "raw_results/ground_truth",
+    gtFormat: "csv",
+    imageRoot: "images",
+    imageBase: "sf",                  // bare filename under <dataDir>/images
+    oracleDir: "_oracle",             // labels backing the metered oracle; sibling of
+                                      // data/, never readable by generated code
+    tables: {
+      imagenet:     { file: "imagenet.csv",     modality: "image", col: "image_filename", key: "id" },
+      night_street: { file: "night_street.csv", modality: "proxy", col: "proxy_score",    key: "id" },
+      ontonotes:    { file: "ontonotes.csv",    modality: "proxy", col: "proxy_score",    key: "id" },
+      tacred:       { file: "tacred.csv",       modality: "proxy", col: "proxy_score",    key: "id" },
+    },
+  },
+
   ecomm: {                            // HARDEST: parquet, queries/dialects/, .ref images, multi-AI-op
     prefix: "fashion_product_images",
     queryDir: "queries/dialects/bigquery",

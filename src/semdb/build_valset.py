@@ -95,6 +95,19 @@ GT_WARNING = (
     "a real run."
 )
 
+# NOT the same situation as GT_WARNING. For the SUPG replay datasets the published
+# `label` column IS the oracle the paper defines -- there is no model that could be
+# called instead, because the raw content was never released. What has to be reported
+# is therefore not "this is illegitimate" but "this cost N oracle labels", so the
+# spend stays visible next to the accuracy it bought.
+SUPG_ORACLE_NOTE = (
+    "Labels came from the SUPG oracle (the dataset's published `label` column), which "
+    "is the ground-truth labeller SUPG and BARGAIN both define for these datasets. "
+    "The draw is metered: {n} distinct ids were labelled for validation. This is "
+    "accounted separately from the generated program's own ORACLE LIMIT budget and is "
+    "reported as val_oracle_calls."
+)
+
 
 # --------------------------------------------------------------------------
 # corpus
@@ -445,6 +458,26 @@ def labels_from_ground_truth(rows: Sequence[dict[str, str]], ids: Sequence[str],
     return {i: (TRUE if by_id.get(i, "") in gold_set else FALSE) for i in ids}
 
 
+def labels_from_supg_oracle(ids: Sequence[str], labels_csv: str) -> dict[str, str]:
+    """Binary labels from a SUPG dataset's withheld `label` column.
+
+    Used only for the replay-mode datasets, whose content was never published. The
+    file lives outside the corpus directory precisely so that reaching it is an
+    explicit, counted act rather than something the generated program could do.
+    """
+    table: dict[str, str] = {}
+    with open(labels_csv, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            value = str(row["label"]).strip().lower()
+            table[str(row["id"])] = TRUE if value in ("1", "true", "1.0", "t", "yes") else FALSE
+    missing = [i for i in ids if i not in table]
+    if missing:
+        raise SystemExit(f"--oracle-labels {labels_csv}: {len(missing)} sampled ids are "
+                         f"absent (first: {missing[:3]}). The label file and the corpus "
+                         f"must come from the same build_supg_scenario.py run.")
+    return {i: table[i] for i in ids}
+
+
 def labels_from_oracle(rows: Sequence[dict[str, str]], ids: Sequence[str], id_col: str,
                        *, question: str, choices: Sequence[str] | None, boolean: bool,
                        model: str, endpoint: str, api_key: str, concurrency: int,
@@ -661,7 +694,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="Write the val set even when its SELECT half is single-class. "
                          "Such a set cannot rank programs, so this is off by default.")
 
-    ap.add_argument("--label-source", default="gt", choices=["gt", "none", "oracle"])
+    ap.add_argument("--label-source", default="gt",
+                    choices=["gt", "none", "oracle", "supg-oracle"])
+    ap.add_argument("--oracle-labels",
+                    help="id,label CSV backing --label-source supg-oracle (the SUPG "
+                         "dataset's withheld ground-truth column).")
     ap.add_argument("--gt-file", help="SemBench ground-truth JSON (--label-source gt).")
     ap.add_argument("--gt-match-col", help="Corpus column the ground truth lists.")
     ap.add_argument("--endpoint", help="OpenAI-compatible base URL (--label-source oracle).")
@@ -801,6 +838,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[build_valset] WARNING: {GT_WARNING}", file=sys.stderr)
     elif args.label_source == "none":
         labels = None
+    elif args.label_source == "supg-oracle":
+        if not args.oracle_labels:
+            raise SystemExit("--label-source supg-oracle requires --oracle-labels")
+        labels = labels_from_supg_oracle(sample.ids, args.oracle_labels)
+        supg_note = SUPG_ORACLE_NOTE.format(n=len(sample.ids))
+        warnings.append(supg_note)
+        print(f"[build_valset] {supg_note}", file=sys.stderr)
     else:
         if not (args.endpoint and args.oracle_model):
             raise SystemExit("--label-source oracle requires --endpoint and --oracle-model")
@@ -862,6 +906,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.label_source == "oracle":
         provenance["oracle"] = oracle_report
         provenance["call_site"] = site_info
+    if args.label_source == "supg-oracle":
+        provenance["oracle_labels"] = os.path.abspath(args.oracle_labels)
+        provenance["call_site"] = site_info
+        # The count the harness reports as val_oracle_calls. Named `cost` to match the
+        # shape the model-oracle path writes, so telemetry reads one field either way.
+        provenance["oracle"] = {
+            "kind": "supg_label_column",
+            "cost": {"labels": len(sample.ids)},
+            "distinct_ids": len(set(sample.ids)),
+            "abstained": [],
+        }
 
     # --- write -----------------------------------------------------------
     os.makedirs(args.out, exist_ok=True)

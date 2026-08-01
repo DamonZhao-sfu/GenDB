@@ -228,6 +228,9 @@ export function parseArgs(argv) {
   // Derive dirs from the sembench root + benchmark config when not given explicitly.
   if (args.sembenchDir) {
     const base = resolve(args.sembenchDir, "files", args.benchmark);
+    // Kept so scenario-level sidecars (supg_targets.json, the SUPG oracle's withheld
+    // labels) can be found without re-deriving the path at every use site.
+    args.scenarioRoot = base;
     args.queryDir = args.queryDir || resolve(base, b ? b.queryDir : `query/${args.querySource}`);
     if (!args.dataDir) {
       args.dataDir = (b && b.dataLayout === "sf" && args.scaleFactor)
@@ -542,6 +545,46 @@ function validateOfflineVadarFile(path) {
  * fails closed when --val-rate was explicitly requested, preventing accidental
  * full-ground-truth feedback.
  */
+/**
+ * The SUPG contract for one query, or null outside the supg benchmark.
+ *
+ * `supg_targets.json` is written by build_supg_scenario.py and is the single source of
+ * truth for which target grades a query (PT -> precision, RT -> recall), how many
+ * oracle labels the generated program may spend, and where the withheld labels live.
+ */
+export function supgSpec(args, query) {
+  if (args.benchmark !== "supg" || !args.scenarioRoot) return null;
+  const path = resolve(args.scenarioRoot, "supg_targets.json");
+  if (!existsSync(path)) return null;
+  let all;
+  try { all = JSON.parse(readFileSync(path, "utf-8")); }
+  catch { return null; }
+  const spec = all?.[query];
+  if (!spec) return null;
+  return {
+    ...spec,
+    oracleLabelsPath: spec.oracle_labels
+      ? resolve(args.scenarioRoot, spec.oracle_labels) : null,
+  };
+}
+
+/**
+ * Install the metered SUPG oracle next to a solver so `import supg_oracle` resolves via
+ * sys.path[0]. The module is copied verbatim (so every run executes the reviewed source)
+ * and the per-run wiring goes in a sibling JSON it reads at import.
+ */
+export function installSupgOracle(execDir, { labelsCsv, budget, dataset, query, ledger }) {
+  const source = resolve(__dirname, "data", "supg", "supg_oracle.py");
+  if (!existsSync(source)) {
+    throw new Error(`supg_oracle.py not found at ${source}; the replay corpora cannot `
+      + `be labelled without it.`);
+  }
+  writeFileSync(resolve(execDir, "supg_oracle.py"), readFileSync(source, "utf-8"));
+  writeFileSync(resolve(execDir, "supg_oracle_config.json"), JSON.stringify({
+    labels_csv: labelsCsv, budget, dataset, query, ledger,
+  }, null, 2) + "\n");
+}
+
 export function validationCorpusFingerprint(corpusPath) {
   try {
     const stat = statSync(corpusPath);
@@ -601,6 +644,10 @@ export function buildValSet(args, query, spec, attempt = {}) {
   const key = [args.valMethod, valRate, args.valCertRate ?? 0, args.valSeed,
     args.valStrataK, args.valScoreTilt, spec.oracleModel,
     args.valCallSite ?? "auto",
+    // A SUPG replay draw is labelled from the withheld column at a FIXED size, not by
+    // a model at a rate; reusing a model-labelled cache entry would answer a different
+    // question with a different cost.
+    ...(spec.labelSource ? [spec.labelSource, `valn-${spec.valN ?? "rate"}`] : []),
     // Sampling v2 adds a probability-valid certainty stratum at the score-ranked
     // head; it must not reuse a pre-v2 draw with a different inclusion design.
     "oracleframes-v5",
@@ -634,7 +681,10 @@ export function buildValSet(args, query, spec, attempt = {}) {
          ...(spec.oracleChoices
            ? ["--label-choices-json", JSON.stringify(spec.oracleChoices)] : [])]
       : ["--sql", spec.sqlPath]),
-    "--method", args.valMethod, "--rate", String(valRate),
+    "--method", args.valMethod,
+    // SUPG replay draws a fixed number of labels (its oracle budget), not a rate: a
+    // rate over 973k night_street rows would silently spend 48,000 oracle labels.
+    ...(spec.valN ? ["--n", String(spec.valN)] : ["--rate", String(valRate)]),
     ...(args.valCertRate ? ["--cert-rate", String(args.valCertRate)] : []),
     "--seed", String(args.valSeed), "--strata-k", String(args.valStrataK),
     "--score-tilt", String(args.valScoreTilt),
@@ -648,8 +698,10 @@ export function buildValSet(args, query, spec, attempt = {}) {
                          "--clip-model", spec.clipModel] : [])),
     ...(spec.textCols || []).flatMap((c) => ["--text-col", c]),
     ...(args.valCallSite != null ? ["--call-site", String(args.valCallSite)] : []),
-    "--label-source", "oracle", "--endpoint", spec.endpoint,
-    "--oracle-model", spec.oracleModel, "--api-key", args.apiKey || "EMPTY",
+    ...(spec.labelSource === "supg-oracle"
+      ? ["--label-source", "supg-oracle", "--oracle-labels", spec.oracleLabels]
+      : ["--label-source", "oracle", "--endpoint", spec.endpoint,
+         "--oracle-model", spec.oracleModel, "--api-key", args.apiKey || "EMPTY"]),
     "--concurrency", String(args.concurrency ?? 8),
     // One cache per (benchmark, query) rather than per design: raising the rate then
     // re-pays only for rows never labeled before.
@@ -658,8 +710,10 @@ export function buildValSet(args, query, spec, attempt = {}) {
       `labels-${corpusFingerprint}.json`,
     ),
     "--out", dir];
-  console.log(`\n[SemDB] [${query}] building validation set (rate=${valRate}, `
-    + `${args.valMethod}, oracle=${spec.oracleModel})`);
+  console.log(`\n[SemDB] [${query}] building validation set `
+    + `(${spec.valN ? `n=${spec.valN}` : `rate=${valRate}`}, ${args.valMethod}, `
+    + `oracle=${spec.labelSource === "supg-oracle"
+        ? "SUPG label column (metered)" : spec.oracleModel})`);
   const proc = spawnSync("python3", bvArgs, { stdio: "inherit" });
   if (proc.status !== 0 || !existsSync(selectPath)) {
     console.warn(`[SemDB] [${query}] validation set not built (build_valset.py exited `
@@ -1460,15 +1514,18 @@ async function computeNaive(sql, args) {
 
 /**
  * Choose the "corpus" table to extract from, using the config modality: prefer an
- * IMAGE table referenced in the predicate, then a TEXT one. AUDIO-only queries have
- * no supported corpus — the caller detects `modality === "audio"` and skips them.
+ * IMAGE table referenced in the predicate, then a TEXT one, then a PROXY one. AUDIO-only
+ * queries have no supported corpus — the caller detects `modality === "audio"` and skips
+ * them. A PROXY corpus (SUPG replay) has no unstructured content at all; it is ranked
+ * last so a scenario that has real content never loses it to the proxy stand-in.
  */
 async function chooseCorpus(sql, tables, args) {
   const used = new Set(tablesInPredicate(sql, args.benchmark));
   const inPred = tables.filter((t) => used.has(t.table));
   const pick = (cands) =>
     cands.find((t) => t.modality === "image") ||
-    cands.find((t) => t.modality === "text") || null;
+    cands.find((t) => t.modality === "text") ||
+    cands.find((t) => t.modality === "proxy") || null;
   return pick(inPred) || pick(tables) ||
     tables.find((t) => t.modality === "audio") ||   // audio-only → caller skips
     tables[tables.length - 1] || { table: "corpus", path: "", modality: "text", isImages: false };
@@ -1713,7 +1770,8 @@ async function planQuery(args, query) {
     || tables.find((t) => t.path !== corpus.path) || corpus;
   const plan = await computeNaive(sql, args);
   return { query, sql, nl, tables, corpus, structured,
-           isImage: corpus.modality === "image", isAudio: corpus.modality === "audio", plan };
+           isImage: corpus.modality === "image", isAudio: corpus.modality === "audio",
+           isProxy: corpus.modality === "proxy", plan };
 }
 
 /** Per-row validation scoring for one iteration: run evaluate.py --score-inference on
@@ -1925,6 +1983,29 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   for (const t of tables) {
     const kind = t.isImages ? "image manifest" : (t.modality || "table");
     tableLines.push(`- ${t.table} (${kind}): path=${t.path}\n    columns: ${await headerOf(t.path)}`);
+    if (t.modality === "proxy") {
+      // The SQL header states the contract too, but the solver prompts are written for
+      // content corpora; without this the agent reaches for CLIP or a text column that
+      // does not exist. Say it where the corpus itself is described.
+      const spec = supgSpec(args, query);
+      tableLines.push(
+        `    NO CONTENT: this corpus has no image, text or caption column — the raw\n`
+        + `    ${t.table} data was never published. \`${t.col || "proxy_score"}\` is a `
+        + `cheap proxy model's\n`
+        + `    confidence in [0,1]; it is free and unlimited. The ground-truth label is\n`
+        + `    reachable ONLY through the metered oracle:\n`
+        + `        import supg_oracle\n`
+        + `        labels = supg_oracle.oracle(ids)   # -> list[bool]\n`
+        + `        supg_oracle.remaining()            # labels still affordable\n`
+        + `    At most ${spec?.oracle_limit ?? 400} DISTINCT ids may be labelled; `
+        + `re-reading an already-labelled\n`
+        + `    id is cached and free. Exceeding the budget raises OracleBudgetExceeded\n`
+        + `    and fails the run. Do NOT attempt to label the corpus row by row: spend\n`
+        + `    the budget calibrating a threshold/sampling rule over `
+        + `\`${t.col || "proxy_score"}\`,\n`
+        + `    then emit every id the rule selects. Do NOT import torch, CLIP or any\n`
+        + `    encoder — there is nothing for them to encode.`);
+    }
   }
   if (args.benchmark === "ecomm") {
     const normalizedProducts = resolve(args.tableDir || args.dataDir, "ecomm_products.csv");
@@ -1941,6 +2022,24 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     }
   }
   const isImage = corpus.isImage || corpus.modality === "image";
+  // SUPG replay: the corpus is (id, proxy_score) and the label is reachable only via
+  // the metered oracle. There is no content for a VLM/LLM to read, so this branch
+  // replaces the extraction and oracle-labelling paths rather than degrading them.
+  const isProxy = corpus.modality === "proxy";
+  // EVERY supg query carries a PT/RT contract and is graded on precision or recall,
+  // content mode included — only the metered ORACLE LIMIT is replay-specific. Gating
+  // the whole spec on isProxy left the imagenet rows with no target_met verdict.
+  const supg = supgSpec(args, query);
+  if (isProxy && !supg) {
+    throw new Error(`[SemDB] [${query}] corpus '${corpus.table}' is a SUPG replay table `
+      + `but supg_targets.json has no entry for ${query}. Re-run `
+      + `data/supg/build_supg_scenario.py.`);
+  }
+  if (isProxy && !supg.oracleLabelsPath) {
+    throw new Error(`[SemDB] [${query}] SUPG replay needs withheld labels; `
+      + `supg_targets.json records none for ${query}.`);
+  }
+  const supgLedger = isProxy ? resolve(runDir, "oracle_calls.json") : null;
   const directSqlPath = args.queryDir
     ? resolve(args.queryDir, `${query}.sql`)
     : null;
@@ -1994,7 +2093,29 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const buildsValidation = !valFile && !!args.valRate && !args.noRefine;
   const validationStarted = Date.now();
   if (!valFile && args.valRate && !args.noRefine) {
-    if (!args.endpoint && !args.valPlanOnly) {
+    if (isProxy && args.queryDir) {
+      // SUPG replay draws its validation labels from the withheld label column, at a
+      // FIXED size equal to the query's ORACLE LIMIT. No endpoint is involved, and the
+      // spend is reported as val_oracle_calls rather than folded into accuracy.
+      const { idCol } = await corpusCols(corpus, args);
+      valRowIdCol = idCol;
+      valFile = buildValSet(args, query, {
+        corpusCsv: corpus.path, idCol, sqlPath: resolve(args.queryDir, `${query}.sql`),
+        isImage: false,
+        importanceBy: `column:${corpus.col || "proxy_score"}`,
+        labelSource: "supg-oracle",
+        oracleLabels: supg.oracleLabelsPath,
+        valN: supg.oracle_limit,
+      });
+      if (!valFile) {
+        throw new Error(
+          `[SemDB] [${query}] SUPG replay validation set could not be built. Without it `
+          + `the refinement loop would score against the FULL label column, which is the `
+          + `whole quantity the oracle budget exists to ration.`);
+      }
+      console.log(`[SemDB] [${query}] SUPG replay: ${supg.oracle_limit} validation `
+        + `labels from ${supg.oracleLabelsPath}`);
+    } else if (!args.endpoint && !args.valPlanOnly) {
       console.warn(`[SemDB] [${query}] --val-rate needs --endpoint (the oracle is a `
         + `model call); falling back to full ground-truth scoring.`);
     } else if (!args.queryDir) {
@@ -2419,6 +2540,17 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       return { status: "crash", stage: "compile", preflight: pre.report, stderr: pre.text };
     }
     if (!doRun) return { status: "empty", stderr: "" };
+    // The metered oracle must sit beside the script that imports it: python puts the
+    // script's own directory on sys.path, and iterations execute out of iter_N/.
+    if (isProxy) {
+      installSupgOracle(dirname(iterCode), {
+        labelsCsv: supg.oracleLabelsPath,
+        budget: supg.oracle_limit,
+        dataset: supg.dataset,
+        query,
+        ledger: resolve(dirname(iterCode), "oracle_calls.json"),
+      });
+    }
     const sArgs = isImage
       ? [iterCode, iterCsv, "--data-dir", dataDir, ...(imageDir ? ["--image-dir", imageDir] : []),
          "--clip-model", clipModel,
@@ -3096,6 +3228,8 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const wallMs = Date.now() - wallStart;
   const timingBreakdown = directTimingBreakdown(
     wallMs, agentMs, validationSamplingLlmMs, codeExecutionRuns);
+  // Written by supg_oracle at interpreter exit; null when the final solver never ran.
+  const supgLedgerData = supgLedger ? await readJSON(supgLedger) : null;
   const report = {
     query, corpus: corpus.table, provider: args.agentProvider, operator: "direct",
     mode: "direct", wall_clock_ms: wallMs,
@@ -3122,6 +3256,27 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
               timing_breakdown_ms: timingBreakdown,
               code_execution_runs: codeExecutionRuns },
     naive_llm_calls: planObj.plan.naive ?? null,
+    // SUPG accounting. `oracle_calls` is what the FINAL full-corpus program actually
+    // spent, read from the ledger the oracle wrote rather than from anything the
+    // program reported about itself; `val_oracle_calls` is the separate, never-charged
+    // draw the refinement loop scored against. Both are surfaced so a target hit on a
+    // large validation spend cannot read as a target hit on the budget alone.
+    supg: supg ? {
+      dataset: supg.dataset,
+      kind: supg.kind,
+      graded_metric: supg.metric,
+      target: supg.target,
+      probability: supg.probability,
+      mode: supg.mode,
+      // Budget accounting is REPLAY-ONLY. In content mode the oracle is a VLM the
+      // program may call per row, with no limit enforced, so reporting `k` there
+      // would claim a constraint that never applied.
+      oracle_budget: isProxy ? supg.oracle_limit : null,
+      oracle_calls: isProxy ? (supgLedgerData?.distinct_ids ?? null) : null,
+      oracle_exceeded: isProxy ? (supgLedgerData?.exceeded ?? null) : null,
+      val_oracle_calls: val?.provenance?.oracle?.cost?.labels
+        ?? (val?.labels ? Object.keys(val.labels).length : null),
+    } : null,
     total_estimated_cost_usd: Number(agentCost.toFixed(4)),
     ground_truth: gt ? { file: gt.file, count: gt.count } : null,
     validation: validationTelemetry,

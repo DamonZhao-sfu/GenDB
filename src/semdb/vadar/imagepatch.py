@@ -20,11 +20,16 @@ that region — `crop(...).dominant_colors()` reads the crop, not the whole fram
 patches compose: `patch.crop(...).crop(...)` and `patch.find(...)[0].read_text()` work,
 and `find`/`read_text_boxes` report boxes back in absolute image coordinates.
 """
+import weakref
 from collections.abc import Mapping
 
 import numpy as np
 
 from . import backend
+
+#: encoder -> its one normalized ctx. Weak so an encoder that goes out of scope does
+#: not pin its caches (image embeddings) for the life of the process.
+_CTX_BY_ENCODER: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
 def _as_ctx(ctx):
@@ -40,10 +45,23 @@ def _as_ctx(ctx):
     A bare encoder is unambiguous, so normalize instead of failing: the caller's intent
     is never in doubt, and the alternative is a whole query's iteration budget spent
     rediscovering a two-character mistake.
+
+    The normalized ctx is MEMOIZED per encoder identity. Returning a fresh dict each
+    time silently un-shared every cache the ctx exists to hold — `_size_cache`,
+    `palette`, `domain` and (before it moved to `backend`) the OCR reader — because a
+    solver that writes `ImagePatch(path, encoder)` inside its row loop builds one ctx
+    per IMAGE. The accommodation above is right; making it allocate was the bug.
     """
     if isinstance(ctx, Mapping):
         return ctx
-    return {"encoder": ctx, "palette": None}
+    try:
+        shared = _CTX_BY_ENCODER.get(ctx)
+        if shared is None:
+            shared = _CTX_BY_ENCODER[ctx] = {"encoder": ctx, "palette": None}
+        return shared
+    except TypeError:
+        # Not weak-referenceable or not hashable — correctness first, share nothing.
+        return {"encoder": ctx, "palette": None}
 
 
 def _norm_box(box, size):
@@ -151,7 +169,21 @@ class ImagePatch:
                                          thresh, template, key=self._key)
 
     def score(self, text, template="a photo of {}"):
-        """Raw CLIP image-text similarity in [0,1] (for yes/no thresholds)."""
+        """RELATIVE CLIP image-text similarity. Use it to RANK or COMPARE, never to
+        threshold on an absolute value.
+
+        The nominal range is [0,1] but the EFFECTIVE range is roughly 0.54..0.67:
+        `clip_match` rescales cosine from [-1,1], and real CLIP image-text cosines sit
+        around 0.1..0.35. So `score(...) >= 0.5` is TRUE FOR EVERY PAIR, including
+        gibberish — measured over 60 (image, text) pairs, all 60 cleared 0.5, and the
+        nonsense string "xyzzy plugh frobnicate" outscored a coherent but unrelated
+        description. A query that thresholded this at 0.5 returned all 1,000 candidate
+        pairs against a 4-row ground truth.
+
+        FOR A YES/NO DECISION USE `verify_detail(prop)`, which contrasts `prop` against
+        "not prop" and is therefore calibrated: on the same 20 images it accepted 5 for
+        a plausible description and 0 for an absurd one.
+        """
         return backend.clip_match(self._src(), template.format(text),
                                     self.ctx["encoder"], key=self._key)
 
@@ -211,38 +243,31 @@ class ImagePatch:
         return backend.domain_classify(self._src(), cache[model_id], list(labels), threshold)
 
     # --- OCR (printed text; stylized logos are unreliable — prefer classify) -
-    _OCR_WARNED = set()
+    #: Same set object as `backend._OCR_WARNED`, so clearing it here (tests do) also
+    #: re-arms the loader's warn-once.
+    _OCR_WARNED = backend._OCR_WARNED
 
     def _ocr(self):
-        """The OCR reader, loaded once per run. Returns None (warning ONCE) when the
-        optional dependency is absent.
+        """The OCR reader — shared process-wide, or an explicitly injected one.
+
+        `ctx["ocr"]` still wins when a caller sets it, which is how tests inject a fake
+        reader and how a run can pin a non-default language set. Everything else goes to
+        `backend.get_ocr_reader()`.
+
+        The reader deliberately does NOT get memoized back into `self.ctx`. It used to
+        be, and a generated solver that builds one ImagePatch per image gets a fresh
+        ctx per patch (see `_as_ctx`) — so the "load once per run" cache degraded to
+        "load once per IMAGE": on mmqa q2a that was 200 easyocr.Reader constructions,
+        275s of a 288s run, and a GPU filled with leaked readers until the last 68 of
+        200 images failed OCR and were silently dropped.
 
         Distinguishing "OCR is unavailable" from "this image has no text" matters more
         here than it looks: OCR against the runtime value space is the primitive the
         planning rules recommend for wordmark logos, so it is often a plan's PRIMARY
-        discriminative path. The old `except Exception: return []` made a missing
-        dependency indistinguishable from a blank image, so such a plan would return
-        ("none", 0.0) for every row with nothing in any log to say the path was never
-        running at all."""
+        discriminative path."""
         if "ocr" in self.ctx:
             return self.ctx["ocr"]
-        try:
-            import easyocr
-        except Exception as e:               # noqa: BLE001 — optional heavy dependency
-            if "load" not in ImagePatch._OCR_WARNED:
-                ImagePatch._OCR_WARNED.add("load")
-                print(f"[imagepatch] OCR unavailable ({e}) — read_text returns \"\" and "
-                      f"best_ocr_match returns \"none\" for EVERY image. Install easyocr, "
-                      f"or bind classify/classify_or_none instead of an OCR path.")
-            self.ctx["ocr"] = None
-            return None
-        try:
-            import torch
-            gpu = torch.cuda.is_available()
-        except Exception:
-            gpu = False
-        self.ctx["ocr"] = easyocr.Reader(["en"], gpu=gpu, verbose=False)
-        return self.ctx["ocr"]
+        return backend.get_ocr_reader()
 
     def read_text_boxes(self, min_conf=0.0):
         """OpImgOCR proper: [{"text", "box": (l,t,r,b) in ABSOLUTE image pixels, "score"}].

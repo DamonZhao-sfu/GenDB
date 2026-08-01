@@ -64,7 +64,7 @@ from sklearn.metrics import adjusted_rand_score, precision_recall_fscore_support
 # Registries
 # ---------------------------------------------------------------------------
 
-SCENARIOS = ("movie", "cars", "medical", "animals", "ecomm")
+SCENARIOS = ("movie", "cars", "medical", "animals", "ecomm", "supg")
 
 #: Queries whose semantic predicate is *purely* audio (informational flag only).
 AUDIO_ONLY_QUERIES: Dict[str, set] = {
@@ -73,6 +73,7 @@ AUDIO_ONLY_QUERIES: Dict[str, set] = {
     "medical": {2},       # non-current smokers w/ normal lung *audio*
     "animals": {2, 4},    # elephant *audio* count / city-with-most elephant audio
     "ecomm": set(),
+    "supg": set(),
 }
 
 #: ecomm accuracy metric per query, encoded from files/ecomm/queries/q*.toml
@@ -953,6 +954,33 @@ def _ecomm_dispatch(qid: int, s: pd.DataFrame, g: pd.DataFrame) -> Dict[str, Any
     raise NotImplementedError(f"ecomm accuracy_metric '{metric}' not supported for Q{qid}.")
 
 
+# ---- supg -----------------------------------------------------------------
+
+
+def _supg_f1(ground_truth: pd.DataFrame, system_results: pd.DataFrame) -> Dict[str, Any]:
+    """Set retrieval over the `id` column, the shape of every SUPG query.
+
+    SUPG queries come in two classes -- PRECISION TARGET and RECALL TARGET -- that
+    share a ground-truth set and differ only in which component must clear the
+    target. So this reports precision and recall separately (and f1 as the summary
+    accuracy) rather than collapsing to one number; `supg_targets.json` in the
+    scenario root records which of the two each query id is graded on.
+    """
+    precision = _compute_precision(ground_truth, system_results, id_column="id")
+    recall = _compute_recall(ground_truth, system_results, id_column="id")
+    f1 = _f1(precision, recall)
+    out = _retrieval_result(precision, recall, f1, variant="supg_f1")
+    out["metric"] = "f1-score"
+    out["metric_family"] = "SingleAccuracyScoreWithRetrievalDetails"
+    out["metric_type"] = "f1-score"
+    out["precision"] = float(precision)
+    out["recall"] = float(recall)
+    out["f1"] = float(f1)
+    out["accuracy"] = float(f1)
+    out.update(_id_set_extras(ground_truth, system_results, id_column="id"))
+    return out
+
+
 _DISPATCH: Dict[str, Dict[int, Callable]] = {
     "movie": _MOVIE,
     "cars": _CARS,
@@ -1009,6 +1037,9 @@ def score(
 
     if scenario == "ecomm":
         result = _ecomm_dispatch(qid, system_results, ground_truth)
+    elif scenario == "supg":
+        # Every SUPG query is the same id-set retrieval; no per-query table needed.
+        result = _supg_f1(ground_truth, system_results)
     else:
         table = _DISPATCH[scenario]
         if qid not in table:

@@ -38,6 +38,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
+from functools import lru_cache
 
 
 # =====================================================================================
@@ -67,10 +68,18 @@ def verify_property(image, prop):
 
 
 def score(image, text):
-    """CLIP image-text similarity in [0, 1]. NOTE: CLIP's text side sees only the first
-    ~77 tokens — pass a SHORT phrase (e.g. "a black handbag"), NEVER a full product
-    description. For long text predicates, extract visual attributes with classify /
-    dominant_colors / detect and match those instead."""
+    """RELATIVE CLIP image-text similarity — RANK or COMPARE with it, never threshold
+    an absolute value.
+
+    Nominal range [0,1]; EFFECTIVE range ~0.54..0.67, because cosine is rescaled from
+    [-1,1] and real CLIP image-text cosines sit near 0.1..0.35. `score(...) >= 0.5` is
+    therefore TRUE FOR EVERY PAIR — use `verify_detail(image, prop)` for a yes/no
+    decision, or compare scores against each other for a ranking.
+
+    NOTE: CLIP's text side sees only the first ~77 tokens — pass a SHORT phrase (e.g.
+    "a black handbag"), NEVER a full product description. For long text predicates,
+    extract visual attributes with classify / dominant_colors / detect and match those
+    instead."""
     return image.score(text)
 
 
@@ -202,16 +211,46 @@ def _plain_text(value) -> str:
     return str(getattr(value, "text", value) or "")
 
 
+#: `normalize` is the innermost primitive of the whole TEXT family and it is called
+#: with the SAME few strings over and over: `text_classify_detail` scores one row
+#: against every label + description + alias, and each `lexical_score` re-normalizes
+#: the row text (once via `contains_phrase`, once via `tokens`). cars Q10 — 9828
+#: complaints x 24 categories x ~8 candidates — issued 7.84M normalize calls, 96% of
+#: a 217s run, over ~10k distinct strings. Memoizing is pure win: `normalize` is a
+#: deterministic function of one string, so the cache cannot change any result.
+#: Bounded, because a generated solver may stream far more rows than it has labels;
+#: 4096 comfortably holds one query's candidate set plus the row in flight.
+_NORM_CACHE = 4096
+
+
+@lru_cache(maxsize=_NORM_CACHE)
+def _normalize_str(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value).casefold()
+    # The combining-mark strip is a per-CHARACTER Python loop — 2.97 BILLION
+    # iterations of it in the Q10 profile, more than half the run. After NFKD every
+    # ASCII string is already mark-free (`unicodedata.combining` is 0 for all of
+    # ASCII), so the loop is provably an identity there and can be skipped outright.
+    if not value.isascii():
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return " ".join(re.findall(r"\w+", value, flags=re.UNICODE))
+
+
+@lru_cache(maxsize=_NORM_CACHE)
+def _tokens_str(value: str) -> frozenset[str]:
+    """The token SET, cached. Frozen so a caller cannot mutate the shared entry."""
+    return frozenset(_normalize_str(value).split())
+
+
 def normalize(text) -> str:
     """Case-fold text and collapse punctuation/whitespace for stable matching."""
-    value = unicodedata.normalize("NFKD", _plain_text(text)).casefold()
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    return " ".join(re.findall(r"\w+", value, flags=re.UNICODE))
+    return _normalize_str(_plain_text(text))
 
 
 def tokens(text) -> set[str]:
     """The normalized word-token set."""
-    return set(normalize(text).split())
+    # A fresh mutable set per call, as before — the cached frozenset is an internal
+    # detail and callers are free to mutate what they get back.
+    return set(_tokens_str(_plain_text(text)))
 
 
 def contains_phrase(text, phrase) -> bool:
@@ -235,7 +274,9 @@ def lexical_score(text, query) -> float:
     """Token-overlap score in [0, 1], with an exact-phrase match scoring 1."""
     if contains_phrase(text, query):
         return 1.0
-    left, right = tokens(text), tokens(query)
+    # `_tokens_str` rather than `tokens`: this is the hot path (one call per candidate
+    # per row) and it only ever reads the sets, so the per-call copy is pure overhead.
+    left, right = _tokens_str(_plain_text(text)), _tokens_str(_plain_text(query))
     if not left or not right:
         return 0.0
     return len(left & right) / len(right)
@@ -255,57 +296,174 @@ def best_lexical_match(text, options, aliases: Mapping[str, Iterable[str]] | Non
     return best
 
 
-def text_classify_detail(text, options,
-                         descriptions: Mapping[str, str] | None = None,
-                         aliases: Mapping[str, Iterable[str]] | None = None,
-                         default="none") -> tuple[str, float]:
-    """Bounded offline text classification over an explicit value space.
+#: Softmax temperature for text. CLIP uses 0.01 because image-text cosines spread
+#: widely; sentence embeddings do not (a clearly-positive review scores 0.81 against
+#: "positive" and 0.70 against "negative" — a 0.11 gap), so 0.01 saturates every row to
+#: 1.0 and destroys the ranking a second time. Measured over 1,000 real reviews, 0.05
+#: keeps the confidence spread across 0.52..0.88 with ZERO rows above 0.99.
+TEXT_SOFTMAX_TEMP = 0.05
 
-    Scores label names, caller-supplied descriptions, and aliases by token overlap.
-    This is deliberately a bounded approximation — not a claim to reproduce a remote
-    model's behavior — and returns its confidence so a plan can expose that boundary.
 
-    `options`, `descriptions` and `aliases` come from the QUERY (a database column's
-    distinct values, or the SQL's literals), never from a taxonomy baked in here.
-    """
-    best, best_score = default, 0.0
+def _option_prompts(options, descriptions, aliases) -> dict[str, list[str]]:
+    """Every surface form that stands for each option: the label, its description, and
+    its aliases. All of them come from the QUERY, never from a taxonomy baked in here."""
+    prompts = {}
     for option in options:
         candidates = [str(option)]
         if descriptions and option in descriptions:
             candidates.append(str(descriptions[option]))
         if aliases:
             candidates.extend(str(value) for value in aliases.get(option, ()))
-        score = max((lexical_score(text, candidate) for candidate in candidates),
-                    default=0.0)
-        if score > best_score:
-            best, best_score = option, score
-    return best, float(best_score)
+        prompts[str(option)] = candidates
+    return prompts
+
+
+def _embed_option_scores(texts, options, descriptions, aliases, model=None):
+    """Cosine of every text against every option → [N, len(options)].
+
+    The option side goes through the encoder's bounded cache (a handful of strings,
+    reused on every row); the text side goes through the BATCHED encoder. An option
+    scores as the best of its surface forms, mirroring how `classify_detail` lets one
+    label be phrased several ways.
+    """
+    import numpy as np
+
+    from . import backend
+    encoder = backend.get_text_encoder(model) if model else backend.get_text_encoder()
+    prompts = _option_prompts(options, descriptions, aliases)
+    flat, spans = [], []
+    for option in options:
+        forms = prompts[str(option)]
+        spans.append((len(flat), len(flat) + len(forms)))
+        flat.extend(forms)
+    option_vectors = encoder.encode_cached(flat)              # [F, D]
+    text_vectors = encoder.encode_texts(texts)                # [N, D]
+    similarity = text_vectors @ option_vectors.T              # [N, F]
+    return np.stack([similarity[:, start:stop].max(axis=1) for start, stop in spans],
+                    axis=1)
+
+
+def _lexical_option_scores(texts, options, descriptions, aliases):
+    """The pre-embedding token-overlap scorer, kept for `method="lexical"`."""
+    import numpy as np
+
+    prompts = _option_prompts(options, descriptions, aliases)
+    return np.array([
+        [max((lexical_score(text, form) for form in prompts[str(option)]), default=0.0)
+         for option in options]
+        for text in texts
+    ], dtype="float32").reshape(len(texts), len(options))
+
+
+def _softmax_rows(scores, temp):
+    import numpy as np
+    x = scores / float(temp)
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def text_classify_batch(texts, options,
+                        descriptions: Mapping[str, str] | None = None,
+                        aliases: Mapping[str, Iterable[str]] | None = None,
+                        default="none", method="embedding",
+                        model=None, min_confidence=0.0) -> list[tuple[str, float]]:
+    """Classify a WHOLE COLUMN at once → [(value, confidence), ...], row-aligned.
+
+    THE PREFERRED ENTRY POINT for corpus-scale work, and the text dual of
+    `encode_images`. One batched encoder pass over the column instead of one forward
+    pass per row: calling the per-row `text_classify_detail` in a loop is the mistake
+    that made the image path spend 15 s on 638 rows.
+
+    Confidence is a softmax over the options, so it is comparable ACROSS ROWS — which
+    is what a ranking (Spearman) or clustering (ARI) query needs. `min_confidence`
+    above 0 lets a plan abstain (returns `default`) instead of taking a weak argmax.
+    """
+    texts = [("" if t is None else str(t)) for t in texts]
+    options = list(options)
+    if not options:
+        return [(default, 0.0)] * len(texts)
+    if not texts:
+        return []
+    raw = (_lexical_option_scores(texts, options, descriptions, aliases)
+           if method == "lexical"
+           else _embed_option_scores(texts, options, descriptions, aliases, model))
+    if method == "lexical":
+        # Preserve the historical contract exactly: the score IS the overlap, and a
+        # row that overlaps nothing abstains.
+        out = []
+        for row in raw:
+            best = int(row.argmax())
+            out.append((options[best], float(row[best])) if row[best] > 0.0
+                       else (default, 0.0))
+        return out
+    confidence = _softmax_rows(raw, TEXT_SOFTMAX_TEMP)
+    out = []
+    for row in confidence:
+        best = int(row.argmax())
+        score = float(row[best])
+        out.append((options[best], score) if score >= float(min_confidence)
+                   else (default, score))
+    return out
+
+
+def text_classify_detail(text, options,
+                         descriptions: Mapping[str, str] | None = None,
+                         aliases: Mapping[str, Iterable[str]] | None = None,
+                         default="none", method="embedding",
+                         model=None, min_confidence=0.0) -> tuple[str, float]:
+    """Offline text classification over an explicit value space → (VALUE, confidence).
+
+    Scores by SEMANTIC SIMILARITY using a local sentence encoder, then softmaxes over
+    the options, so the confidence is comparable across rows — the same output schema
+    as the image-side `classify_detail`.
+
+    This replaced a token-overlap scorer that could not do the job: over 1,000 real
+    movie reviews, scoring against the bare labels ["positive","negative"] left 998 of
+    them tied at exactly 0.0, because only two reviews literally contain those words.
+    The embedding path yields 768 distinct scores over the same corpus, and raises
+    agreement with the corpus' own sentiment column from 0.34 to 0.73.
+
+    `options`, `descriptions` and `aliases` come from the QUERY (a database column's
+    distinct values, or the SQL's literals), never from a taxonomy baked in here.
+    Phrasing matters as much as it does for CLIP: "a positive movie review" beats the
+    bare "positive" by 12 points, so pass `descriptions` when the label name alone is
+    not a sentence.
+
+    Pass `method="lexical"` for the exact-overlap behavior (deterministic, no model).
+    PREFER `text_classify_batch` for a whole column — this per-row form encodes one
+    text per call.
+    """
+    return text_classify_batch([text], options, descriptions, aliases,
+                               default=default, method=method, model=model,
+                               min_confidence=min_confidence)[0]
 
 
 def text_classify_multi_detail(text, options,
                                descriptions: Mapping[str, str] | None = None,
                                aliases: Mapping[str, Iterable[str]] | None = None,
-                               threshold: float = 0.34) -> tuple[list[str], dict[str, float]]:
+                               threshold: float = 0.34,
+                               method="embedding", model=None
+                               ) -> tuple[list[str], dict[str, float]]:
     """Every supported label from an explicit multi-label value space, with scores.
 
     The multi-label counterpart of `text_classify_detail`: use it when the field holds
-    a SET of values at once (several genres on one film) rather than a single label.
-    Pass `aliases` to name the cue PHRASES that stand in for a label — matching on the
-    bare label name alone is what makes token overlap over-fire.
+    a SET of values at once (several genres on one film) rather than one label.
+
+    NOTE the score scale differs from the single-label form ON PURPOSE. Independent
+    labels cannot be softmaxed against each other, so the score here is the raw cosine
+    (or overlap, under `method="lexical"`) per option, NOT a probability. `threshold`
+    is therefore a similarity cutoff — re-tune it when switching methods; the historical
+    0.34 was calibrated for token overlap.
     """
-    selected: list[str] = []
-    scores: dict[str, float] = {}
-    for option in options:
-        candidates = [str(option)]
-        if descriptions and option in descriptions:
-            candidates.append(str(descriptions[option]))
-        if aliases:
-            candidates.extend(str(value) for value in aliases.get(option, ()))
-        score = max((lexical_score(text, candidate) for candidate in candidates),
-                    default=0.0)
-        scores[str(option)] = float(score)
-        if score >= float(threshold):
-            selected.append(option)
+    scores_matrix = (_lexical_option_scores([str(text)], options, descriptions, aliases)
+                     if method == "lexical"
+                     else _embed_option_scores([str(text)], options, descriptions,
+                                               aliases, model))
+    row = scores_matrix[0]
+    scores = {str(option): float(row[i]) for i, option in enumerate(options)}
+    selected = [option for i, option in enumerate(options)
+                if float(row[i]) >= float(threshold)]
     return selected, scores
 
 
@@ -473,15 +631,23 @@ Returns:
 def verify_property(image, prop):
 
 """
-CLIP image-to-TEXT similarity in [0,1] — a raw score, for thresholding when no closed
-value space exists. CLIP's text side sees only the first ~77 tokens, so pass a SHORT
-phrase ("a black handbag"), NEVER a full product description; for a long predicate,
-extract visual attributes with classify / dominant_colors / detect and match those.
+CLIP image-to-TEXT similarity — a RELATIVE score. RANK or COMPARE with it; NEVER
+threshold an absolute value.
+DO NOT WRITE `score(image, text) >= 0.5`. The nominal range is [0,1] but the EFFECTIVE
+range is ~0.54..0.67 (cosine rescaled from [-1,1]; real CLIP image-text cosines are
+~0.1..0.35), so that test is TRUE FOR EVERY PAIR — nonsense text included. A query that
+made this mistake emitted all 1,000 candidate pairs against a 4-row ground truth.
+  yes/no on one image      -> verify_detail(image, prop)   (contrastive, calibrated)
+  best of a value space    -> classify_detail(image, options)
+  ranking / top-k          -> compare score() values against EACH OTHER
+CLIP's text side sees only the first ~77 tokens, so pass a SHORT phrase ("a black
+handbag"), NEVER a full product description; for a long predicate, extract visual
+attributes with classify / dominant_colors / detect and match those.
 Args:
     image (image): the image.
     text (string): a short phrase.
 Returns:
-    float: similarity in [0,1].
+    float: relative similarity, effective range ~0.54..0.67.
 """
 def score(image, text):
 
@@ -834,21 +1000,53 @@ Returns:
 def best_lexical_match(text, options, aliases=None, default="none"):
 
 """
-The TEXT counterpart of vision's `classify_detail`: classifies text into the single best
-option of an explicit value space and returns (VALUE, confidence in [0,1]). Scores the
-label name, an optional description, and optional aliases by token overlap. `options`
-comes from the query's column or SQL literals — there is no built-in taxonomy.
+CLASSIFY A WHOLE TEXT COLUMN AT ONCE → [(value, confidence), ...], row-aligned with
+`texts`. PREFER THIS over calling `text_classify_detail` in a loop: it makes ONE batched
+encoder pass over the column instead of one forward pass per row. Looping the per-row
+form over a corpus is the single most expensive mistake available in this API.
+    labels = text_classify_batch([r["review"] for r in rows], ["positive", "negative"],
+                                 descriptions={"positive": "a positive movie review",
+                                               "negative": "a negative movie review"})
+    for row, (value, confidence) in zip(rows, labels): ...
+Confidence is a softmax over the options, so it is comparable ACROSS ROWS — use it to
+rank, gate or cascade. `min_confidence` above 0 abstains (returns `default`) instead of
+taking a weak argmax. `method="lexical"` selects the old exact-token-overlap scorer.
+Args:
+    texts (list): the column, one string per row.
+    options (list): the value space.
+    descriptions (dict): optional {option: a sentence describing it}.
+    aliases (dict): optional {option: [cue phrases]}.
+    default (string): returned when confidence < min_confidence (default "none").
+    method (string): "embedding" (default) or "lexical".
+    min_confidence (float): abstain below this (default 0.0 = never abstain).
+Returns:
+    list: [(best option value, confidence in [0,1]), ...] aligned with `texts`.
+"""
+def text_classify_batch(texts, options, descriptions=None, aliases=None, default="none", method="embedding", model=None, min_confidence=0.0):
+
+"""
+The TEXT counterpart of vision's `classify_detail`: classifies ONE text into the single
+best option of an explicit value space and returns (VALUE, confidence in [0,1]).
+Scores by SEMANTIC SIMILARITY with a local sentence encoder, then softmaxes over the
+options, so confidence is comparable across rows. `options` comes from the query's
+column or SQL literals — there is no built-in taxonomy.
 Named `text_`* because vision's `classify_detail` takes an image, not a string.
+PHRASING MATTERS, exactly as it does for CLIP templates: pass `descriptions` when a bare
+label name is not a sentence. On 1,000 real movie reviews "a positive movie review"
+beat the bare "positive" by 12 points of accuracy.
+USE `text_classify_batch` FOR A WHOLE COLUMN — this form encodes one text per call.
 Args:
     text (string): the text.
     options (list): the value space.
     descriptions (dict): optional {option: a sentence describing it}.
     aliases (dict): optional {option: [cue phrases]}.
-    default (string): returned when nothing overlaps (default "none").
+    default (string): returned when confidence < min_confidence (default "none").
+    method (string): "embedding" (default) or "lexical" (exact token overlap).
+    min_confidence (float): abstain below this (default 0.0 = never abstain).
 Returns:
     tuple: (best option value, confidence in [0,1]).
 """
-def text_classify_detail(text, options, descriptions=None, aliases=None, default="none"):
+def text_classify_detail(text, options, descriptions=None, aliases=None, default="none", method="embedding", model=None, min_confidence=0.0):
 
 """
 Multi-label form of `text_classify_detail`: EVERY option clearing `threshold`, plus the
@@ -856,9 +1054,13 @@ per-option scores. Use when the field holds a SET of values at once (several gen
 one synopsis) rather than one label. Pass `aliases` with the cue PHRASES that stand in
 for each label — matching the bare label name alone is what makes token overlap over-fire
 (a synopsis containing only "film" would otherwise match "action film").
-CAUTION: scoring is TOKEN OVERLAP, so a multi-word cue can half-match — "love story"
-scores 0.5 against "...horror story...". When you want WHOLE-PHRASE semantics, build the
-predicate from `contains_any` instead:
+CAUTION: the score here is a RAW per-option similarity, NOT a probability — independent
+labels cannot be softmaxed against each other, so this scale differs from the
+single-label form on purpose. Re-tune `threshold` per method: 0.34 was calibrated for
+token overlap, and cosine similarity sits in a different, narrower band.
+Under `method="lexical"` a multi-word cue can half-match — "love story" scores 0.5
+against "...horror story...". When you want WHOLE-PHRASE semantics, build the predicate
+from `contains_any` instead:
     labels = [k for k, cues in cue_map.items() if contains_any(text, cues)]
 Reach for this function when you need the SCORES (to gate, rank or cascade).
 Args:
@@ -867,6 +1069,7 @@ Args:
     descriptions (dict): optional {option: a sentence describing it}.
     aliases (dict): optional {option: [cue phrases]}.
     threshold (float): keep options scoring at or above this (default 0.34).
+    method (string): "embedding" (default) or "lexical".
 Returns:
     tuple: (list of matching values, {option: score}).
 """

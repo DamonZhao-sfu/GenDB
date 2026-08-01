@@ -881,6 +881,11 @@ CSV_COLS = [
     "relative_error", "absolute_error", "mape", "mean_absolute_percentage_error",
     "spearman", "kendall", "spearman_correlation", "kendall_tau",
     "ari", "adjusted_rand_index", "covered",
+    # SUPG contract (blank for every other benchmark). A SUPG query is graded on ONE
+    # of precision/recall depending on its class, against a target, under an oracle
+    # budget -- `f1` alone cannot say whether the query passed.
+    "supg_class", "supg_target", "graded_metric", "graded_value", "target_met",
+    "oracle_budget", "oracle_calls", "val_oracle_calls",
 ]
 
 
@@ -985,6 +990,42 @@ def telemetry_row(tele, query="", benchmark=""):
                 row[column] = metrics[column]
         if metrics.get("variant") is not None:
             row["metric_variant"] = metrics["variant"]
+
+    apply_supg_grading(row, tele)
+    return row
+
+
+def apply_supg_grading(row, tele):
+    """Fill the SUPG contract columns from telemetry + whatever metrics `row` holds.
+
+    Idempotent, and called TWICE on purpose. `main` builds the row from telemetry
+    before the scenario metrics exist, then merges them in; grading has to run after
+    that merge or `graded_value` reads an empty precision/recall. Calling it from
+    `telemetry_row` as well keeps a telemetry-only row (metrics already persisted)
+    correctly graded.
+    """
+    supg = tele.get("supg") if isinstance(tele, dict) else None
+    if not isinstance(supg, dict):
+        return row
+    row["supg_class"] = supg.get("kind", "")
+    row["supg_target"] = supg.get("target", "")
+    row["graded_metric"] = supg.get("graded_metric", "")
+    row["oracle_budget"] = supg.get("oracle_budget", "")
+    row["oracle_calls"] = supg.get("oracle_calls", "")
+    row["val_oracle_calls"] = supg.get("val_oracle_calls", "")
+    # PT is graded on precision, RT on recall. Read the graded value from the metrics
+    # that were actually computed rather than recomputing it here.
+    graded = row.get(supg.get("graded_metric") or "", "")
+    if graded == "" or graded is None:
+        return row
+    row["graded_value"] = graded
+    if supg.get("target") is not None:
+        met = float(graded) >= float(supg["target"])
+        # An over-budget run cannot claim its target: the number was bought with
+        # oracle calls the SUPG contract did not allow.
+        if supg.get("oracle_exceeded"):
+            met = False
+        row["target_met"] = str(met).lower()
     return row
 
 
@@ -1187,6 +1228,8 @@ def main():
         else:
             metrics, raw = eval_scenario(bench, args.query, args.pred, gt_dir, args.sf)
             row.update(**metrics)
+            # Now that precision/recall exist, the SUPG target can be graded.
+            apply_supg_grading(row, tele)
             if args.emit_diff:
                 # A diff-generation failure must NOT prevent metric persistence / the CSV row.
                 try:

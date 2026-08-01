@@ -42,6 +42,9 @@ def test_bounded_classification_and_candidate_extraction_expose_confidence():
 
 
 def test_multi_label_classification_keeps_each_supported_option():
+    """`method="lexical"` pinned deliberately: this asserts `horror == 0`, which is an
+    OVERLAP property. Cosine similarity is never exactly 0, so under the embedding
+    default the assertion would be meaningless rather than merely different."""
     labels, scores = pt.text_classify_multi_detail(
         "A funny romantic story with jokes and a love affair.",
         ["comedy", "romance", "horror"],
@@ -51,6 +54,7 @@ def test_multi_label_classification_keeps_each_supported_option():
             "horror": ["ghost slasher"],
         },
         threshold=0.5,
+        method="lexical",
     )
     assert labels == ["comedy", "romance"]
     assert scores["horror"] == 0
@@ -85,7 +89,7 @@ def test_token_overlap_scoring_over_fires_on_multi_word_cues():
     aliases = {"romance": ["love story"], "horror": ["horror"]}
     labels, scores = pt.text_classify_multi_detail(
         "A science fiction horror story about an alien monster.",
-        ["romance", "horror"], aliases=aliases, threshold=0.5)
+        ["romance", "horror"], aliases=aliases, threshold=0.5, method="lexical")
     assert scores["romance"] == 0.5 and "romance" in labels     # the partial hit
     assert not pt.contains_any(
         "A science fiction horror story about an alien monster.", ["love story"])
@@ -113,3 +117,81 @@ def test_api_surface_has_no_endpoint_or_semantic_judge():
     assert "judge" not in public
     assert "endpoint" not in public
     assert not hasattr(pt, "judge")
+
+
+# --- embedding-backed classification (the default since the lexical scorer was
+# --- shown to leave 998/1000 real reviews tied at exactly 0.0) -----------------
+
+def test_embedding_scoring_separates_what_token_overlap_could_not():
+    """The defect that motivated the change: neither review contains the words
+    "positive"/"negative", so token overlap scored both 0.0 and could not rank them."""
+    good = "An absolute masterpiece, I loved every minute of it."
+    bad = "A dull, lifeless slog that wastes its cast."
+    options = ["positive", "negative"]
+    descriptions = {"positive": "a positive movie review",
+                    "negative": "a negative movie review"}
+    assert pt.text_classify_detail(good, options, method="lexical") == ("none", 0.0)
+    assert pt.text_classify_detail(bad, options, method="lexical") == ("none", 0.0)
+
+    good_label, good_score = pt.text_classify_detail(good, options, descriptions)
+    bad_label, _ = pt.text_classify_detail(bad, options, descriptions)
+    assert good_label == "positive" and bad_label == "negative"
+    assert 0.0 < good_score <= 1.0
+
+
+def test_batch_matches_the_per_row_form():
+    """`text_classify_batch` exists only to save encoder passes — it must not change
+    a single answer, or plans would score differently depending on how they looped."""
+    texts = ["a brilliant, moving film", "utterly boring and pointless",
+             "", "the cinematography is stunning"]
+    options = ["positive", "negative"]
+    batched = pt.text_classify_batch(texts, options)
+    per_row = [pt.text_classify_detail(t, options) for t in texts]
+    assert [b[0] for b in batched] == [s[0] for s in per_row]
+    assert all(abs(b[1] - s[1]) < 1e-5 for b, s in zip(batched, per_row))
+
+
+def test_confidence_is_comparable_across_rows_not_a_two_valued_score():
+    """A ranking (Spearman) or clustering (ARI) query needs a score with real spread.
+    The lexical scorer produced two distinct values over a whole corpus."""
+    texts = ["superb and unforgettable", "quite good overall", "it was okay",
+             "somewhat disappointing", "a complete disaster"]
+    scores = [s for _, s in pt.text_classify_batch(texts, ["positive", "negative"])]
+    assert len({round(s, 4) for s in scores}) == len(texts)
+    assert all(0.0 <= s <= 1.0 for s in scores)
+    assert not all(s > 0.99 for s in scores), "softmax temperature saturated the score"
+
+
+def test_min_confidence_abstains_instead_of_taking_a_weak_argmax():
+    options = ["positive", "negative"]
+    label, score = pt.text_classify_detail("the film is 104 minutes long", options,
+                                           min_confidence=0.99, default="unknown")
+    assert label == "unknown" and score < 0.99
+
+
+def test_empty_and_degenerate_inputs_do_not_crash():
+    assert pt.text_classify_batch([], ["a", "b"]) == []
+    assert pt.text_classify_batch(["x"], []) == [("none", 0.0)]
+    assert pt.text_classify_batch([None], ["a", "b"])[0][0] in ("a", "b")
+
+
+# --- score() calibration trap -------------------------------------------------
+
+def test_clip_match_rescaling_makes_an_absolute_half_threshold_meaningless():
+    """`score()` is nominally [0,1] but `clip_match` maps cosine via (c+1)/2, and real
+    CLIP image-text cosines are ~0.1..0.35. So `>= 0.5` accepts EVERY pair — the defect
+    that made one query emit 1,000 rows against a 4-row ground truth. Pinned as
+    arithmetic so it needs no GPU and cannot regress silently.
+    """
+    def rescale(cosine):                                     # mirrors backend.clip_match
+        return (cosine + 1.0) / 2.0
+
+    realistic = [0.05, 0.10, 0.20, 0.35]                     # incl. an unrelated pair
+    assert all(rescale(c) >= 0.5 for c in realistic), (
+        "if this fails the rescaling changed and the guidance in score()'s docstring "
+        "must be re-measured")
+    # A cosine would have to be NEGATIVE to fall below 0.5 — CLIP image-text pairs
+    # essentially never are.
+    assert rescale(-0.01) < 0.5
+    assert "verify_detail" in pt.score.__doc__, (
+        "score() must keep steering yes/no decisions to the calibrated primitive")
