@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -126,10 +126,53 @@ async function readReconciled(path, kind, options) {
   return value;
 }
 
+/** Persist the deterministic lineage owned by the PGO loop.
+ *
+ *  A replan is a complete replacement document, so the model sees the initial-plan JSON
+ *  example as well as the previous artifact. Qwen can correctly revise all semantic
+ *  fields yet copy the example's `plan_version: 1, parent_plan_version: null`. Spending a
+ *  nine-minute Planner call and then discarding the query over those two bookkeeping
+ *  literals is both expensive and unnecessary: the orchestrator already has the sole
+ *  authoritative previous version.
+ *
+ *  This does NOT repair query identity or semantic content. `readReconciled` has already
+ *  rejected a plan belonging to another query, and the schema has already validated the
+ *  document. We only stamp lineage to the one value the PGO state machine permits.
+ */
+async function reconcilePlanLineage(plan, path, previousPlan) {
+  if (!previousPlan) return [];
+  const expectedVersion = previousPlan.plan_version + 1;
+  const expectedParent = previousPlan.plan_version;
+  const repaired = [];
+  if (plan.plan_version !== expectedVersion) {
+    repaired.push({ field: "plan_version", was: plan.plan_version, now: expectedVersion });
+    plan.plan_version = expectedVersion;
+  }
+  if (plan.parent_plan_version !== expectedParent) {
+    repaired.push({
+      field: "parent_plan_version",
+      was: plan.parent_plan_version,
+      now: expectedParent,
+    });
+    plan.parent_plan_version = expectedParent;
+  }
+  if (repaired.length) {
+    await writeJsonAtomic(path, plan);
+    const changes = repaired
+      .map(({ field, was, now }) => `${field}=${JSON.stringify(was)} -> ${now}`)
+      .join(", ");
+    console.warn(
+      `[SemDB] plan at ${path} emitted stale replan lineage; normalized ${changes}.`,
+    );
+  }
+  return repaired;
+}
+
 export async function readAndValidatePlan(path, options = {}) {
   const plan = await readReconciled(path, "plan", options);
   if (options.requireCompilable) assertPlanGeneratable(plan);
   if (options.previousPlan) {
+    await reconcilePlanLineage(plan, path, options.previousPlan);
     if (plan.plan_version !== options.previousPlan.plan_version + 1) {
       throw new Error(
         `Replanned SemDB plan_version must increment by one at ${path}`,
@@ -446,6 +489,16 @@ export async function writeJsonAtomic(path, value) {
   );
   const text = `${JSON.stringify(value, null, 2)}\n`;
   await writeFile(tempPath, text, { encoding: "utf8", flag: "wx" });
+  await rename(tempPath, path);
+}
+
+export async function writeTextAtomic(path, text, options = {}) {
+  const tempPath = resolve(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  await writeFile(tempPath, String(text), { encoding: "utf8", flag: "wx" });
+  if (options.mode != null) await chmod(tempPath, options.mode);
   await rename(tempPath, path);
 }
 

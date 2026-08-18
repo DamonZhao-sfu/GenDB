@@ -3,17 +3,18 @@
  * semantic operator compilation pipeline (Schema Designer → Extractor → Code
  * Generator).
  *
- * Two agent providers are supported, reusing src/gendb/providers unchanged:
+ * Three agent providers are supported, reusing src/gendb/providers unchanged:
  *   - "claude" → @anthropic-ai/claude-agent-sdk   (providers/claude.mjs)
  *   - "codex"  → @openai/codex-sdk                (providers/codex.mjs)
+ *   - "vllm"   → local Responses-compatible vLLM  (providers/vllm.mjs)
  *
  * Pick one with `defaults.agentProvider` or the orchestrator's `--agent-provider`
  * flag. Each provider block sets the model per agent and the reasoning effort.
  */
 
 export const defaults = {
-  // "claude" or "codex" — selects the underlying agent SDK.
-  agentProvider: "claude",
+  // Use the locally served Qwen model by default.
+  agentProvider: "vllm",
 
   // Corpus / benchmark selection (SemBench).
   benchmark: "mmqa",          // mmqa | cars | ecomm | animals | movie
@@ -23,11 +24,11 @@ export const defaults = {
   // compiler agents). Independent of the agent provider above.
   extraction: {
     clipModel: "openai/clip-vit-base-patch32",   // tier-② CLIP for non-VLM image extraction (semvision)
-    smallImageModel: "HuggingFaceTB/SmolVLM-256M-Instruct",
-    strongImageModel: "Qwen/Qwen3.6-35B-A3B",
-    smallTextModel: "Qwen/Qwen2.5-0.5B-Instruct",
-    escalationImageModel: "Qwen/Qwen3.6-35B-A3B",
-    captionModel: "Qwen/Qwen3.6-35B-A3B",   // OpImgCap — one caption per corpus image
+    smallImageModel: "Qwen/Qwen3.8-27B-FP8",
+    strongImageModel: "Qwen/Qwen3.8-27B-FP8",
+    smallTextModel: "Qwen/Qwen3.8-27B-FP8",
+    escalationImageModel: "Qwen/Qwen3.8-27B-FP8",
+    captionModel: "Qwen/Qwen3.8-27B-FP8",   // OpImgCap — one caption per corpus image
     theta: 0.5,               // residual confidence floor, cut on OpImgVQA's logprob score
   },
 
@@ -38,6 +39,7 @@ export const defaults = {
   refineStallThreshold: 2,    // stop after this many consecutive non-improving iterations
   refineSampleCap: 15,        // max FP and FN rows shown to the agent per iteration
   directAgentArchitecture: "pgo", // pgo | legacy; only affects --direct
+  agentExecution: "agent",        // agent | structured; vLLM Planner/Optimizer only
   enableAgentSkills: true,    // publish role + learned skills into a discoverable root
   maxReplans: 1,              // evidence-backed Planner revisions per query
 
@@ -116,6 +118,29 @@ export const defaults = {
         memory_manager: "high",
       },
       escalationModel: "gpt-5.6-luna",
+    },
+
+    vllm: {
+      model: "Qwen/Qwen3.8-27B-FP8",
+      agentModels: {
+        schema_designer: "Qwen/Qwen3.8-27B-FP8",
+        extractor: "Qwen/Qwen3.8-27B-FP8",
+        code_generator: "Qwen/Qwen3.8-27B-FP8",
+        query_planner: "Qwen/Qwen3.8-27B-FP8",
+        semantic_code_generator: "Qwen/Qwen3.8-27B-FP8",
+        semantic_optimizer: "Qwen/Qwen3.8-27B-FP8",
+        memory_manager: "Qwen/Qwen3.8-27B-FP8",
+      },
+      agentEffortLevels: {
+        schema_designer: "medium",
+        extractor: "medium",
+        code_generator: "medium",
+        query_planner: "medium",
+        semantic_code_generator: "medium",
+        semantic_optimizer: "medium",
+        memory_manager: "medium",
+      },
+      escalationModel: "Qwen/Qwen3.8-27B-FP8",
     },
   },
 };

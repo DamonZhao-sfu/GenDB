@@ -120,6 +120,45 @@ function safeHistory(history = []) {
   }));
 }
 
+/** Aggregate a solver trace without exposing row ids or validation labels. Branch names
+ * are diagnostic only; these serialized trace values are the authoritative final
+ * operator decisions seen by validation. */
+export function summarizeTraceArtifact(trace) {
+  const rows = trace?.rows;
+  if (!rows || typeof rows !== "object" || Array.isArray(rows)) {
+    return {
+      status: "missing",
+      entries: 0,
+      true_count: 0,
+      false_count: 0,
+      other_count: 0,
+      distinct_values: [],
+      omitted_distinct_values: 0,
+    };
+  }
+  const counts = new Map();
+  let trueCount = 0;
+  let falseCount = 0;
+  for (const value of Object.values(rows)) {
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    const normalized = String(serialized).trim().toLocaleLowerCase("en-US");
+    if (normalized === "true") trueCount++;
+    else if (normalized === "false") falseCount++;
+    counts.set(String(serialized), (counts.get(String(serialized)) || 0) + 1);
+  }
+  const values = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  return {
+    status: "ok",
+    entries: Object.keys(rows).length,
+    true_count: trueCount,
+    false_count: falseCount,
+    other_count: Object.keys(rows).length - trueCount - falseCount,
+    distinct_values: values.slice(0, 12).map(([value, count]) => ({ value, count })),
+    omitted_distinct_values: Math.max(0, values.length - 12),
+  };
+}
+
 export function buildIterationFeedback({
   query,
   candidate,
@@ -211,6 +250,10 @@ export function buildIterationFeedback({
       ?? (scoreOutcome.runLog
         ? { log: scoreOutcome.runLog }
         : (runOutcome.runLog ? { log: runOutcome.runLog } : {})),
+    trace_summary:
+      scoreOutcome.traceSummary
+      ?? runOutcome.traceSummary
+      ?? summarizeTraceArtifact(null),
     history: safeHistory(history),
     data_boundary: {
       source: dataBoundary.source,
@@ -222,9 +265,18 @@ export function buildIterationFeedback({
 }
 
 export function hasMeasurableSelectSignal(feedback) {
+  const noBinaryPositiveSignal = ["f1", "predicate_fidelity_f1"].includes(
+    feedback?.objective?.name,
+  )
+    && feedback?.execution?.status === "ok"
+    && feedback?.objective?.precision == null
+    && feedback?.objective?.recall == null
+    && finiteOrNull(feedback?.errors?.false_positive_total) === 0
+    && finiteOrNull(feedback?.errors?.false_negative_total) === 0;
   return feedback?.data_boundary?.source === "select_validation"
     && feedback.data_boundary.cert_accessed === false
     && feedback.data_boundary.full_ground_truth_accessed === false
+    && !noBinaryPositiveSignal
     && (
       feedback.execution.status !== "ok"
       || finiteOrNull(feedback.objective?.value) !== null

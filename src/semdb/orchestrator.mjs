@@ -35,6 +35,7 @@ import { spawnSync } from "child_process";
 import {
   renderTemplate,
   runAgent,
+  runStructuredAgent,
   readJSON,
   setAgentProvider,
 } from "../gendb/shared.mjs";
@@ -68,9 +69,23 @@ import {
   readAndValidateOptimizerAction,
   readAndValidatePlan,
   writeJsonAtomic,
+  writeTextAtomic,
 } from "./agent-runtime/contracts.mjs";
 import { runPgoLoop } from "./agent-runtime/pgo-loop.mjs";
-import { assertSelectValidationPayload } from "./agent-runtime/feedback.mjs";
+import {
+  prepareAgentRole,
+  prepareStructuredRole,
+  supportsStructuredRole,
+  validateStructuredOptimizerEvidence,
+} from "./agent-runtime/structured-role.mjs";
+import {
+  assertSelectValidationPayload,
+  summarizeTraceArtifact,
+} from "./agent-runtime/feedback.mjs";
+import {
+  buildPlannerTableProfile,
+  lintPlanAgainstTableProfile,
+} from "./agent-runtime/context-profile.mjs";
 import { classifyValidationCapability } from "./validation_capability.mjs";
 
 // Shared SQL scanners (also used by memory/signature.mjs, so the retrieval key is
@@ -122,6 +137,10 @@ export function parseArgs(argv) {
     // the vadar/ operator library. This is the only pipeline — the Schema-Designer +
     // extract/attrs/compile split was removed.
     agentArchitecture: defaults.directAgentArchitecture,
+    agentExecution: defaults.agentExecution,
+    structuredReasoningEffort: null,
+    plannerMaxOutputTokens: null,
+    optimizerMaxOutputTokens: null,
     maxReplans: defaults.maxReplans,
     enableAgentSkills: defaults.enableAgentSkills,
     memoryDir: defaults.memoryDir,   // cross-run memory; null disables it entirely
@@ -149,6 +168,7 @@ export function parseArgs(argv) {
     if (a === "--query" && argv[i + 1]) args.query = argv[++i];
     else if (a === "--benchmark" && argv[i + 1]) args.benchmark = argv[++i];
     else if (a === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
+    else if (a === "--base-url" && argv[i + 1]) process.env.VLLM_BASE_URL = argv[++i];
     else if (a === "--model" && argv[i + 1]) args.modelOverride = argv[++i];
     else if (a === "--query-source" && argv[i + 1]) args.querySource = argv[++i];
     else if (a === "--sf" && argv[i + 1]) args.scaleFactor = argv[++i];
@@ -175,6 +195,16 @@ export function parseArgs(argv) {
     else if (a === "--image-only") args.imageOnly = true;
     else if (a === "--direct") { /* the only pipeline; accepted for compatibility */ }
     else if (a === "--agent-architecture" && argv[i + 1]) args.agentArchitecture = argv[++i];
+    else if (a === "--agent-execution" && argv[i + 1]) args.agentExecution = argv[++i];
+    else if (a === "--structured-reasoning-effort" && argv[i + 1]) {
+      args.structuredReasoningEffort = argv[++i];
+    }
+    else if (a === "--planner-max-output-tokens" && argv[i + 1]) {
+      args.plannerMaxOutputTokens = Number(argv[++i]);
+    }
+    else if (a === "--optimizer-max-output-tokens" && argv[i + 1]) {
+      args.optimizerMaxOutputTokens = Number(argv[++i]);
+    }
     else if (a === "--max-replans" && argv[i + 1]) args.maxReplans = Number(argv[++i]);
     else if (a === "--no-agent-skills") args.enableAgentSkills = false;
     else if (a === "--memory-dir" && argv[i + 1]) args.memoryDir = resolve(argv[++i]);
@@ -207,6 +237,27 @@ export function parseArgs(argv) {
   }
   if (!Number.isInteger(args.maxReplans) || args.maxReplans < 0) {
     throw new Error("--max-replans must be a non-negative integer");
+  }
+  if (!["agent", "structured"].includes(args.agentExecution)) {
+    throw new Error(`--agent-execution must be "agent" or "structured" (got "${args.agentExecution}")`);
+  }
+  if (
+    args.structuredReasoningEffort
+    && !["low", "medium", "xhigh"]
+      .includes(args.structuredReasoningEffort)
+  ) {
+    throw new Error(
+      `--structured-reasoning-effort must be low, medium, or xhigh for Qwen3.8 `
+      + `(got "${args.structuredReasoningEffort}")`,
+    );
+  }
+  for (const [flag, value] of [
+    ["--planner-max-output-tokens", args.plannerMaxOutputTokens],
+    ["--optimizer-max-output-tokens", args.optimizerMaxOutputTokens],
+  ]) {
+    if (value != null && (!Number.isInteger(value) || value <= 0)) {
+      throw new Error(`${flag} must be a positive integer`);
+    }
   }
   // Infer benchmark / sembench root / scale-factor from explicit dir paths, so
   // `--data-dir .../files/cars/data/sf_9836` works WITHOUT --benchmark/--sf.
@@ -279,7 +330,7 @@ export async function validateDataDirectory(args) {
 
 /** Verify an explicitly requested oracle model exists before paying for any work. */
 export async function validateEndpointModel(endpoint, model, apiKey = "EMPTY") {
-  if (!endpoint || !model) return;
+  if (!endpoint || !model) return model;
   const url = endpoint.replace(/\/+$/, "") + "/models";
   let response;
   try {
@@ -296,14 +347,18 @@ export async function validateEndpointModel(endpoint, model, apiKey = "EMPTY") {
   let payload;
   try { payload = await response.json(); }
   catch { throw new Error(`oracle endpoint ${url} did not return JSON`); }
-  const available = (payload?.data || []).map((entry) => entry.id).filter(Boolean);
-  if (!available.includes(model)) {
+  const entries = payload?.data || [];
+  const match = entries.find((entry) => entry?.id === model)
+    || entries.find((entry) => entry?.root === model);
+  const available = entries.map((entry) => entry?.id).filter(Boolean);
+  if (!match?.id) {
     throw new Error(
       `oracle model '${model}' is not served by ${endpoint}. `
       + `Available model(s): ${available.join(", ") || "(none)"}. `
       + `Restart the endpoint with --model ${model}, or pass a served --oracle-model.`
     );
   }
+  return match.id;
 }
 
 /** Normalize old F1-only outcomes and new metric-aware outcomes. */
@@ -1424,10 +1479,9 @@ async function curateMemory(args, runPlans) {
     existing_templates: templates
       .map((t) => `- ${t.id}: ${t.summary} (instances: ${t.content?.instance_count ?? 1})`)
       .join("\n"),
-    // Only LEARNED skills. skill_usage.json also counts the three role procedures,
-    // and handing those to the Manager makes it dutifully write evidence.json into
-    // directories that are procedures, not knowledge — they are exempt from the
-    // evidence rule and never appear in the memory catalog.
+    // Only LEARNED skills. Generator still discovers its role procedure, while Planner
+    // and Optimizer receive theirs directly as the system procedure. In either case role
+    // procedures are not knowledge and must stay out of evidence curation.
     skill_usage: await renderLearnedSkillUsage(usagePath, skills),
     update_schema_path: resolve(__dirname, "contracts", "memory-update.schema.json"),
     update_path: updatePath,
@@ -1539,53 +1593,283 @@ async function listQueries(dir) {
     .map((f) => f.replace(/\.sql$/i, "")).sort();
 }
 
+function mergeAgentResults(results, extraProfile = {}) {
+  const last = results.at(-1) || {};
+  const tokens = {};
+  const skillsUsed = {};
+  for (const result of results) {
+    for (const [key, value] of Object.entries(result.tokens || {})) {
+      tokens[key] = (tokens[key] || 0) + (Number(value) || 0);
+    }
+    for (const [key, value] of Object.entries(result.skillsUsed || {})) {
+      skillsUsed[key] = (skillsUsed[key] || 0) + (Number(value) || 0);
+    }
+  }
+  const sumProfile = (key) => results.reduce(
+    (total, result) => total + (Number(result.profile?.[key]) || 0), 0);
+  return {
+    ...last,
+    durationMs: results.reduce((total, result) => total + (result.durationMs || 0), 0),
+    tokens,
+    costUsd: results.reduce((total, result) => total + (result.costUsd || 0), 0),
+    numTurns: results.reduce((total, result) => total + (result.numTurns || 0), 0),
+    skillsUsed,
+    profile: {
+      structured: results.some((result) => result.profile?.structured),
+      structured_requests: sumProfile("structured_requests"),
+      system_prompt_chars: sumProfile("system_prompt_chars"),
+      user_prompt_chars: sumProfile("user_prompt_chars"),
+      agent_messages: sumProfile("agent_messages"),
+      agent_message_chars: sumProfile("agent_message_chars"),
+      reasoning_items: sumProfile("reasoning_items"),
+      reasoning_chars: sumProfile("reasoning_chars"),
+      command_executions: sumProfile("command_executions"),
+      command_output_chars: sumProfile("command_output_chars"),
+      max_command_output_chars: Math.max(
+        0,
+        ...results.map((result) => Number(result.profile?.max_command_output_chars) || 0),
+      ),
+      file_changes: sumProfile("file_changes"),
+      ...extraProfile,
+    },
+  };
+}
+
+async function validateStructuredArtifact(configKey, outputPath, vars) {
+  if (configKey === "query_planner") {
+    const previousPlan = vars.previous_plan_path
+      ? await readJSON(vars.previous_plan_path)
+      : null;
+    const plan = await readAndValidatePlan(outputPath, {
+      queryId: vars.query_id,
+      ...(previousPlan ? { previousPlan } : {}),
+    });
+    const findings = [
+      ...lintImagePlan(plan),
+      ...lintPlanAgainstTableProfile(plan, vars.planner_table_profile),
+    ];
+    if (findings.length) {
+      throw new Error(`Semantic plan lint failed: ${findings.join(" ")}`);
+    }
+    return plan;
+  }
+  if (configKey === "semantic_optimizer") {
+    const manifest = await readJSON(vars.candidate_manifest_path);
+    const action = await readAndValidateOptimizerAction(outputPath, {
+      queryId: vars.query_id,
+      candidateId: manifest?.candidate_id,
+    });
+    await validateStructuredOptimizerEvidence(action, vars);
+    return action;
+  }
+  throw new Error(`No structured artifact validator for ${configKey}`);
+}
+
+/** A role sees its own procedure plus only retrieval-selected learned skills. Planner and
+ * Optimizer put the procedure directly in their system prompt, so advertising it again
+ * would recreate the skill-read loop this path is designed to remove. */
+export function selectAgentSkills(agentConfig, availableSkills, relevantSkillNames, options = {}) {
+  const relevant = new Set(Array.isArray(relevantSkillNames) ? relevantSkillNames : []);
+  return (availableSkills || []).filter((skill) => {
+    if (skill.role) {
+      return !options.procedureInSystem && skill.name === agentConfig.skillName;
+    }
+    return relevant.has(skill.name);
+  });
+}
+
 async function runPhase(agentConfig, vars, runDir, args, opts = {}) {
   const systemPromptPath = opts.systemPromptPath || agentConfig.promptPath;
   const userPromptPath = opts.userPromptPath || agentConfig.userPromptPath;
-  const systemPrompt = await readFile(systemPromptPath, "utf-8");
-  const template = await readFile(userPromptPath, "utf-8");
-  const userPrompt = renderTemplate(template, vars);
+  const defaultRolePaths = !opts.systemPromptPath && !opts.userPromptPath;
+  const canonicalAgentProcedure = defaultRolePaths
+    && supportsStructuredRole(agentConfig.configKey)
+    && Boolean(agentConfig.skillPath);
+  const useStructured = args.agentProvider === "vllm"
+    && args.agentExecution === "structured"
+    && supportsStructuredRole(agentConfig.configKey)
+    && defaultRolePaths;
+  const model = args.modelOverride || getAgentModel(agentConfig.configKey, args.agentProvider);
+  const effortLevel = getAgentEffort(agentConfig.configKey, args.agentProvider);
 
-  // Skills are DISCOVERED, not bound. Each role's procedure and every learned
-  // memory skill live in one isolated root (args.skillRoot); the agent picks what
-  // to load. Scoping settingSources to 'project' with that root as cwd is what
-  // keeps discovery free without exposing GenDB's C++ skills or the operator's
-  // personal global skills.
-  const skillsEnabled = args.enableAgentSkills !== false
-    && Boolean(args.skillRoot)
-    && (agentConfig.allowedTools || []).includes("Skill");
-  const skills = skillsEnabled ? (args.availableSkills || []) : [];
-  const allowedTools = skillsEnabled
-    ? agentConfig.allowedTools
-    : (agentConfig.allowedTools || []).filter((t) => t !== "Skill");
+  let cachedAgentExecution = null;
+  const prepareFullAgentExecution = async () => {
+    if (cachedAgentExecution) return cachedAgentExecution;
+    let systemPrompt;
+    let userPrompt;
+    let contextProfile = {};
+    if (canonicalAgentProcedure) {
+      const prepared = await prepareAgentRole(agentConfig, vars);
+      const contextPath = resolve(runDir, `_agent_context_${agentConfig.configKey}.md`);
+      if (!args.dryRun) {
+        await writeTextAtomic(contextPath, `${prepared.contextText}\n`, { mode: 0o444 });
+      }
+      const template = await readFile(userPromptPath, "utf-8");
+      systemPrompt = prepared.systemPrompt;
+      userPrompt = renderTemplate(template, {
+        ...vars,
+        agent_context_path: contextPath,
+        agent_context_sha256: prepared.contextSha256,
+      });
+      contextProfile = {
+        canonical_role_procedure: agentConfig.skillName,
+        agent_context_bundle_path: contextPath,
+        agent_context_bundle_chars: prepared.contextText.length,
+        agent_context_bundle_sha256: prepared.contextSha256,
+      };
+    } else {
+      const [legacySystemPrompt, template] = await Promise.all([
+        readFile(systemPromptPath, "utf-8"),
+        readFile(userPromptPath, "utf-8"),
+      ]);
+      systemPrompt = legacySystemPrompt;
+      userPrompt = renderTemplate(template, vars);
+    }
+
+    const skillCandidates = selectAgentSkills(
+      agentConfig,
+      args.availableSkills || [],
+      vars.memory_inline_skills ? [] : vars.memory_relevant_skill_names,
+      { procedureInSystem: canonicalAgentProcedure },
+    );
+    const skillsEnabled = args.enableAgentSkills !== false
+      && Boolean(args.skillRoot)
+      && (agentConfig.allowedTools || []).includes("Skill")
+      && skillCandidates.length > 0;
+    const skills = skillsEnabled ? skillCandidates : [];
+    const allowedTools = skillsEnabled
+      ? agentConfig.allowedTools
+      : (agentConfig.allowedTools || []).filter((tool) => tool !== "Skill");
+    cachedAgentExecution = {
+      skillsEnabled,
+      skills,
+      profile: {
+        ...contextProfile,
+        discoverable_skill_count: skills.length,
+        discoverable_skill_names: skills.map((skill) => skill.name),
+      },
+      options: {
+        systemPrompt,
+        userPrompt,
+        allowedTools,
+        model,
+        effortLevel,
+        configName: agentConfig.configKey,
+        cwd: runDir,
+        timeoutMs: defaults.agentTimeoutMs,
+        useSkills: skillsEnabled,
+        skillRoot: skillsEnabled ? args.skillRoot : undefined,
+        skillsDir: skillsEnabled ? skillsDirFor(args.skillRoot) : undefined,
+        skills,
+        settingSources: skillsEnabled ? ["project"] : undefined,
+      },
+    };
+    return cachedAgentExecution;
+  };
 
   if (args.dryRun) {
     console.log(`\n[SemDB] --- ${agentConfig.name} (dry-run) ---`);
+    if (useStructured) {
+      const prepared = await prepareStructuredRole(agentConfig, vars, {
+        effortLevel: args.structuredReasoningEffort,
+        maxOutputTokens: agentConfig.configKey === "query_planner"
+          ? args.plannerMaxOutputTokens
+          : args.optimizerMaxOutputTokens,
+      });
+      console.log(`[SemDB] execution: structured, max_output_tokens=${prepared.maxOutputTokens}, effort=${prepared.effortLevel}`);
+      console.log(prepared.userPrompt);
+      return { dryRun: true };
+    }
+    const agentExecution = await prepareFullAgentExecution();
     console.log(`[SemDB] discoverable skills: ${
-      skillsEnabled ? (skills.map((s) => s.name).join(", ") || "(none published)") : "(disabled)"
+      agentExecution.skillsEnabled
+        ? agentExecution.skills.map((skill) => skill.name).join(", ")
+        : "(disabled)"
     }`);
-    console.log(userPrompt);
+    if (canonicalAgentProcedure) {
+      console.log(`[SemDB] canonical procedure: ${agentConfig.skillName}`);
+      console.log(`[SemDB] context bundle: ${agentExecution.profile.agent_context_bundle_path}`
+        + ` (${agentExecution.profile.agent_context_bundle_chars} chars)`);
+    }
+    console.log(agentExecution.options.userPrompt);
     return { dryRun: true };
   }
 
-  const result = await runAgent(agentConfig.name, {
-    systemPrompt,
-    userPrompt,
-    allowedTools,
-    model: args.modelOverride || getAgentModel(agentConfig.configKey, args.agentProvider),
-    effortLevel: getAgentEffort(agentConfig.configKey, args.agentProvider),
-    configName: agentConfig.configKey,
-    cwd: runDir,
-    timeoutMs: defaults.agentTimeoutMs,
-    useSkills: skillsEnabled,
-    skillRoot: skillsEnabled ? args.skillRoot : undefined,
-    skillsDir: skillsEnabled ? skillsDirFor(args.skillRoot) : undefined,
-    skills,
-    settingSources: skillsEnabled ? ["project"] : undefined,
-  });
+  let result;
+  if (useStructured) {
+    const prepared = await prepareStructuredRole(agentConfig, vars, {
+      effortLevel: args.structuredReasoningEffort,
+      maxOutputTokens: agentConfig.configKey === "query_planner"
+        ? args.plannerMaxOutputTokens
+        : args.optimizerMaxOutputTokens,
+    });
+    const attempts = [];
+    let correction = "";
+    let validated = false;
+    let requestMaxOutputTokens = prepared.maxOutputTokens;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const structured = await runStructuredAgent(agentConfig.name, {
+        systemPrompt: prepared.systemPrompt,
+        userPrompt: prepared.userPrompt + correction,
+        schema: prepared.schema,
+        schemaName: prepared.schemaName,
+        maxOutputTokens: requestMaxOutputTokens,
+        model,
+        timeoutMs: defaults.agentTimeoutMs,
+        configName: agentConfig.configKey,
+        effortLevel: prepared.effortLevel,
+      });
+      attempts.push(structured);
+      if (structured.error) {
+        if (attempt === 1 && structured.retryable) {
+          correction = `\n\n## Retry correction\nThe previous structured response failed: ${structured.error.slice(0, 1200)}\nReturn one corrected JSON object.`;
+          if (structured.profile?.incomplete_reason === "max_output_tokens") {
+            requestMaxOutputTokens = prepared.retryMaxOutputTokens;
+            correction += ` The retry output budget is ${requestMaxOutputTokens} tokens; finish the JSON before that limit.`;
+          }
+          continue;
+        }
+        break;
+      }
+      try {
+        await writeJsonAtomic(prepared.outputPath, structured.structured);
+        await validateStructuredArtifact(agentConfig.configKey, prepared.outputPath, vars);
+        validated = true;
+        break;
+      } catch (error) {
+        structured.error = `Structured artifact contract failed: ${error.message}`;
+        structured.retryable = true;
+        if (attempt === 1) {
+          correction = `\n\n## Retry correction\nThe previous JSON failed the runtime contract: ${error.message.slice(0, 1200)}\nReturn the complete corrected object.`;
+        }
+      }
+    }
+    if (validated) {
+      result = mergeAgentResults(attempts, {
+        structured_attempts: attempts.length,
+        fallback_used: false,
+      });
+      delete result.error;
+    } else {
+      const reason = attempts.at(-1)?.error || "unknown structured-output failure";
+      console.warn(`[SemDB] ${agentConfig.name} structured path failed; falling back to the tool agent: ${reason}`);
+      const agentExecution = await prepareFullAgentExecution();
+      const fallback = await runAgent(agentConfig.name, agentExecution.options);
+      result = mergeAgentResults([...attempts, fallback], {
+        structured_attempts: attempts.length,
+        fallback_used: true,
+        fallback_reason: reason,
+        ...agentExecution.profile,
+      });
+    }
+  } else {
+    const agentExecution = await prepareFullAgentExecution();
+    result = await runAgent(agentConfig.name, agentExecution.options);
+    result.profile = { ...(result.profile || {}), ...agentExecution.profile };
+  }
   if (result.error) throw new Error(`${agentConfig.name} failed: ${result.error}`);
   const usageQueryId = opts.queryId || vars.query_id;
-  if (skillsEnabled && usageQueryId) {
+  if (usageQueryId && Object.keys(result.skillsUsed || {}).length) {
     await recordSkillUsage(args.out, usageQueryId, result.skillsUsed);
   }
   return result;
@@ -1727,6 +2011,7 @@ function makeRecorder(args, phases) {
       model: args.modelOverride || getAgentModel(name, args.agentProvider),
       duration_ms: r.durationMs || 0,
       tokens: r.tokens || {},
+      profile: r.profile || {},
       cost_usd: r.costUsd || 0,
       llm_calls: r.numTurns || 1,   // internal turns this agent made (min 1)
     });
@@ -1975,6 +2260,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     memory_pre_injection: mem?.blocks?.[role] || "",
     memory_catalog: mem?.catalog || "",
     memory_inline_skills: mem?.inlineSkills || "",
+    memory_relevant_skill_names: mem?.relevantSkillNames || [],
     memory_note: mem && mem.tier !== "novel" ? "true" : "",
   });
 
@@ -2021,6 +2307,9 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       );
     }
   }
+  const plannerTableProfile = architecture === "pgo"
+    ? await buildPlannerTableProfile(tables)
+    : null;
   const isImage = corpus.isImage || corpus.modality === "image";
   // SUPG replay: the corpus is (id, proxy_score) and the label is reachable only via
   // the metered oracle. There is no content for a VLM/LLM to read, so this branch
@@ -2781,16 +3070,21 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   // query that joins an image predicate against a text column reads a single file.
   const primitiveFiles = [resolve(__dirname, "vadar", "predefined.py")];
   const plannerVars = (planPath, previousPlanPath = "", optimizerActionPath = "",
-                       plannerLint = "", referencePlanPath = "") => ({
+                       plannerLint = "", referencePlanPath = "",
+                       previousPlanVersion = null) => ({
     query_id: query,
     query_sql: sql,
     query_nl: nl || "(none)",
     modality: isImage ? "image" : "text",
     tables_doc: tableLines.join("\n"),
+    planner_table_profile: plannerTableProfile,
     local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
     trace_contract: agentTraceContract,
     plan_path: planPath,
     previous_plan_path: previousPlanPath,
+    previous_plan_version: previousPlanVersion ?? "",
+    required_plan_version: previousPlanVersion == null ? 1 : previousPlanVersion + 1,
+    required_parent_plan_version: previousPlanVersion == null ? "null" : previousPlanVersion,
     optimizer_action_path: optimizerActionPath,
     planner_lint: plannerLint,
     plan_schema_path: resolve(__dirname, "contracts", "semantic-plan.schema.json"),
@@ -2881,7 +3175,14 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   }) => {
     record("query_planner", await runPhase(
       queryPlannerConfig,
-      plannerVars(planPath, previousPlanPath, actionPath, takePlanLint()),
+      plannerVars(
+        planPath,
+        previousPlanPath,
+        actionPath,
+        takePlanLint(),
+        "",
+        previousPlan.plan_version,
+      ),
       iterDir,
       args,
     ));
@@ -3018,6 +3319,9 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         plan_path: candidate.planPath || planPath,
         candidate_manifest_path: candidate.manifestPath,
         iteration_feedback_path: feedbackPath,
+        candidate_helpers_path: candidate.helperPath,
+        candidate_solver_path: candidate.solverPath,
+        candidate_diff_path: resolve(candidate.iterDir, "diff.json"),
         history_manifest_paths: historyManifestPaths,
         optimizer_action_path: actionPath,
         optimizer_action_schema_path: resolve(
@@ -3040,6 +3344,11 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     return { actionObject, actionPath };
   };
   const executePgoCandidate = async (candidate, context = {}) => {
+    const withTraceSummary = async (run) => {
+      const tracePath = resolve(candidate.iterDir, `trace_${query}.json`);
+      const trace = existsSync(tracePath) ? await readJSON(tracePath) : null;
+      return { ...run, traceSummary: summarizeTraceArtifact(trace) };
+    };
     const run = await runSolver(
       candidate.iterDir,
       candidate.solverPath,
@@ -3065,15 +3374,15 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         parentCandidate: null,
       });
       Object.assign(candidate, cold);
-      return runSolver(
+      return withTraceSummary(await runSolver(
         candidate.iterDir,
         candidate.solverPath,
         candidate.csvPath,
         valMode ? valIdsPath : null,
         candidate.helperPath,
-      );
+      ));
     }
-    return run;
+    return withTraceSummary(run);
   };
   const scorePgoCandidate = async (candidate, run) => {
     if (valMode) {
@@ -3145,6 +3454,9 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
           plan_path: dryPlanPath,
           candidate_manifest_path: dryManifestPath,
           iteration_feedback_path: resolve(iter0Dir, "iteration_feedback.json"),
+          candidate_helpers_path: dryHelperPath,
+          candidate_solver_path: drySolverPath,
+          candidate_diff_path: resolve(iter0Dir, "diff.json"),
           history_manifest_paths: `- ${dryManifestPath}`,
           optimizer_action_path: resolve(iter1Dir, "optimizer_action.json"),
           optimizer_action_schema_path: resolve(
@@ -3224,6 +3536,10 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   const gt = await resolveGroundTruth(args.groundTruthDir, query, args.scaleFactor);
   const agentMs = phases.reduce((s, p) => s + p.duration_ms, 0);
   const agentCalls = phases.reduce((s, p) => s + p.llm_calls, 0);
+  const agentMessages = phases.reduce(
+    (s, p) => s + (Number(p.profile?.agent_messages) || 0), 0);
+  const agentCommands = phases.reduce(
+    (s, p) => s + (Number(p.profile?.command_executions) || 0), 0);
   const agentCost = phases.reduce((s, p) => s + p.cost_usd, 0);
   const wallMs = Date.now() - wallStart;
   const timingBreakdown = directTimingBreakdown(
@@ -3252,6 +3568,8 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       injected_tokens: mem?.injectedTokens ?? null,
     },
     direct: { agent_stage_ms: agentMs, agent_calls: agentCalls,
+              agent_model_messages: agentMessages,
+              agent_command_executions: agentCommands,
               agent_cost_usd: Number(agentCost.toFixed(4)),
               timing_breakdown_ms: timingBreakdown,
               code_execution_runs: codeExecutionRuns },
@@ -3356,18 +3674,20 @@ async function runQueryDirect(args, planObj, csvPath) {
 async function main() {
   const base = parseArgs(process.argv);
   await validateDataDirectory(base);
-  if (base.valRate && !base.valPlanOnly && base.endpoint && base.oracleModel) {
-    await validateEndpointModel(base.endpoint, base.oracleModel, base.apiKey);
+  if (base.valRate && !base.valPlanOnly && base.endpoint) {
+    const configuredOracle = base.oracleModel || defaults.extraction.strongImageModel;
+    base.oracleModel = await validateEndpointModel(
+      base.endpoint, configuredOracle, base.apiKey);
   }
   setAgentProvider(base.agentProvider);
   base.runId = new Date().toISOString().replace(/[:.]/g, "-");
   const csvPath = base.telemetryCsv || resolve(base.out, "results.csv");
 
   // --- Skills and cross-run memory ------------------------------------------
-  // The skill root exists even without --memory-dir: the three role procedures
-  // are discovered from it, and before this change they were injected into every
-  // system prompt unconditionally. Memory only adds learned semdb-* skills and
-  // the L0/L1 push channel on top.
+  // The skill root exists even without --memory-dir: Generator discovers its procedure
+  // there, and all roles may discover retrieval-selected learned skills. Planner and
+  // Optimizer receive their canonical procedure directly in the system prompt so they do
+  // not spend a command loading it again.
   base.memoryReady = false;
   base.skillRoot = null;
   base.availableSkills = [];
@@ -3407,6 +3727,10 @@ async function main() {
     process.exit(1);
   }
   console.log(`[SemDB] provider=${base.agentProvider} models: ${agentModelsLine(base)}`);
+  console.log(`[SemDB] agent execution=${base.agentExecution}`
+    + (base.agentExecution === "structured"
+      ? ` (Planner/Optimizer tool-free, fallback=agent)`
+      : " (full tool agents)"));
   console.log(`[SemDB] processing ${queries.length} quer${queries.length === 1 ? "y" : "ies"}: ${queries.join(", ")}`);
 
   // 0) PARQUET benchmarks (ecomm): materialize tables + image manifest to CSV ONCE,

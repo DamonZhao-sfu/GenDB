@@ -37,8 +37,8 @@ assert.ok(!plannerPrompt.includes("VADAR Signature"));
 assert.ok(!plannerPrompt.includes("VADAR API"));
 assert.ok(!plannerPrompt.includes("legacy VADAR"));
 assert.ok(plannerPrompt.includes("### Step 8: Replan from evidence"));
-assert.ok(plannerUser.includes("{{plan_schema_path}}"));
-assert.ok(plannerUser.includes("{{optimizer_action_path}}"));
+assert.ok(plannerUser.includes("{{agent_context_path}}"));
+assert.ok(plannerUser.includes("{{agent_context_sha256}}"));
 
 for (const heading of [
   "## Identity",
@@ -76,8 +76,8 @@ for (let step = 0; step <= 8; step += 1) {
   );
 }
 assert.ok(optimizerPrompt.includes("Never use `PATCH_CODE` to tune a planned phrase"));
-assert.ok(optimizerUser.includes("{{optimizer_action_schema_path}}"));
-assert.ok(optimizerUser.includes("{{local_primitive_files}}"));
+assert.ok(optimizerUser.includes("{{agent_context_path}}"));
+assert.ok(optimizerUser.includes("{{agent_context_sha256}}"));
 
 for (const binding of [
   "plan_schema_path:",
@@ -88,37 +88,25 @@ for (const binding of [
   assert.ok(orchestrator.includes(binding), `Orchestrator is missing ${binding}`);
 }
 
-// Skills are discovered, not bound: each role must be granted the Skill tool, told to
-// load its own procedure, and given the three memory blocks.
-for (const [label, config, systemPrompt, userPrompt, skill] of [
-  ["Planner", plannerConfig, plannerPrompt, plannerUser, "plan-semantic-query"],
-  ["Generator", generatorConfig, generatorPrompt, generatorUser, "generate-semantic-program"],
-  ["Optimizer", optimizerConfig, optimizerPrompt, optimizerUser, "optimize-semantic-program"],
+// Planner/Optimizer receive their canonical procedure directly as the system prompt and
+// must not spend a tool round-trip loading it again. Generator keeps discovery because it
+// remains the unconstrained coding role in both execution modes.
+for (const [label, config, userPrompt, skill] of [
+  ["Planner", plannerConfig, plannerUser, "plan-semantic-query"],
+  ["Optimizer", optimizerConfig, optimizerUser, "optimize-semantic-program"],
 ]) {
   assert.ok(config.allowedTools.includes("Skill"), `${label} must be granted the Skill tool`);
   assert.ok(
-    userPrompt.includes(`Load the \`${skill}\` skill`),
-    `${label} user prompt must direct the agent to load its procedure skill`,
+    userPrompt.includes(`canonical \`${skill}\` procedure is already active`),
+    `${label} user prompt must state that its canonical procedure is already active`,
   );
-  assert.ok(
-    systemPrompt.includes("## Prior knowledge is advisory"),
-    `${label} system prompt must mark prior knowledge advisory`,
-  );
-  assert.ok(
-    systemPrompt.includes("never contains ground-truth answers"),
-    `${label} system prompt must state the ground-truth boundary`,
-  );
-  for (const guard of ["memory_pre_injection", "memory_catalog", "memory_inline_skills"]) {
-    assert.ok(
-      userPrompt.includes(`{{#if ${guard}}}`),
-      `${label} user prompt must guard ${guard} so it vanishes when memory is off`,
-    );
-  }
+  assert.ok(userPrompt.includes("Do not load its `SKILL.md` again"));
 }
-assert.ok(
-  plannerUser.includes("{{#if memory_reference_plan_path}}"),
-  "Planner needs the warm-start reference branch (a reference, not a replan)",
-);
+assert.ok(generatorConfig.allowedTools.includes("Skill"));
+assert.ok(generatorUser.includes("Load the `generate-semantic-program` skill"));
+for (const guard of ["memory_pre_injection", "memory_catalog", "memory_inline_skills"]) {
+  assert.ok(generatorUser.includes(`{{#if ${guard}}}`));
+}
 
 function assertFullyRendered(template, vars, label) {
   const rendered = renderTemplate(template, vars);
@@ -126,20 +114,13 @@ function assertFullyRendered(template, vars, label) {
   return rendered;
 }
 
-assertFullyRendered(plannerUser, {
+const renderedPlannerReplan = assertFullyRendered(plannerUser, {
   query_id: "q",
-  query_sql: "SELECT * FROM images",
-  query_nl: "find matching images",
-  modality: "image",
-  tables_doc: "- images.csv",
-  local_primitive_files: "- predefined.py",
-  trace_contract: "row key: id",
-  previous_plan_path: "/run/iter_0/plan.json",
-  optimizer_action_path: "/run/iter_1/optimizer_action.json",
-  planner_lint: "",
-  plan_schema_path: "/repo/contracts/semantic-plan.schema.json",
-  plan_path: "/run/iter_1/plan.json",
+  agent_context_path: "/run/iter_1/_agent_context_query_planner.md",
+  agent_context_sha256: "abc123",
 }, "Planner user prompt");
+assert.ok(renderedPlannerReplan.includes("_agent_context_query_planner.md"));
+assert.ok(renderedPlannerReplan.includes("abc123"));
 
 const patchPrompt = assertFullyRendered(generatorUser, {
   query_id: "q",
@@ -181,15 +162,8 @@ assert.ok(!replanPrompt.includes("## PATCH_CODE Context"));
 
 assertFullyRendered(optimizerUser, {
   query_id: "q",
-  plan_path: "/run/iter_0/plan.json",
-  candidate_manifest_path: "/run/iter_0/candidate_manifest.json",
-  iteration_feedback_path: "/run/iter_0/iteration_feedback.json",
-  history_manifest_paths: "- /run/iter_0/candidate_manifest.json",
-  local_primitive_files: "- predefined.py",
-  remaining_iteration_budget: 2,
-  remaining_replan_budget: 1,
-  optimizer_action_schema_path: "/repo/contracts/optimizer-action.schema.json",
-  optimizer_action_path: "/run/iter_1/optimizer_action.json",
+  agent_context_path: "/run/iter_1/_agent_context_semantic_optimizer.md",
+  agent_context_sha256: "def456",
 }, "Optimizer user prompt");
 
 console.log("test_agent_prompt_structure OK");

@@ -8,11 +8,14 @@
  */
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { renderTemplate } from "../../gendb/shared.mjs";
+import { config as plannerConfig } from "../agents/query-planner/index.mjs";
+import { prepareAgentRole } from "../agent-runtime/structured-role.mjs";
 import { renderPreInjection, renderInlineSkills, capTokens } from "../memory/render.mjs";
 import { renderCatalog } from "../memory/skills.mjs";
 
@@ -102,19 +105,32 @@ assert.ok(preInjection.includes("advisory"));
 assert.ok(catalog.includes("Available Memory Skills"));
 assert.ok(inline.includes("Memory Skills (inlined)"));
 
-const on = renderTemplate(plannerUser, {
+const bundleRoot = await mkdtemp(resolve(tmpdir(), "semdb-memory-bundle-"));
+const referencePlanPath = resolve(bundleRoot, "reference-plan.json");
+await writeFile(referencePlanPath, JSON.stringify({ query_id: "q2a", plan_version: 1 }));
+const bundleBase = {
   ...BASE.planner,
+  planner_table_profile: { profile_version: "2.0", tables: [] },
+  local_primitive_files: `- ${resolve(here, "..", "vadar", "predefined.py")}`,
+  plan_schema_path: resolve(here, "..", "contracts", "semantic-plan.schema.json"),
+  plan_path: resolve(bundleRoot, "plan.json"),
+};
+const on = (await prepareAgentRole(plannerConfig, {
+  ...bundleBase,
   memory_pre_injection: preInjection,
   memory_catalog: catalog,
   memory_inline_skills: inline,
   memory_note: "true",
-  memory_reference_plan_path: "/past/plan.json",
-});
-const off = renderTemplate(plannerUser, { ...BASE.planner, ...MEMORY_OFF });
+  memory_reference_plan_path: referencePlanPath,
+})).contextText;
+const off = (await prepareAgentRole(plannerConfig, {
+  ...bundleBase,
+  ...MEMORY_OFF,
+})).contextText;
 
 assert.ok(on.includes("Prior Knowledge"));
-assert.ok(on.includes("Reference Plan From a Past Run"));
-assert.ok(on.includes("keep\n`plan_version` at `1`") || on.includes("plan_version` at `1`"),
+assert.ok(on.includes("Advisory reference plan from a past run"));
+assert.ok(on.includes("Keep initial lineage at 1/null"),
   "the reference branch must preserve the initial-plan contract");
 
 // Everything the memory-off rendering says must still be said with memory on: the

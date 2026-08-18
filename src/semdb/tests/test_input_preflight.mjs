@@ -19,12 +19,20 @@ await assert.rejects(
 
 const server = createServer((req, res) => {
   res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify({ data: [{ id: "Qwen/Qwen3-VL-30B-A3B-Instruct" }] }));
+  res.end(JSON.stringify({ data: [
+    { id: "Qwen/Qwen3-VL-30B-A3B-Instruct" },
+    { id: "qwen3.8", root: "Qwen/Qwen3.8-27B-FP8" },
+  ] }));
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const endpoint = `http://127.0.0.1:${server.address().port}/v1`;
 try {
-  await validateEndpointModel(endpoint, "Qwen/Qwen3-VL-30B-A3B-Instruct");
+  assert.equal(
+    await validateEndpointModel(endpoint, "Qwen/Qwen3-VL-30B-A3B-Instruct"),
+    "Qwen/Qwen3-VL-30B-A3B-Instruct");
+  assert.equal(
+    await validateEndpointModel(endpoint, "Qwen/Qwen3.8-27B-FP8"),
+    "qwen3.8");
   await assert.rejects(
     validateEndpointModel(endpoint, "Qwen/Qwen3-32B"),
     /not served.*Available model.*Qwen\/Qwen3-VL-30B-A3B-Instruct/);

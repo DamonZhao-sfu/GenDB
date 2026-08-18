@@ -3,7 +3,11 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { renderFeedback } from "../orchestrator.mjs";
-import { buildIterationFeedback } from "../agent-runtime/feedback.mjs";
+import {
+  buildIterationFeedback,
+  hasMeasurableSelectSignal,
+  summarizeTraceArtifact,
+} from "../agent-runtime/feedback.mjs";
 import {
   readAndValidateFeedback,
   writeJsonAtomic,
@@ -90,6 +94,45 @@ const structuredAri = buildIterationFeedback({
     full_ground_truth_accessed: false,
   },
 });
+assert.deepEqual(summarizeTraceArtifact({
+  rows: { a: "true", b: "false", c: "match:blue", d: true },
+}), {
+  status: "ok",
+  entries: 4,
+  true_count: 2,
+  false_count: 1,
+  other_count: 1,
+  distinct_values: [
+    { value: "true", count: 2 },
+    { value: "false", count: 1 },
+    { value: "match:blue", count: 1 },
+  ],
+  omitted_distinct_values: 0,
+});
+
+const noPositiveSignal = buildIterationFeedback({
+  query: "q1",
+  candidate: { candidate_id: "q1-iter-0", iteration: 0 },
+  runOutcome: { status: "ok", selectedRows: 0 },
+  scoreOutcome: {
+    status: "ok",
+    objective: {
+      name: "f1",
+      value: 0,
+      direction: "maximize",
+      details: { precision: null, recall: null },
+    },
+    metrics: { fp: 0, fn: 0 },
+    diff: { fp_total: 0, fn_total: 0, mistakes: [] },
+  },
+  dataBoundary: {
+    source: "select_validation",
+    cert_accessed: false,
+    full_ground_truth_accessed: false,
+  },
+});
+assert.equal(hasMeasurableSelectSignal(noPositiveSignal), false,
+  "an all-negative validation sample cannot guide binary-F1 optimization");
 assert.equal(structuredAri.objective.name, "adjusted_rand_index");
 assert.equal(structuredAri.objective.value, 0.8);
 assert.equal(structuredAri.objective.scope, "query_metric");

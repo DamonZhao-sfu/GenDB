@@ -197,7 +197,9 @@ An argmax primitive on a FILTER must be able to abstain: `classify`/`classify_de
 never return "none", so bind `classify_or_none` or record a numeric
 `confidence_signal.threshold`.
 
-Write one object with exactly the schema's top-level fields.
+Write one object with exactly the schema's top-level fields. The example below uses the
+lineage for an initial plan. On a replan, ignore the example's `1`/`null` literals and use
+the exact required `plan_version` and `parent_plan_version` printed in the task prompt.
 
 `query_id` is the id given as **Query id** in the task prompt, copied verbatim. It is NOT
 the run directory name in the output path: that directory is named

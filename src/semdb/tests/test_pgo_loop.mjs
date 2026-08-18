@@ -156,7 +156,8 @@ const compileRepair = await scenario({
   hasValidationSignal: true,
 });
 assert.equal(compileRepair.result.bestIter, 1);
-assert.equal(compileRepair.calls.optimizer, 1);
+assert.equal(compileRepair.calls.optimizer, 0,
+  "compile/preflight failures route directly to Generator without an Optimizer model call");
 
 const budget = await scenario({
   actions: ["REPLAN", "REPLAN"],

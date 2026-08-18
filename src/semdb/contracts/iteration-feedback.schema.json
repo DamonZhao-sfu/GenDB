@@ -144,6 +144,39 @@
       }
     },
     "runtime_branches": { "type": "object" },
+    "trace_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "entries",
+        "true_count",
+        "false_count",
+        "other_count",
+        "distinct_values",
+        "omitted_distinct_values"
+      ],
+      "properties": {
+        "status": { "enum": ["ok", "missing"] },
+        "entries": { "type": "integer", "minimum": 0 },
+        "true_count": { "type": "integer", "minimum": 0 },
+        "false_count": { "type": "integer", "minimum": 0 },
+        "other_count": { "type": "integer", "minimum": 0 },
+        "distinct_values": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "count"],
+            "properties": {
+              "value": { "type": "string" },
+              "count": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "omitted_distinct_values": { "type": "integer", "minimum": 0 }
+      }
+    },
     "history": {
       "type": "array",
       "items": { "type": "object" }

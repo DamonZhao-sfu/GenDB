@@ -127,20 +127,27 @@ export async function classifyQuery(planObj, args, memoryDir, config = {}) {
   const skills = await listSkills(skillRoot);
   const catalog = renderCatalog(skills, catalogCap);
 
-  // Codex has no Skill tool; inline the edge-linked skills instead so the two
-  // providers see the same knowledge.
-  let inlineSkills = "";
-  if (args.agentProvider === "codex" && l1) {
+  // Resolve the edge-linked learned skills once. Agent runtimes use this list to expose
+  // only relevant pull-channel knowledge instead of advertising every role and memory
+  // skill on every turn.
+  const relevantSkillNames = [];
+  if (l1) {
     const linked = [];
     for (const type of ["uses_operator", "exhibits_pattern"]) {
       linked.push(...(await getConnectedNodes(l1.id, type, memoryDir, "outgoing")));
     }
-    const wanted = linked
-      .map((n) => n.skill_name)
-      .filter(Boolean)
-      .slice(0, config.maxInlineSkills ?? 3);
+    for (const name of linked.map((n) => n.skill_name).filter(Boolean)) {
+      if (!relevantSkillNames.includes(name)) relevantSkillNames.push(name);
+      if (relevantSkillNames.length >= (config.maxInlineSkills ?? 3)) break;
+    }
+  }
+
+  // Codex has no Skill tool; inline the edge-linked skills instead so the two
+  // providers see the same knowledge.
+  let inlineSkills = "";
+  if (args.agentProvider === "codex" && relevantSkillNames.length) {
     const bodies = [];
-    for (const name of wanted) {
+    for (const name of relevantSkillNames) {
       const path = resolve(skillsDirFor(skillRoot), name, "SKILL.md");
       if (!existsSync(path)) continue;
       bodies.push({ name, body: await readFile(path, "utf8") });
@@ -159,6 +166,7 @@ export async function classifyQuery(planObj, args, memoryDir, config = {}) {
     blocks,
     catalog,
     inlineSkills,
+    relevantSkillNames,
     skillsAvailable: skills.filter((s) => !s.role).length,
     injectedTokens: {
       pre: Math.ceil((blocks.planner || "").length / 4),

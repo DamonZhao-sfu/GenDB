@@ -214,8 +214,8 @@ def _plain_text(value) -> str:
 #: `normalize` is the innermost primitive of the whole TEXT family and it is called
 #: with the SAME few strings over and over: `text_classify_detail` scores one row
 #: against every label + description + alias, and each `lexical_score` re-normalizes
-#: the row text (once via `contains_phrase`, once via `tokens`). cars Q10 — 9828
-#: complaints x 24 categories x ~8 candidates — issued 7.84M normalize calls, 96% of
+#: the row text (once via `contains_phrase`, once via `tokens`). One large text
+#: workload issued millions of normalize calls, accounting for nearly all of
 #: a 217s run, over ~10k distinct strings. Memoizing is pure win: `normalize` is a
 #: deterministic function of one string, so the cache cannot change any result.
 #: Bounded, because a generated solver may stream far more rows than it has labels;
@@ -227,7 +227,7 @@ _NORM_CACHE = 4096
 def _normalize_str(value: str) -> str:
     value = unicodedata.normalize("NFKD", value).casefold()
     # The combining-mark strip is a per-CHARACTER Python loop — 2.97 BILLION
-    # iterations of it in the Q10 profile, more than half the run. After NFKD every
+    # iterations of it in that profile, more than half the run. After NFKD every
     # ASCII string is already mark-free (`unicodedata.combining` is 0 for all of
     # ASCII), so the loop is provably an identity there and can be skipped outright.
     if not value.isascii():

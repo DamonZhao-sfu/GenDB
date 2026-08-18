@@ -86,6 +86,56 @@ export function routeOptimizerAction({
   return { route: "planner_then_generator" };
 }
 
+/** Mechanical contract failures have one owner and need no semantic model decision.
+ * Route them straight back to the Generator while preserving all plan-owned choices. */
+export function buildDeterministicRepairAction({ feedback, candidate }) {
+  const execution = feedback?.execution || {};
+  const trace = feedback?.trace_summary || {};
+  const compileLike = execution.status === "crash"
+    && ["compile", "preflight", "static_check"].includes(String(execution.stage || "").toLowerCase());
+  const missingTrace = execution.status === "empty" && trace.status === "missing";
+  if (!compileLike && !missingTrace) return null;
+
+  const id = candidateId(candidate);
+  const reason = missingTrace
+    ? "The candidate did not produce its required trace artifact."
+    : `The candidate failed during ${execution.stage || "preflight"}.`;
+  const diagnostic = String(execution.stderr_tail || "").trim().slice(-1200);
+  const targetArtifact = /(?:_semantic_helpers|helpers?\.py|helper module)/i.test(diagnostic)
+    ? "helpers"
+    : "solver";
+  return {
+    schema_version: "1.0",
+    query_id: String(feedback.query_id),
+    candidate_id: String(id),
+    action: "PATCH_CODE",
+    diagnosis: {
+      category: missingTrace ? "missing_trace_artifact" : "deterministic_preflight_failure",
+      summary: `${reason} This is an implementation-contract failure, not evidence for changing the semantic plan.`,
+      evidence: [
+        `execution.status=${execution.status}; execution.stage=${execution.stage ?? "null"}`,
+        missingTrace ? "trace_summary.status=missing" : `stderr_tail=${diagnostic || "(empty)"}`,
+      ],
+    },
+    targets: [{
+      artifact: targetArtifact,
+      symbol: missingTrace ? "trace serialization path" : "module preflight path",
+      intent: missingTrace
+        ? "Repair the solver so every evaluated validation unit is serialized to the required trace artifact."
+        : "Repair the reported syntax/import/name/contract defect so the candidate passes preflight without changing plan-owned semantics.",
+    }],
+    preserve: [
+      "current validated plan and every plan-owned semantic choice",
+      "trace identity, only-ids boundary, SQL projection, and offline execution",
+    ],
+    expected_effect: {
+      primary_metric: feedback.objective?.name || "execution_status",
+      direction: "unknown",
+      risk: "Low: deterministic routing permits only an implementation-contract repair.",
+    },
+  };
+}
+
 function historyEntry(candidate, outcome, action, improved) {
   return {
     iteration: candidateIteration(candidate),
@@ -196,18 +246,25 @@ export async function runPgoLoop({
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
       const iterDir = resolve(runDir, `iter_${iteration}`);
       await mkdir(iterDir, { recursive: true });
-      const actionResult = await optimize({
-        query,
-        iteration,
-        plan,
-        planPath,
-        candidate: bestCandidate,
+      const deterministicAction = buildDeterministicRepairAction({
         feedback: latestFeedback.feedback,
-        feedbackPath: latestFeedback.feedbackPath,
-        history,
-        remainingIterationBudget: maxIterations - iteration + 1,
-        remainingReplanBudget: maxReplans - replansUsed,
+        candidate: bestCandidate,
       });
+      if (deterministicAction) {
+        console.log(`[SemDB] [${id}] optimizer bypass: ${deterministicAction.diagnosis.category}`);
+      }
+      const actionResult = deterministicAction || await optimize({
+          query,
+          iteration,
+          plan,
+          planPath,
+          candidate: bestCandidate,
+          feedback: latestFeedback.feedback,
+          feedbackPath: latestFeedback.feedbackPath,
+          history,
+          remainingIterationBudget: maxIterations - iteration + 1,
+          remainingReplanBudget: maxReplans - replansUsed,
+        });
       const action = actionResult?.actionObject ?? actionResult;
       const actionPath = actionResult?.actionPath
         ?? resolve(iterDir, "optimizer_action.json");

@@ -70,6 +70,8 @@ from vadar.predefined import classify, best_ocr_match, dominant_colors, contains
 ./run_image_queries.sh                 # all image scenarios
 QUERIES=q2a,q7 ./run_image_queries.sh mmqa
 ITERS=0 ./run_image_queries.sh         # single-shot, no refinement loop
+AGENT_EXECUTION=agent ./run_image_queries.sh mmqa
+                                        # legacy full tool agents for Planner/Optimizer
 ```
 
 Or drive the orchestrator directly — see [`USAGE.md`](USAGE.md):
@@ -77,9 +79,11 @@ Or drive the orchestrator directly — see [`USAGE.md`](USAGE.md):
 ```bash
 node src/semdb/orchestrator.mjs --benchmark mmqa \
   --sembench-dir /localhome/hza214/SemBench --sf 200 \
-  --run --agent-provider codex \
+  --run --agent-provider vllm \
+  --agent-execution structured \
+  --base-url http://localhost:8000/v1 \
   --endpoint http://localhost:8000/v1 --api-key EMPTY \
-  --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct \
+  --oracle-model Qwen/Qwen3.8-27B-FP8 \
   --val-rate 0.05 --max-iterations 5 \
   --out src/semdb/runs/mmqa
 ```
@@ -87,7 +91,7 @@ node src/semdb/orchestrator.mjs --benchmark mmqa \
 movie
 
 ```
-node src/semdb/orchestrator.mjs     --benchmark movie     --sembench-dir /localhome/hza214/SemBench     --sf 1000     --direct     --run     --agent-provider codex     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3-VL-30B-A3B-Instruct   --val-rate 0.05   --max-iterations 3   --out src/semdb/runs/movie_new
+node src/semdb/orchestrator.mjs     --benchmark movie     --sembench-dir /localhome/hza214/SemBench     --sf 1000     --direct     --run     --agent-provider vllm     --base-url http://localhost:8000/v1     --endpoint http://localhost:8000/v1     --api-key EMPTY     --oracle-model Qwen/Qwen3.8-27B-FP8   --val-rate 0.05   --max-iterations 3   --out src/semdb/runs/movie_new
 ```
 
 
@@ -106,3 +110,58 @@ the earlier **Schema-Designer → Extractor → Code-Generator** pipeline (extra
 attribute table once per corpus, then compile the SQL against it). That pipeline was
 removed; those artifacts are self-contained and still run, but they no longer describe
 how the system works.
+
+### Deploy the agent model
+
+```
+export MODEL_PATH=Qwen/Qwen3.8-27B-FP8
+
+vllm serve $MODEL_PATH \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --served-model-name qwen3.8 \
+  --max-num-seqs 32 \
+  --max-model-len 262144 \
+  --max-num-batched-tokens 16384 \
+  --kv-cache-dtype fp8 \
+  --trust-remote-code \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.90 \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --mm-encoder-tp-mode data \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --default-chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20}'
+```
+
+```
+RUN_NAME="mmqa-qwen38-structured"
+  ITERS=3
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh mmqa
+```
+
+```
+RUN_NAME="ecomm-qwen38-structured"
+  ITERS=3
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh ecomm
+```

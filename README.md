@@ -159,7 +159,8 @@ GenDB supports four operating modes:
 
 All modes support `--optimization-target hot` (optimize for cached/warm runs, default) or `--optimization-target cold` (optimize for cold runs with OS cache cleared before each execution).
 
-All modes support `--agent-provider claude` (default) or `--agent-provider codex` to select the underlying LLM agent.
+All modes support `--agent-provider claude` (default), `--agent-provider codex`, or
+`--agent-provider vllm` for an OpenAI-compatible local vLLM endpoint.
 
 ```bash
 # Multi-agent (5 agents, default, Claude)
@@ -167,6 +168,10 @@ node src/gendb/orchestrator.mjs --benchmark tpc-h --sf 10
 
 # Multi-agent with Codex agent
 node src/gendb/orchestrator.mjs --benchmark tpc-h --sf 10 --agent-provider codex --model gpt-5.3-codex
+
+# Multi-agent with Qwen/Qwen3.8-27B-FP8 on local vLLM
+node src/gendb/orchestrator.mjs --benchmark tpc-h --sf 10 \
+  --agent-provider vllm --base-url http://localhost:8000/v1
 
 # Multi-agent with domain skills (7 agents)
 node src/gendb/orchestrator.mjs --benchmark tpc-h --sf 10 --use-skills

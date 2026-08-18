@@ -234,9 +234,11 @@ await addEdge({ source: "L1_mmqa_joinimage_aaa", target: "L3_ocr_name_join", typ
 const withSkills = await classifyQuery(racetrack, { benchmark: "mmqa", agentProvider: "claude" }, memoryDir, {});
 assert.match(withSkills.catalog, /semdb-ocr-name-join/);
 assert.equal(withSkills.skillsAvailable, 1);
+assert.deepEqual(withSkills.relevantSkillNames, ["semdb-ocr-name-join"]);
 assert.equal(withSkills.inlineSkills, "", "claude discovers skills natively — nothing is inlined");
 
 const codex = await classifyQuery(racetrack, { benchmark: "mmqa", agentProvider: "codex" }, memoryDir, {});
+assert.deepEqual(codex.relevantSkillNames, ["semdb-ocr-name-join"]);
 assert.match(codex.inlineSkills, /Bind through best_ocr_match/,
   "codex has no Skill tool, so linked skills are inlined instead");
 assert.match(codex.inlineSkills, /advisory/i);

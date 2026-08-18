@@ -25,24 +25,86 @@ npm install
 pip install torch transformers pillow accelerate
 ```
 
-The agent phases need Claude credentials (`ANTHROPIC_API_KEY`, same as GenDB).
+The agent phases need credentials only when using a hosted provider. The default
+`vllm` provider uses the local endpoint at `http://localhost:8000/v1`.
 The extraction phase needs `huggingface.co` reachable to fetch the small model.
 
-### Choosing the agent provider (Claude or Codex)
-The three compiler agents run on either provider — set it in `semdb.config.mjs`
+### Choosing the agent provider (local vLLM, Claude, or Codex)
+The compiler agents can run on any provider — set it in `semdb.config.mjs`
 (`defaults.agentProvider`) or per run with `--agent-provider`:
 
 ```bash
-# use OpenAI Codex (gpt-5.6-codex) instead of Claude
+# Qwen/Qwen3.8-27B-FP8 served by local vLLM (the default)
 node src/semdb/orchestrator.mjs --query q3a --query-dir <...> --data-dir <...> \
-     --agent-provider codex
+     --agent-provider vllm --base-url http://localhost:8000/v1
 ```
 
-Codex needs `@openai/codex-sdk` (already in `package.json`) and Codex auth. The
-model per agent lives in `semdb.config.mjs → defaults.providers.codex` — change
-the single `model:` line to re-point every agent, or edit `agentModels` per agent.
+The local provider uses `@openai/codex-sdk` as its agent runtime but does not require
+OpenAI authentication. The model per agent lives in
+`semdb.config.mjs → defaults.providers.vllm`; `VLLM_BASE_URL` is equivalent to
+`--base-url`. The vLLM server must expose the Responses API. If
+`--served-model-name` uses an alias (for example `qwen3.8`), the provider resolves it
+through the `/models` entry whose `root` is `Qwen/Qwen3.8-27B-FP8`.
 `--model <id>` forces one model for all agents (testing). The *extraction* small
 models (`defaults.extraction.*`) are independent of this choice.
+
+For local vLLM, Planner and Optimizer default to the full agent runtime; the Generator
+is also a coding agent. The tool-free structured path remains available for A/B:
+
+```bash
+# Default: full Codex agent for every role
+--agent-execution agent
+
+# Opt-in fast path: JSON Schema, no shell tools for Planner/Optimizer
+--agent-execution structured
+```
+
+When using `run_image_queries.sh`, the wrapper likewise defaults to `agent`. Set
+`AGENT_EXECUTION=structured` to opt into the tool-free path. This switch affects
+Planner and Optimizer; Generator uses the full coding-agent runtime in both modes.
+
+The full-agent path keeps unrestricted diagnostic tools but avoids the former prompt/read
+loop. Planner and Optimizer use their role `SKILL.md` directly as the sole system
+procedure, then read one immutable-on-entry `_agent_context_<role>.md` bundle containing
+the current query, artifacts, full-file profile, primitive catalog, memory evidence, and
+JSON schema. Their role skill is not advertised for discovery a second time. The skill
+catalog contains only retrieval-selected learned skills; when memory has no relevant
+skill, no catalog is injected. Agents may still inspect other files or run diagnostics
+when the bundle exposes a concrete missing or inconsistent fact.
+
+Structured defaults are Planner `max_output_tokens=24000` (32K only on a confirmed
+truncation retry), Optimizer `12000` (16K on truncation retry), and
+`reasoning_effort=medium`. Qwen3.8 on the supported vLLM deployment accepts `low`, `medium`,
+or `xhigh`. Override them for controlled experiments with
+`--planner-max-output-tokens`, `--optimizer-max-output-tokens`, and
+`--structured-reasoning-effort`. A structured role retries one invalid response once,
+then automatically falls back to the full agent.
+
+The structured path remains tool-free but includes the evidence each role needs:
+
+- Planner receives a compact, validation-label-free profile streamed across every row of
+  each referenced runtime CSV, including same-name join-column overlap. Distinct tracking
+  is memory-bounded, and zero overlap is authoritative only when both the scan and value
+  sets are marked complete. Schema/runtime validation and semantic plan lint share the
+  existing single correction retry, so a lint failure is repaired before Generator time
+  is spent.
+- Optimizer receives the exact current helper and solver sources with stable line numbers,
+  the validation diff, and an aggregate trace summary. `PATCH_CODE` must cite a real
+  `helpers:L<n>` or `solver:L<n>` line; branch names never override the serialized trace.
+- Compile/preflight failures and a missing required trace are deterministic implementation
+  failures and route directly to Generator without an Optimizer model request.
+- A binary-F1 validation sample with null precision/recall and zero FP/FN contains no
+  positive optimization signal; the loop preserves the current candidate instead of asking
+  Optimizer to invent a patch.
+
+No validation labels, CERT data, or final ground truth enter the Planner profile or trace
+summary. Candidate sources are read by Node and placed in the single request; neither role
+gets shell or filesystem tools in structured mode.
+
+The provider also canonicalizes presentation-only JSON fences and removes
+`replan_reason` when an Optimizer action is `PATCH_CODE` or `STOP`, where the schema
+forbids that field. It never invents a missing reason, target, id, or semantic value;
+those errors still use the correction/fallback path.
 
 ---
 

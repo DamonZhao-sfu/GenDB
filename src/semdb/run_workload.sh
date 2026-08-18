@@ -21,7 +21,7 @@ set -uo pipefail
 SEMBENCH="${SEMBENCH:-/localhome/hza214/SemBench}"
 BENCH="mmqa"
 SF=""
-AGENT_PROVIDER="${AGENT_PROVIDER:-codex}"
+AGENT_PROVIDER="${AGENT_PROVIDER:-vllm}"
 ENDPOINT="${ENDPOINT:-http://localhost:8000/v1}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-Qwen/Qwen3-VL-2B-Instruct}"
 API_KEY="${API_KEY:-EMPTY}"

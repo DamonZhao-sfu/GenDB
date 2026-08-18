@@ -30,6 +30,7 @@ async function fixture(base, overrides) {
   return path;
 }
 const onDisk = async (path) => JSON.parse(await readFile(path, "utf8")).query_id;
+const planOnDisk = async (path) => JSON.parse(await readFile(path, "utf8"));
 
 // 1. `<benchmark>-<query>` is repaired, and the repair is PERSISTED — the manifest
 //    cross-check and the next iteration both re-read this file.
@@ -76,5 +77,25 @@ await assert.rejects(
   () => readAndValidateOptimizerAction(badCandidate, { queryId: "q13", candidateId: "q13-iter-0" }),
   /candidate id mismatch/,
 );
+
+// 8. Replan lineage is deterministic PGO metadata, not a semantic model decision. A
+//    recorded Qwen run produced a correct replacement plan but copied the initial-plan
+//    example's 1/null literals after 8m50s of work. Normalize and persist those two fields
+//    from the authoritative previous plan instead of discarding the whole query.
+const staleLineage = await fixture(PLAN_FIXTURE, {
+  query_id: "q13",
+  plan_version: 1,
+  parent_plan_version: null,
+});
+const prior = { ...PLAN_FIXTURE, query_id: "q13", plan_version: 1 };
+const revised = await readAndValidatePlan(staleLineage, {
+  queryId: "q13",
+  previousPlan: prior,
+});
+assert.equal(revised.plan_version, 2);
+assert.equal(revised.parent_plan_version, 1);
+const persisted = await planOnDisk(staleLineage);
+assert.equal(persisted.plan_version, 2);
+assert.equal(persisted.parent_plan_version, 1);
 
 console.log("test_contract_id_reconcile OK");

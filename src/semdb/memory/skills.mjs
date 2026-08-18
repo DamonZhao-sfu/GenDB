@@ -46,10 +46,9 @@ export function skillRootFor(memoryDir) {
 /**
  * Where this run's skills live.
  *
- * The role procedures used to be injected into every system prompt regardless of
- * memory, so the root cannot be conditional on --memory-dir: without memory the
- * agents would simply lose their procedures. With memory the same root also holds
- * the learned semdb-* skills, so one cwd serves both.
+ * The root cannot be conditional on --memory-dir: Generator still discovers its role
+ * procedure here, and every tool agent may discover retrieval-selected learned skills.
+ * Planner/Optimizer use their repo skill directly as the canonical system procedure.
  */
 export function resolveSkillRoot({ memoryDir, out }) {
   return memoryDir ? skillRootFor(memoryDir) : resolve(out, "_skills");
