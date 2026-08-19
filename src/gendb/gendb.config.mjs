@@ -9,7 +9,7 @@
 
 export const defaults = {
   // --- Pipeline settings (provider-agnostic) ---
-  agentProvider: "claude",  // "claude" or "codex" — select the underlying agent SDK
+  agentProvider: "claude",  // "claude", "codex", or local "vllm"
   targetBenchmark: "tpc-h", // "tpc-h" / "sec-edgar"
   scaleFactor: 10,          // 10 for tpc-h, 3 for sec-edgar
   optimizationTarget: "hot",  // "hot" (optimize avg hot runs) or "cold" (optimize cold run)
@@ -106,6 +106,33 @@ export const defaults = {
       escalationEffortLevel: "high",
       singleAgent: {
         model: "gpt-5.4",
+        effortLevel: "medium",
+      },
+    },
+    vllm: {
+      model: "Qwen/Qwen3.8-27B-FP8",
+      // Override with VLLM_BASE_URL or --base-url.
+      baseUrl: "http://localhost:8000/v1",
+      agentModels: {
+        workload_analyzer: "Qwen/Qwen3.8-27B-FP8",
+        storage_designer: "Qwen/Qwen3.8-27B-FP8",
+        query_planner: "Qwen/Qwen3.8-27B-FP8",
+        code_generator: "Qwen/Qwen3.8-27B-FP8",
+        query_optimizer: "Qwen/Qwen3.8-27B-FP8",
+        memory_manager: "Qwen/Qwen3.8-27B-FP8",
+      },
+      agentEffortLevels: {
+        workload_analyzer: "medium",
+        storage_designer: "medium",
+        query_planner: "medium",
+        code_generator: "medium",
+        query_optimizer: "medium",
+        memory_manager: "medium",
+      },
+      escalationModel: "Qwen/Qwen3.8-27B-FP8",
+      escalationEffortLevel: "medium",
+      singleAgent: {
+        model: "Qwen/Qwen3.8-27B-FP8",
         effortLevel: "medium",
       },
     },

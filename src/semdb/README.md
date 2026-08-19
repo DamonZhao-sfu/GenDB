@@ -14,6 +14,33 @@ Target workload: [SemBench](https://github.com/SemBench/SemBench).
 Theory: semantic-operator decomposition / compilation (arXiv 2607.13407), VADAR
 dynamic-API synthesis (arXiv 2502.06787).
 
+## Experimental hybrid code generation
+
+PGO defaults to `--codegen full`. The experimental `--codegen hybrid` path reduces the
+LLM-owned source area: the model writes semantic helpers and, for a generic query, a small
+`execute(context)` relational lowering. `hybrid_runtime.py` owns CLI parsing, logical-table
+binding, file/media access, physical validation-id membership, trace/result serialization,
+and diagnostics. Every non-pure-audio SemBench query uses this same generic ABI; there
+are no query-specific q1/q7 hybrid runtimes.
+
+Generic fragments have a 260-line ceiling because they lower query-specific joins,
+aggregation, ordering, limits, and projection through the runtime context API. Normal
+manifest hash checks and Python compile/import preflight remain active before execution.
+
+Use the quality-preserving agent fragment path by default:
+
+```bash
+CODEGEN=hybrid FRAGMENT_EXECUTION=agent QUERIES=q7 ./src/semdb/run_image_queries.sh mmqa
+CODEGEN=hybrid FRAGMENT_EXECUTION=agent ALL=1 QUERIES=q1 ./src/semdb/run_image_queries.sh ecomm
+CODEGEN=hybrid FRAGMENT_EXECUTION=agent ALL=1 ./src/semdb/run_image_queries.sh movie cars medical animals mmqa ecomm
+```
+
+`FRAGMENT_EXECUTION=structured` is a tool-free, one-request throughput experiment. It
+is not the default: a Planner plan with an incorrect primitive return type can be
+implemented literally by the structured fragment, whereas the full agent may inspect
+the primitive source and correct the mismatch. Compile/import preflight still rejects
+invalid structured candidates.
+
 ## The idea in one query
 
 `AI.IF("does this image show the logo of {airline}?")` joining airlines × images is
@@ -140,6 +167,7 @@ vllm serve $MODEL_PATH \
 RUN_NAME="mmqa-qwen38-structured"
   ITERS=3
   ALL=1 \
+  QUERIES=q7 \
   AGENT_EXECUTION=structured \
   PROVIDER=vllm \
   VLLM_BASE_URL=http://localhost:8000/v1 \
@@ -150,6 +178,7 @@ RUN_NAME="mmqa-qwen38-structured"
   OUT="$PWD/src/semdb/runs/$RUN_NAME" \
   ./src/semdb/run_image_queries.sh mmqa
 ```
+
 
 ```
 RUN_NAME="ecomm-qwen38-structured"
@@ -165,3 +194,112 @@ RUN_NAME="ecomm-qwen38-structured"
   OUT="$PWD/src/semdb/runs/$RUN_NAME" \
   ./src/semdb/run_image_queries.sh ecomm
 ```
+
+
+```
+RUN_NAME="cars-qwen38-structured"
+  ITERS=2
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh cars
+```
+
+
+```
+RUN_NAME="movie-qwen38-structured"
+  ITERS=2
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh movie
+```
+
+```
+RUN_NAME="ecomm-qwen38-agent-hybrid"
+  ITERS=3
+  CODEGEN=hybrid \
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  FRAGMENT_EXECUTION=agent \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh ecomm
+```
+
+当前默认 AGENT_EXECUTION 是 agent，不是 structured，所以脚本中需要显式设置 AGENT_EXECUTION=structured。
+
+  下面脚本会顺序运行全部数据集：mmqa、cars、medical、animals、ecomm、movie。每个数据集：
+
+  - ITERS=3
+  - ALL=1，运行全部 queries，而不仅是图像 queries
+  - Planner/Optimizer 使用 structured
+  - 使用独立的 RUN_NAME
+  - 显式使用 CODEGEN=full 表示运行完整代码生成基线；改成 hybrid 可覆盖全部 query
+
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  ITERS=2
+
+  for DATASET in movie mmqa; do
+    RUN_NAME="${DATASET}-qwen38-structured"
+
+    echo "Running ${DATASET}: ${RUN_NAME}"
+    ALL=1 \
+    AGENT_EXECUTION=structured \
+    CODEGEN=full \
+    PROVIDER=vllm \
+    VLLM_BASE_URL=http://localhost:8000/v1 \
+    VAL_RATE=0.05 \
+    ENDPOINT=http://localhost:8000/v1 \
+    ORACLE=Qwen/Qwen3.8-27B-FP8 \
+    ITERS="$ITERS" \
+    OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+    ./src/semdb/run_image_queries.sh "$DATASET"
+  done
+
+  如果只运行 MMQA，可以直接使用：
+
+  RUN_NAME="mmqa-qwen38-structured"
+  ITERS=3
+
+  ALL=1 \
+  AGENT_EXECUTION=structured \
+  CODEGEN=full \
+  PROVIDER=vllm \
+  VLLM_BASE_URL=http://localhost:8000/v1 \
+  VAL_RATE=0.05 \
+  ENDPOINT=http://localhost:8000/v1 \
+  ORACLE=Qwen/Qwen3.8-27B-FP8 \
+  ITERS="$ITERS" \
+  OUT="$PWD/src/semdb/runs/$RUN_NAME" \
+  ./src/semdb/run_image_queries.sh mmqa
+
+  各数据集的输出目录分别是：
+
+  src/semdb/runs/mmqa-qwen38-structured
+  src/semdb/runs/cars-qwen38-structured
+  src/semdb/runs/medical-qwen38-structured
+  src/semdb/runs/animals-qwen38-structured
+  src/semdb/runs/ecomm-qwen38-structured
+  src/semdb/runs/movie-qwen38-structured
+
+  注意：AGENT_EXECUTION=structured 控制的是 Planner/Optimizer；在 CODEGEN=full 下，语义代码 Generator 仍保留工具型 agent 执行能力。

@@ -73,6 +73,11 @@ import {
 } from "./agent-runtime/contracts.mjs";
 import { runPgoLoop } from "./agent-runtime/pgo-loop.mjs";
 import {
+  compileHybridCandidate,
+  writeHybridContract,
+} from "./agent-runtime/hybrid-compiler.mjs";
+import { generateStructuredFragment } from "./agent-runtime/structured-fragment.mjs";
+import {
   prepareAgentRole,
   prepareStructuredRole,
   supportsStructuredRole,
@@ -84,6 +89,7 @@ import {
 } from "./agent-runtime/feedback.mjs";
 import {
   buildPlannerTableProfile,
+  lintAvoidableTextSemanticRefusal,
   lintPlanAgainstTableProfile,
 } from "./agent-runtime/context-profile.mjs";
 import { classifyValidationCapability } from "./validation_capability.mjs";
@@ -138,6 +144,8 @@ export function parseArgs(argv) {
     // extract/attrs/compile split was removed.
     agentArchitecture: defaults.directAgentArchitecture,
     agentExecution: defaults.agentExecution,
+    codegenMode: process.env.SEMDB_CODEGEN || defaults.codegenMode,
+    fragmentExecution: process.env.SEMDB_FRAGMENT_EXECUTION || "agent",
     structuredReasoningEffort: null,
     plannerMaxOutputTokens: null,
     optimizerMaxOutputTokens: null,
@@ -196,6 +204,8 @@ export function parseArgs(argv) {
     else if (a === "--direct") { /* the only pipeline; accepted for compatibility */ }
     else if (a === "--agent-architecture" && argv[i + 1]) args.agentArchitecture = argv[++i];
     else if (a === "--agent-execution" && argv[i + 1]) args.agentExecution = argv[++i];
+    else if (a === "--codegen" && argv[i + 1]) args.codegenMode = argv[++i];
+    else if (a === "--fragment-execution" && argv[i + 1]) args.fragmentExecution = argv[++i];
     else if (a === "--structured-reasoning-effort" && argv[i + 1]) {
       args.structuredReasoningEffort = argv[++i];
     }
@@ -240,6 +250,15 @@ export function parseArgs(argv) {
   }
   if (!["agent", "structured"].includes(args.agentExecution)) {
     throw new Error(`--agent-execution must be "agent" or "structured" (got "${args.agentExecution}")`);
+  }
+  if (!["full", "hybrid"].includes(args.codegenMode)) {
+    throw new Error(`--codegen must be "full" or "hybrid" (got "${args.codegenMode}")`);
+  }
+  if (!["agent", "structured"].includes(args.fragmentExecution)) {
+    throw new Error(
+      `--fragment-execution must be "agent" or "structured" `
+      + `(got "${args.fragmentExecution}")`,
+    );
   }
   if (
     args.structuredReasoningEffort
@@ -1568,9 +1587,9 @@ async function computeNaive(sql, args) {
 
 /**
  * Choose the "corpus" table to extract from, using the config modality: prefer an
- * IMAGE table referenced in the predicate, then a TEXT one, then a PROXY one. AUDIO-only
- * queries have no supported corpus — the caller detects `modality === "audio"` and skips
- * them. A PROXY corpus (SUPG replay) has no unstructured content at all; it is ranked
+ * IMAGE table referenced in the predicate, then a TEXT one, then a PROXY one. Pure-audio
+ * queries have no supported corpus — the caller classifies and skips them. A PROXY corpus
+ * (SUPG replay) has no unstructured content at all; it is ranked
  * last so a scenario that has real content never loses it to the proxy stand-in.
  */
 async function chooseCorpus(sql, tables, args) {
@@ -1642,10 +1661,11 @@ async function validateStructuredArtifact(configKey, outputPath, vars) {
       : null;
     const plan = await readAndValidatePlan(outputPath, {
       queryId: vars.query_id,
-      ...(previousPlan ? { previousPlan } : {}),
+      ...(previousPlan ? { previousPlan } : { initialPlan: true }),
     });
     const findings = [
       ...lintImagePlan(plan),
+      ...lintAvoidableTextSemanticRefusal(plan),
       ...lintPlanAgainstTableProfile(plan, vars.planner_table_profile),
     ];
     if (findings.length) {
@@ -2059,6 +2079,18 @@ async function planQuery(args, query) {
            isProxy: corpus.modality === "proxy", plan };
 }
 
+/** True only when every unstructured table referenced by a query is audio.
+ * Structured join sides do not make an audio query mixed-modal. A query that also
+ * references image, text, or proxy evidence continues through planning/codegen so hybrid
+ * routing is uniform; the Planner must still report unavailable audio semantics honestly.
+ */
+export function isPureAudioPlan(plan) {
+  const semanticTables = (plan?.tables || []).filter((table) =>
+    ["audio", "image", "text", "proxy"].includes(table.modality));
+  return semanticTables.length > 0
+    && semanticTables.every((table) => table.modality === "audio");
+}
+
 /** Per-row validation scoring for one iteration: run evaluate.py --score-inference on
  *  the solver's trace_<q>.json vs val.json, read a typed query objective plus fidelity
  *  diagnostics. status "ok" requires a trace file. */
@@ -2305,6 +2337,17 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         + `metadata and image ref is the decoded local file. This is the offline `
         + `EXTERNAL_OBJECT_TRANSFORM adapter, not validation data.`,
       );
+    }
+  }
+  const hybridTableBindings = Object.fromEntries(
+    tables
+      .filter((table) => table.table && table.path)
+      .map((table) => [table.table, basename(table.path)]),
+  );
+  if (args.benchmark === "ecomm") {
+    const normalizedProducts = resolve(args.tableDir || args.dataDir, "ecomm_products.csv");
+    if (existsSync(normalizedProducts)) {
+      hybridTableBindings.ECOMM_PRODUCTS = basename(normalizedProducts);
     }
   }
   const plannerTableProfile = architecture === "pgo"
@@ -3099,6 +3142,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     helpersPath,
     solverPath,
     manifestPath,
+    hybridContractPath = "",
   }) => ({
     query_id: query,
     generation_mode: generationMode,
@@ -3110,6 +3154,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     helpers_path: helpersPath,
     solve_path: solverPath,
     manifest_draft_path: manifestPath,
+    hybrid_contract_path: hybridContractPath,
     tables_doc: tableLines.join("\n"),
     local_primitive_files: primitiveFiles.map((path) => `- ${path}`).join("\n"),
     semdb_dir: __dirname,
@@ -3123,6 +3168,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
   // plan_version === 1 contract. `warm` is cleared if preflight later rejects the
   // seeded candidate, so a stale reference degrades to today's cold start.
   let warm = mem?.warmStart || null;
+  if (args.codegenMode === "hybrid") warm = null;
 
   // Lint findings owed to the NEXT planner call. The lint catches plan-owned defects the
   // optimizer cannot repair — the generator must implement the plan, and the optimizer can
@@ -3157,7 +3203,10 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
       iterDir,
       args,
     ));
-    const plan = await readAndValidatePlan(planPath, { queryId: query });
+    const plan = await readAndValidatePlan(planPath, {
+      queryId: query,
+      initialPlan: true,
+    });
     if (plan.plan_version !== 1 || plan.parent_plan_version !== null) {
       throw new Error(
         `[SemDB] [${query}] initial plan must use plan_version=1 and parent_plan_version=null`,
@@ -3206,6 +3255,7 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     const helperPath = resolve(iterDir, `_semantic_helpers_${query}.py`);
     const solverPath = resolve(iterDir, codeBasename);
     const manifestPath = resolve(iterDir, "candidate_manifest.json");
+    const hybridContractPath = resolve(iterDir, "hybrid_contract.json");
     if (action?.action === "PATCH_CODE" && parentCandidate) {
       await copyFile(parentCandidate.helperPath, helperPath);
       await copyFile(parentCandidate.solverPath, solverPath);
@@ -3223,23 +3273,75 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
         warm = null;
       }
     }
-    record("semantic_code_generator", await runPhase(
-      semanticCodeGeneratorConfig,
-      generatorVars({
-        planPath,
-        generationMode: action?.action || "INITIAL",
-        parentManifestPath:
-          action?.action === "PATCH_CODE"
-            ? (parentCandidate?.manifestPath || "")
-            : "",
-        actionPath,
-        helpersPath: helperPath,
-        solverPath,
-        manifestPath,
-      }),
-      iterDir,
-      args,
-    ));
+    const vars = generatorVars({
+      planPath,
+      generationMode: action?.action || "INITIAL",
+      parentManifestPath:
+        action?.action === "PATCH_CODE"
+          ? (parentCandidate?.manifestPath || "")
+          : "",
+      actionPath,
+      helpersPath: helperPath,
+      solverPath,
+      manifestPath,
+      hybridContractPath,
+    });
+    if (args.codegenMode === "hybrid") {
+      const hybridContract = await writeHybridContract(hybridContractPath, {
+        benchmark: args.benchmark,
+        query,
+        plan,
+        tableBindings: hybridTableBindings,
+      });
+      const hybridAgentConfig = {
+        ...semanticCodeGeneratorConfig,
+        name: "Semantic Fragment Generator",
+        allowedTools: ["Read", "Write", "Edit", "Bash"],
+      };
+      if (args.fragmentExecution === "structured" && args.agentProvider === "vllm") {
+        record("semantic_code_generator", await generateStructuredFragment({
+          vars,
+          contract: hybridContract,
+          provider: args.agentProvider,
+          modelOverride: args.modelOverride,
+          timeoutMs: defaults.agentTimeoutMs,
+        }));
+      } else {
+        record("semantic_code_generator", await runPhase(
+          hybridAgentConfig,
+          vars,
+          iterDir,
+          args,
+          {
+            systemPromptPath: resolve(
+              __dirname, "agents", "semantic-code-generator", "hybrid-prompt.md",
+            ),
+            userPromptPath: resolve(
+              __dirname, "agents", "semantic-code-generator", "hybrid-user-prompt.md",
+            ),
+          },
+        ));
+      }
+      if (!args.dryRun) {
+        await compileHybridCandidate({
+          benchmark: args.benchmark,
+          query,
+          plan,
+          helpersPath: helperPath,
+          solverPath,
+          manifestPath,
+          semdbDir: __dirname,
+          tableBindings: hybridTableBindings,
+        });
+      }
+    } else {
+      record("semantic_code_generator", await runPhase(
+        semanticCodeGeneratorConfig,
+        vars,
+        iterDir,
+        args,
+      ));
+    }
     if (!existsSync(helperPath) || !existsSync(solverPath) || !existsSync(manifestPath)) {
       throw new Error(
         `[SemDB] [${query}] Generator did not create a complete candidate in ${iterDir}`,
@@ -3550,6 +3652,8 @@ async function runQueryDirectCore(args, planObj, csvPath, architecture) {
     query, corpus: corpus.table, provider: args.agentProvider, operator: "direct",
     mode: "direct", wall_clock_ms: wallMs,
     agent_architecture: architecture,
+    codegen_mode: args.codegenMode,
+    fragment_execution: args.codegenMode === "hybrid" ? args.fragmentExecution : null,
     plan_versions: planVersions,
     replans: replansUsed,
     optimizer_actions: actionCounts,
@@ -3763,12 +3867,12 @@ async function main() {
     try { allPlans.push(await planQuery(base, q)); }
     catch (e) { console.error(`[SemDB] [${q}] plan failed: ${e.message}`); }
   }
-  // Skip queries we can't run: audio corpora, or a corpus whose table file didn't
+  // Skip queries we can't run: pure-audio corpora, or a corpus whose table file didn't
   // resolve (usually a wrong/missing --benchmark so the SQL prefix matched nothing).
   const plans = allPlans.filter((p) => {
-    const audioTables = p.tables.filter((table) => table.modality === "audio");
-    if (audioTables.length) {
-      console.warn(`[SemDB] [${p.query}] SKIP: query references unsupported audio `
+    if (isPureAudioPlan(p)) {
+      const audioTables = p.tables.filter((table) => table.modality === "audio");
+      console.warn(`[SemDB] [${p.query}] SKIP: pure-audio query; unsupported audio `
         + `table(s): ${audioTables.map((table) => table.table).join(", ")}.`);
       return false;
     }

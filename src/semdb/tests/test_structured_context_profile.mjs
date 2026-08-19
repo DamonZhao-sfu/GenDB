@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 import {
   buildPlannerTableProfile,
+  lintAvoidableTextSemanticRefusal,
   lintPlanAgainstTableProfile,
   parseCsvSample,
 } from "../agent-runtime/context-profile.mjs";
@@ -75,5 +76,27 @@ assert.equal(lintPlanAgainstTableProfile({
     condition: "normalize(text_data.title) == normalize(movies.Title)",
   }],
 }, boundedProfile).length, 0, "a truncated value set must never prove an empty join");
+
+const avoidableRefusal = {
+  compilability: {
+    class: "not_compilable",
+    obligations: [
+      "The Destinations column holds city names, but no European geography taxonomy is present.",
+    ],
+    unresolved: ["A closed value space or reference list of European cities is required."],
+  },
+};
+assert.equal(lintAvoidableTextSemanticRefusal(avoidableRefusal).length, 1);
+assert.match(
+  lintAvoidableTextSemanticRefusal(avoidableRefusal)[0],
+  /text_classify_detail.*bounded_approximation/,
+);
+assert.equal(lintAvoidableTextSemanticRefusal({
+  compilability: {
+    class: "not_compilable",
+    obligations: ["The required image file is absent from every runtime input."],
+    unresolved: ["No image evidence is available."],
+  },
+}).length, 0, "a genuinely missing evidence type must remain not_compilable");
 
 console.log("test_structured_context_profile OK");

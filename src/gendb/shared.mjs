@@ -108,3 +108,21 @@ export async function runAgent(name, options) {
   const provider = await getProvider();
   return provider.runAgent(name, options);
 }
+
+/** Invoke a provider's tool-free structured-output path when it implements one. */
+export async function runStructuredAgent(name, options) {
+  const provider = await getProvider();
+  if (typeof provider.runStructuredAgent !== "function") {
+    return {
+      result: "",
+      durationMs: 0,
+      tokens: {},
+      costUsd: 0,
+      numTurns: 0,
+      error: `Provider does not support structured agents`,
+      retryable: false,
+      profile: { structured: true, structured_requests: 0 },
+    };
+  }
+  return provider.runStructuredAgent(name, options);
+}

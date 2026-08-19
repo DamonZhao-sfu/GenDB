@@ -29,7 +29,7 @@
 #   ITERS=3 ./run_image_queries.sh animals     # cap the refinement loop at 3 iterations
 #   ITERS=0 ./run_image_queries.sh             # single-shot (no refinement)
 #   QUERIES=q2a,q7 ./run_image_queries.sh mmqa # only these queries
-#   ALL=1 ./run_image_queries.sh movie         # drop --image-only (text/audio too)
+#   ALL=1 ./run_image_queries.sh movie         # drop --image-only (pure audio still skips)
 #   AGENT_EXECUTION=structured ./run_image_queries.sh mmqa
 #                                                # opt into tool-free Planner/Optimizer
 #   FORCE=1 ./run_image_queries.sh mmqa        # regenerate agents/code even if cached
@@ -58,6 +58,8 @@ PROVIDER="${PROVIDER:-vllm}"
 CLIP="${CLIP:-openai/clip-vit-base-patch32}"
 ITERS="${ITERS:-5}"                                               # --max-iterations
 AGENT_EXECUTION="${AGENT_EXECUTION:-agent}"                       # agent | structured
+CODEGEN="${CODEGEN:-${SEMDB_CODEGEN:-full}}"                      # full | hybrid
+FRAGMENT_EXECUTION="${FRAGMENT_EXECUTION:-${SEMDB_FRAGMENT_EXECUTION:-agent}}"
 ORCH="$REPO/src/semdb/orchestrator.mjs"
 
 case "$AGENT_EXECUTION" in
@@ -66,6 +68,14 @@ case "$AGENT_EXECUTION" in
     echo "[run] ERROR: AGENT_EXECUTION must be 'structured' or 'agent' (got '$AGENT_EXECUTION')." >&2
     exit 2
     ;;
+esac
+case "$CODEGEN" in
+  full|hybrid) ;;
+  *) echo "[run] ERROR: CODEGEN must be 'full' or 'hybrid' (got '$CODEGEN')." >&2; exit 2;;
+esac
+case "$FRAGMENT_EXECUTION" in
+  agent|structured) ;;
+  *) echo "[run] ERROR: FRAGMENT_EXECUTION must be 'agent' or 'structured'." >&2; exit 2;;
 esac
 
 force_flag=""; [ "${FORCE:-0}" = "1" ] && force_flag="--force"
@@ -113,7 +123,7 @@ SCENARIOS=(
 want=(); [ "$#" -gt 0 ] && want=("$@")
 selected() { [ "${#want[@]}" -eq 0 ] && return 0; for w in "${want[@]}"; do [ "$w" = "$1" ] && return 0; done; return 1; }
 
-echo "[run] provider=$PROVIDER agent-execution=$AGENT_EXECUTION iters=$ITERS clip=$CLIP out=$OUT"
+echo "[run] provider=$PROVIDER agent-execution=$AGENT_EXECUTION codegen=$CODEGEN fragment=$FRAGMENT_EXECUTION iters=$ITERS clip=$CLIP out=$OUT"
 echo "[run] scope=${img_flag:-all-modalities}${QUERIES:+  queries=$QUERIES}"
 if [ ${#val_flags[@]} -gt 0 ]; then
   echo "[run] validation-set refinement: rate=$VAL_RATE endpoint=$ENDPOINT${VAL_PAIR_TOP:+ pair-top=$VAL_PAIR_TOP}"
@@ -148,6 +158,8 @@ for row in "${SCENARIOS[@]}"; do
     --benchmark "$bench" \
     --agent-provider "$PROVIDER" \
     --agent-execution "$AGENT_EXECUTION" \
+    --codegen "$CODEGEN" \
+    --fragment-execution "$FRAGMENT_EXECUTION" \
     --clip-model "$CLIP" \
     --out "$OUT" \
     "${iter_flags[@]}" "${query_flags[@]}" "${val_flags[@]}" \

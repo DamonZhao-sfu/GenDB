@@ -128,21 +128,20 @@ async function readReconciled(path, kind, options) {
 
 /** Persist the deterministic lineage owned by the PGO loop.
  *
- *  A replan is a complete replacement document, so the model sees the initial-plan JSON
- *  example as well as the previous artifact. Qwen can correctly revise all semantic
- *  fields yet copy the example's `plan_version: 1, parent_plan_version: null`. Spending a
- *  nine-minute Planner call and then discarding the query over those two bookkeeping
- *  literals is both expensive and unnecessary: the orchestrator already has the sole
- *  authoritative previous version.
+ *  Models sometimes copy lineage literals from the wrong example: an initial plan can
+ *  inherit `2/1` from replan instructions, while a replan can copy the initial plan's
+ *  `1/null`. Spending a long Planner call and then discarding an otherwise valid plan over
+ *  those two bookkeeping literals is unnecessary: the orchestrator is the sole authority
+ *  for whether this call is initial or a replan.
  *
  *  This does NOT repair query identity or semantic content. `readReconciled` has already
  *  rejected a plan belonging to another query, and the schema has already validated the
  *  document. We only stamp lineage to the one value the PGO state machine permits.
  */
-async function reconcilePlanLineage(plan, path, previousPlan) {
-  if (!previousPlan) return [];
-  const expectedVersion = previousPlan.plan_version + 1;
-  const expectedParent = previousPlan.plan_version;
+async function reconcilePlanLineage(plan, path, { initialPlan = false, previousPlan } = {}) {
+  if (!initialPlan && !previousPlan) return [];
+  const expectedVersion = initialPlan ? 1 : previousPlan.plan_version + 1;
+  const expectedParent = initialPlan ? null : previousPlan.plan_version;
   const repaired = [];
   if (plan.plan_version !== expectedVersion) {
     repaired.push({ field: "plan_version", was: plan.plan_version, now: expectedVersion });
@@ -162,7 +161,8 @@ async function reconcilePlanLineage(plan, path, previousPlan) {
       .map(({ field, was, now }) => `${field}=${JSON.stringify(was)} -> ${now}`)
       .join(", ");
     console.warn(
-      `[SemDB] plan at ${path} emitted stale replan lineage; normalized ${changes}.`,
+      `[SemDB] plan at ${path} emitted stale ${initialPlan ? "initial" : "replan"} `
+        + `lineage; normalized ${changes}.`,
     );
   }
   return repaired;
@@ -171,8 +171,11 @@ async function reconcilePlanLineage(plan, path, previousPlan) {
 export async function readAndValidatePlan(path, options = {}) {
   const plan = await readReconciled(path, "plan", options);
   if (options.requireCompilable) assertPlanGeneratable(plan);
+  if (options.initialPlan) {
+    await reconcilePlanLineage(plan, path, { initialPlan: true });
+  }
   if (options.previousPlan) {
-    await reconcilePlanLineage(plan, path, options.previousPlan);
+    await reconcilePlanLineage(plan, path, { previousPlan: options.previousPlan });
     if (plan.plan_version !== options.previousPlan.plan_version + 1) {
       throw new Error(
         `Replanned SemDB plan_version must increment by one at ${path}`,

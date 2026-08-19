@@ -75,6 +75,54 @@ def _basename_image_id(v):
     return str(v).split("/")[-1].replace("%2e", ".")
 
 
+def _normalize_column_name(name):
+    """Normalize harmless generator projection drift without changing row values.
+
+    Generated SQL-shaped programs may preserve qualifiers (``t.ID``), use the physical
+    normalized-table name (``image_filepath``), or vary case. SemBench's evaluator cares
+    about the projected value, not those spelling differences.
+    """
+    value = str(name or "").lstrip("\ufeff").strip().strip('`"')
+    value = value.rsplit(".", 1)[-1]
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _resolve_projection_column(rows, fields, aliases, query, logical_name,
+                               required=True):
+    """Return the actual header for one logical MMQA projection column.
+
+    This is intentionally alias-based rather than positional: q2b has three outputs and
+    generated programs sometimes add diagnostics. A truly incompatible projection gets an
+    actionable schema error instead of a late ``KeyError`` from an individual row.
+    """
+    available = list(fields or [])
+    if not available and rows:
+        available = list(rows[0].keys())
+    by_normalized = {}
+    for column in available:
+        by_normalized.setdefault(_normalize_column_name(column), column)
+    for alias in aliases:
+        column = by_normalized.get(_normalize_column_name(alias))
+        if column is not None:
+            return column
+    # An empty JSON list has no header but is still a valid empty prediction container.
+    if not available:
+        return None
+    if required:
+        raise ValueError(
+            f"MMQA {query} predictions require a {logical_name!r} column "
+            f"(accepted aliases: {', '.join(aliases)}); got columns: "
+            f"{', '.join(map(str, available)) or '(none)'}"
+        )
+    return None
+
+
+IMAGE_ID_COLUMNS = (
+    "image_id", "uri", "filename", "image_filename", "image_filepath",
+    "filepath", "file_path", "path", "ref",
+)
+
+
 def _column_is_int(rows, col):
     """Mirror pandas' per-column int64 inference: True iff EVERY value in `col`
     parses as an int (so q2 IDs compare equal to the integer ground truth)."""
@@ -83,48 +131,66 @@ def _column_is_int(rows, col):
 
 
 def eval_q1(rows, fields, gt):
-    results = [str(r.get("director", "")).strip(' "').lower() for r in rows]
+    director_col = _resolve_projection_column(
+        rows, fields, ("director", "generated_director", "_output", "result"),
+        "q1", "director",
+    )
+    results = [str(r.get(director_col, "")).strip(' "').lower() for r in rows]
     gold = {g.strip().lower() for g in gt}
     return results, gold
 
 
 def eval_q2(rows, fields, gt):
-    id_is_int = _column_is_int(rows, "ID")
+    id_col = _resolve_projection_column(
+        rows, fields, ("ID", "track_id", "racetrack_id"), "q2", "ID",
+    )
+    image_col = _resolve_projection_column(
+        rows, fields, IMAGE_ID_COLUMNS, "q2", "image identifier",
+    )
+    gold_arity = len(gt[0]) if gt else 2
+    if gold_arity not in (2, 3):
+        raise ValueError(f"Unexpected q2 ground-truth tuple width: {gold_arity}")
+    color_col = _resolve_projection_column(
+        rows, fields, ("color", "primary_color", "dominant_color", "logo_color"),
+        "q2", "color", required=gold_arity == 3,
+    )
+    id_is_int = bool(id_col) and _column_is_int(rows, id_col)
     results = set()
     for r in rows:
-        r = dict(r)
-        if "uri" in r:
-            r["image_id"] = r.pop("uri")          # BigQuery
-        if "filename" in r:
-            r["image_id"] = r.pop("filename")     # Palimpzest
-        image_id = _basename_image_id(r["image_id"])
-        rid = int(str(r["ID"]).strip()) if id_is_int else r["ID"]
-        ncols = len(r)
-        if ncols == 2:
+        image_id = _basename_image_id(r.get(image_col, ""))
+        raw_id = r.get(id_col, "")
+        rid = int(str(raw_id).strip()) if id_is_int else raw_id
+        if gold_arity == 2:
             results.add((rid, image_id))
-        elif ncols == 3:
-            results.add((rid, image_id, str(r["color"]).strip().lower()))
         else:
-            raise ValueError(f"Unexpected number of columns: {ncols} in the results.")
+            results.add((rid, image_id, str(r.get(color_col, "")).strip().lower()))
     gold = set(tuple(g) for g in gt)
     return results, gold
 
 
 def eval_q3(rows, fields, gt):
-    results = [r["title"] for r in rows]
+    title_col = _resolve_projection_column(
+        rows, fields, ("title", "movie_title"), "q3", "title",
+    )
+    results = [r.get(title_col, "") for r in rows]
     return results, set(gt)
 
 
 def eval_q4(rows, fields, gt):
-    if not rows or "genre" not in (fields or []):
-        return [], set()
+    genre_col = _resolve_projection_column(
+        rows, fields, ("genre", "unnested_genre"), "q4", "genre",
+    )
+    movies_col = _resolve_projection_column(
+        rows, fields, ("movies_in_genre", "movies", "movie_titles", "titles"),
+        "q4", "movies_in_genre",
+    )
     results = []
     for r in rows:
-        genre = r.get("genre")
+        genre = r.get(genre_col)
         if _isna(genre):
             continue
         genre = str(genre).strip().lower()
-        movies = r.get("movies_in_genre")
+        movies = r.get(movies_col)
         if _isna(movies):
             continue
         for movie in str(movies).split(","):
@@ -137,14 +203,14 @@ def eval_q4(rows, fields, gt):
 
 
 def eval_q5(rows, fields, gt):
+    actor_col = _resolve_projection_column(
+        rows, fields,
+        ("cast_member", "cast_members", "actor", "_output", "output", "result"),
+        "q5", "cast member",
+    )
     results = []
     for r in rows:
-        if "_output" in r:
-            value = r["_output"]
-        elif "actor" in r:
-            value = r["actor"]
-        else:
-            raise ValueError("Expected either '_output' or 'actor' column in the results.")
+        value = r.get(actor_col)
         if _isna(value) or not isinstance(value, str):
             continue
         results.append(value.strip().lower())
@@ -153,23 +219,26 @@ def eval_q5(rows, fields, gt):
 
 
 def eval_q6(rows, fields, gt):
-    if not rows or "Airlines" not in (fields or []):
-        results = []
-    else:
-        results = [r["Airlines"] for r in rows]
+    airline_col = _resolve_projection_column(
+        rows, fields, ("Airlines", "airline", "airline_name"),
+        "q6", "Airlines",
+    )
+    results = [r.get(airline_col, "") for r in rows]
     return results, set(gt)
 
 
 def eval_q7(rows, fields, gt):
+    airline_col = _resolve_projection_column(
+        rows, fields, ("Airlines", "airline", "airline_name"),
+        "q7", "Airlines",
+    )
+    image_col = _resolve_projection_column(
+        rows, fields, IMAGE_ID_COLUMNS, "q7", "image identifier",
+    )
     results = set()
     for r in rows:
-        r = dict(r)
-        if "uri" in r:
-            r["image_id"] = r.pop("uri")
-        if "filename" in r:
-            r["image_id"] = r.pop("filename")
-        image_id = _basename_image_id(r["image_id"])
-        results.add((r["Airlines"], image_id))
+        image_id = _basename_image_id(r.get(image_col, ""))
+        results.add((r.get(airline_col, ""), image_id))
     gold = set(tuple(g) for g in gt)
     return results, gold
 

@@ -76,6 +76,10 @@ parameter, return type, score meaning, or model capability.
   the plan.
 - Treat supplied normalized-view and external-object adapter contracts as authoritative
   relational equivalences.
+- Missing external taxonomy data alone is not a reason for `not_compilable` when an
+  available runtime text field contains the evidence. Bind `text_classify_detail` to
+  short query-defined positive/negative hypotheses and declare a `bounded_approximation`;
+  do not invent or hard-code the missing taxonomy.
 - Preserve ordered-pair direction and diagonal rules for self-joins.
 - Apply `--only-ids` after forming the correct validation unit and before semantic inference.
 - Require a trace entry for every evaluated validation unit, including negative decisions.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 
 import { classifyValidationCapability } from "../validation_capability.mjs";
 import { referencedTables } from "../validation_matrix.mjs";
-import { parseArgs } from "../orchestrator.mjs";
+import { isPureAudioPlan, parseArgs } from "../orchestrator.mjs";
 
 const plan = (unit, sites = 1) => ({
   benchmark: "ecomm",
@@ -29,6 +29,19 @@ assert.equal(tuple.obligations.length, 4);
 const audio = classifyValidationCapability(plan("row"), { audioTables: ["audio_mm"] });
 assert.equal(audio.class, "not_compilable");
 assert.equal(audio.reason_code, "unsupported_audio_runtime");
+
+assert.equal(isPureAudioPlan({ tables: [
+  { table: "cars", modality: "structured" },
+  { table: "audio_mm", modality: "audio" },
+] }), true);
+assert.equal(isPureAudioPlan({ tables: [
+  { table: "cars", modality: "structured" },
+  { table: "audio_mm", modality: "audio" },
+  { table: "car_mm", modality: "image" },
+] }), false);
+assert.equal(isPureAudioPlan({ tables: [
+  { table: "complaints", modality: "text" },
+] }), false);
 
 assert.deepEqual(
   referencedTables(

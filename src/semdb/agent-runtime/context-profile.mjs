@@ -350,3 +350,33 @@ export function lintPlanAgainstTableProfile(plan, profile) {
   }
   return findings;
 }
+
+/** Reject a Planner refusal when the only missing resource is an external taxonomy but
+ * the plan itself identifies a runtime text field containing the evidence. The local text
+ * classifier can compare query-defined boolean hypotheses without a hard-coded lookup;
+ * that is a bounded approximation, not an unavailable capability.
+ *
+ * This deliberately does not rewrite the plan or admit it to generation. Structured mode
+ * receives the finding as a retry correction, while a genuine not_compilable plan remains
+ * blocked by assertPlanGeneratable().
+ */
+export function lintAvoidableTextSemanticRefusal(plan) {
+  if (plan?.compilability?.class !== "not_compilable") return [];
+  const explanation = [
+    ...(plan.compilability.obligations || []),
+    ...(plan.compilability.unresolved || []),
+  ].join(" ");
+  const missingTaxonomy = /\b(?:taxonomy|geograph(?:y|ic|ical)|reference\s+(?:list|data|table)|closed\s+value\s+space|lookup\s+table)\b/i
+    .test(explanation);
+  const availableTextEvidence = /\b(?:text|description|destinations?|synopsis|review|title|name)\b[^.]{0,100}\b(?:column|field|runtime|table|present|holds?|contains?)\b|\b(?:column|field)\b[^.]{0,100}\b(?:text|description|destinations?|synopsis|review|title|name)\b/i
+    .test(explanation);
+  if (!missingTaxonomy || !availableTextEvidence) return [];
+  return [
+    "This not_compilable refusal is avoidable: the plan identifies an available runtime "
+      + "text field containing the semantic evidence and refuses only because an external "
+      + "taxonomy/reference list is absent. Bind text_classify_detail (or the matching "
+      + "documented text primitive) to short query-defined positive/negative hypotheses, "
+      + "classify the plan as bounded_approximation, and record the model limitation. Do "
+      + "not invent or hard-code a taxonomy.",
+  ];
+}

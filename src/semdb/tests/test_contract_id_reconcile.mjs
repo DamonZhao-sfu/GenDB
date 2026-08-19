@@ -98,4 +98,21 @@ const persisted = await planOnDisk(staleLineage);
 assert.equal(persisted.plan_version, 2);
 assert.equal(persisted.parent_plan_version, 1);
 
+// 9. Initial lineage is equally deterministic. Qwen can carry 2/1 from a previous
+// structured replan example into a fresh query; normalize it to 1/null and persist it.
+const staleInitialLineage = await fixture(PLAN_FIXTURE, {
+  query_id: "q13",
+  plan_version: 2,
+  parent_plan_version: 1,
+});
+const initial = await readAndValidatePlan(staleInitialLineage, {
+  queryId: "q13",
+  initialPlan: true,
+});
+assert.equal(initial.plan_version, 1);
+assert.equal(initial.parent_plan_version, null);
+const persistedInitial = await planOnDisk(staleInitialLineage);
+assert.equal(persistedInitial.plan_version, 1);
+assert.equal(persistedInitial.parent_plan_version, null);
+
 console.log("test_contract_id_reconcile OK");

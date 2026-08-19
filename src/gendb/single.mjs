@@ -73,6 +73,7 @@ function parseArgsSingle(argv) {
     if (argv[i] === "--model-override" && argv[i + 1]) args.modelOverride = argv[++i];
     if (argv[i] === "--optimization-target" && argv[i + 1]) args.optimizationTarget = argv[++i];
     if (argv[i] === "--agent-provider" && argv[i + 1]) args.agentProvider = argv[++i];
+    if (argv[i] === "--base-url" && argv[i + 1]) process.env.VLLM_BASE_URL = argv[++i];
     if (argv[i] === "--single-agent-prompt" && argv[i + 1]) args.promptVariant = argv[++i];
   }
   if (!args.schema) args.schema = getSchemaPath(args.targetBenchmark);

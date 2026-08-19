@@ -75,6 +75,7 @@ assert.equal(planner.retryMaxOutputTokens, 32_000);
 assert.equal(planner.effortLevel, "medium");
 assert.ok(planner.systemPrompt.includes("# Plan Semantic Query"));
 assert.ok(planner.systemPrompt.includes("You have no tools"));
+assert.ok(planner.systemPrompt.includes("Missing external taxonomy data alone"));
 assert.ok(!planner.systemPrompt.includes("You are the SemDB Semantic Query Planner"),
   "structured mode must not duplicate the legacy system procedure");
 assert.ok(planner.userPrompt.includes("Required plan_version: 2"));
@@ -111,6 +112,7 @@ const agentPlanner = await prepareAgentRole(plannerConfig, {
 });
 assert.ok(agentPlanner.systemPrompt.includes("# Plan Semantic Query"));
 assert.ok(agentPlanner.systemPrompt.includes("procedure above is already loaded"));
+assert.ok(agentPlanner.systemPrompt.includes("Missing external taxonomy data alone"));
 assert.ok(!agentPlanner.systemPrompt.includes("You have no tools"));
 assert.ok(!agentPlanner.systemPrompt.includes("You are the SemDB Semantic Query Planner"));
 assert.ok(agentPlanner.contextText.includes("full_file_streaming"));

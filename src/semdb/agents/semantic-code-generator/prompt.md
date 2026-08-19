@@ -80,14 +80,12 @@ If an action asks for a semantic change absent from the current plan, stop with 
 
 Follow every step in order.
 
-### Step 1: Validate inputs and construct the implementation map
+### Step 1: Validate inputs
 
 - Never generate from a plan whose `compilability.class` is `not_compilable`.
 - Confirm the plan query id, version, modality, semantic sites, helper dependencies,
   relational steps, trace contract, and runtime contract.
 - Read the exact local primitive source files before importing or calling an API.
-- Build a one-to-one map from every helper node and relational step to its Python symbol or
-  code block.
 - If a primitive, parameter, type edge, or semantic decision is missing, report
   `NEEDS_REPLAN`; do not guess.
 

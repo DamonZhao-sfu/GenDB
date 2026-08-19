@@ -140,6 +140,14 @@ multi-label value spaces. Do not replace an implicit semantic predicate with an 
 keyword rule; declare the bounded approximation and its limitation or mark it
 `not_compilable`.
 
+The absence of an external taxonomy or lookup table does not by itself make a semantic
+relation over an available text field `not_compilable`. For example, a Destinations field
+can be compared with short query-defined hypotheses such as "has a destination in Europe"
+and "has no destination in Europe" using `text_classify_detail`. Treat this as a declared
+`bounded_approximation`; do not invent or hard-code a city/country list. Use
+`not_compilable` only when the required evidence itself is absent or no supplied primitive
+accepts that evidence type.
+
 ### Step 6: Plan relational execution and reuse
 
 - Put deterministic filters and joins in their exact execution order.

@@ -40,6 +40,7 @@ export const defaults = {
   refineSampleCap: 15,        // max FP and FN rows shown to the agent per iteration
   directAgentArchitecture: "pgo", // pgo | legacy; only affects --direct
   agentExecution: "agent",        // agent | structured; vLLM Planner/Optimizer only
+  codegenMode: "full",            // full | hybrid; hybrid uses one generic ABI
   enableAgentSkills: true,    // publish role + learned skills into a discoverable root
   maxReplans: 1,              // evidence-backed Planner revisions per query
 

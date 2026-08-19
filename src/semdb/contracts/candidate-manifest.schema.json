@@ -32,7 +32,13 @@
       "properties": {
         "plan": { "type": "string", "minLength": 1 },
         "helpers": { "type": "string", "minLength": 1 },
-        "solver": { "type": "string", "minLength": 1 }
+        "solver": { "type": "string", "minLength": 1 },
+        "implementation_map": {
+          "type": "string",
+          "minLength": 1,
+          "deprecated": true,
+          "description": "Accepted only to read historical manifests; ignored by the runtime."
+        }
       }
     },
     "hashes": {
@@ -42,7 +48,12 @@
       "properties": {
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "helpers_sha256": { "$ref": "#/$defs/sha256" },
-        "solver_sha256": { "$ref": "#/$defs/sha256" }
+        "solver_sha256": { "$ref": "#/$defs/sha256" },
+        "implementation_map_sha256": {
+          "$ref": "#/$defs/sha256",
+          "deprecated": true,
+          "description": "Accepted only to read historical manifests; ignored by the runtime."
+        }
       }
     }
   },
